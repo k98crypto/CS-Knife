@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import time
+import socket
+import queue
 import threading
 import tkinter as tk
 import winsound
@@ -47,6 +49,98 @@ except Exception as e:
 current_ticket_context = ""
 is_summarizing = False
 
+# ==================== 中继服务地址 ====================
+def load_bridge_port(default=8765):
+    """读 config.json 里的 port，保证与 bridge_server.py 一致。"""
+    try:
+        with open(os.path.join(CURRENT_DIR, "config.json"), "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        return int(cfg.get("port", default) or default)
+    except Exception:
+        return default
+
+BRIDGE_PORT = load_bridge_port()
+BRIDGE_BASE = f"http://127.0.0.1:{BRIDGE_PORT}"
+
+
+# ==================== 高 DPI 感知（防止缩放导致窗口被摆到屏幕外） ====================
+def enable_dpi_awareness():
+    """让 Tk 使用物理像素坐标：本机 125%~150% 缩放时坐标不再错乱。"""
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)      # PER_MONITOR_AWARE_V2
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# ==================== 单实例互斥（旧版能开出两个悬浮窗互相抢热键） ====================
+_INSTANCE_LOCK = {"sock": None}
+
+def acquire_single_instance(port=8766):
+    """用本地端口占用做互斥：成功 True，已有实例在跑 False。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        _INSTANCE_LOCK["sock"] = s
+        return True
+    except OSError:
+        return False
+
+
+def fetch_diag_info(timeout=2.0):
+    """读取中继的 /api/diag。返回 dict（含 legacy=True 表示中继是旧版代码）或 None（没连上）。"""
+    try:
+        r = requests.get(f"{BRIDGE_BASE}/api/diag", timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            return data if isinstance(data, dict) else None
+        if r.status_code == 404:
+            return {"legacy": True}
+        return None
+    except Exception:
+        return None
+
+
+# ==================== 悬浮窗几何（纯粹函数，便于单测） ====================
+HUD_W, HUD_H = 470, 300          # 展开尺寸
+HUD_H_FOLDED = 58                # 折叠后只留标题栏 + 底栏
+SCREEN_MARGIN = 8
+DEFAULT_MARGIN = 24
+TASKBAR_RESERVE = 48
+
+BG_ROOT = "#12141A"
+BG_BAR = "#1C2029"
+BORDER = "#2B3140"
+FG_MAIN = "#E6E6E6"
+FG_DIM = "#8A93A0"
+FG_HINT = "#6B7280"
+ACCENT = "#4EC9B0"
+WARN = "#E5C07B"
+DANGER = "#F44747"
+
+
+def clamp_position(x, y, w, h, sw, sh, margin=SCREEN_MARGIN):
+    """把窗口坐标夹回屏幕可见区域。
+
+    不夹取的话，一旦换显示器 / 改分辨率（例如 2560 宽换回 1440x900），
+    从 hud_pos.json 读回的旧坐标就会把窗口放到屏幕外 —— 表现就是"悬浮窗不见了"。
+    """
+    max_x = max(margin, sw - w - margin)
+    max_y = max(margin, sh - h - margin)
+    x = min(max(int(x), margin), max_x)
+    y = min(max(int(y), margin), max_y)
+    return x, y
+
+
+def default_position(w, h, sw, sh, margin=DEFAULT_MARGIN, taskbar=TASKBAR_RESERVE):
+    """默认停靠右下角（旧版固定左上角，容易被浏览器工具栏/地址栏压住）。"""
+    return clamp_position(sw - w - margin, sh - h - margin - taskbar, w, h, sw, sh, margin)
+
+
 def beep_start(): winsound.Beep(1000, 100)
 def beep_success(): winsound.Beep(1600, 150)
 def beep_item(): winsound.Beep(1300, 80)
@@ -56,72 +150,351 @@ def beep_error():
     winsound.Beep(400, 150)
 
 class HUDOverlay:
+    """桌面悬浮窗（始终置顶 + 可折叠 + 可召回 + 连接状态灯）。
+
+    第七轮重构要点：
+      1. 始终保持置顶：📌 默认开启（可手动取消，召回时自动重新置顶）
+      2. 标题栏三盏灯一眼看出「中继 / 探针 / 手机端」是否在线
+      3. 位置绝不会再跑到屏幕外：启动时坐标夹取 + Ctrl+Alt+H 一键召回
+      4. 所有 UI 更新走线程安全队列（旧版从工作线程直接操作 Tk，偶发闪退）
+    """
+
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("工单助手 HUD")
-        init_pos = "+25+25"
+        self.pinned = True
+        self.folded = False
+        self._q = queue.Queue()
+        self._pos_fixed = False
+        # 记录"我们想要的坐标"。不要依赖 winfo_x()：窗口还没映射时它返回 0，
+        # 会把 (962,592) 这种正确位置写成 (0,0)（第七轮踩过的坑）。
+        self._target = (DEFAULT_MARGIN, DEFAULT_MARGIN)
+        # 高 DPI 缩放：本机 2880x1800 / 200% 时，若只按物理像素写 470x300，
+        # 字号会被 tk scaling 放大 2 倍 -> 文字溢出、界面挤成一团。
+        # 这里按 DPI 比例放大窗口与内边距，视觉尺寸与 100% 缩放时保持一致。
+        self.scale = self._detect_scale()
+        self.w = int(HUD_W * self.scale)
+        self.h = int(HUD_H * self.scale)
+        self.h_folded = int(HUD_H_FOLDED * self.scale)
+        self._build_ui()
+        self._apply_geometry(initial=True)
+        self.root.attributes("-topmost", bool(self.pinned))
+        self.root.attributes("-alpha", 0.95)
+        self.root.overrideredirect(True)
+        self.root.after(80, self._drain_queue)
+        self.root.after(400, self._poll_links)
+
+    def _detect_scale(self):
+        """DPI 缩放比（100% -> 1.0，200% -> 2.0）。"""
+        try:
+            scaling = float(self.root.tk.call("tk", "scaling"))
+            return max(1.0, min(3.0, round(scaling / (96.0 / 72.0), 2)))
+        except Exception:
+            return 1.0
+
+    def _px(self, n):
+        """把设计稿上的 100% 尺寸换算成本机物理像素。"""
+        return int(round(n * self.scale))
+
+    # ---------------- 界面构建 ----------------
+    def _mk_btn(self, parent, text, cmd, fg=FG_DIM, hover="#39414F", width=3):
+        return tk.Button(parent, text=text, command=cmd, font=("Microsoft YaHei UI", 9),
+                         fg=fg, bg=BG_BAR, activeforeground="#FFFFFF", activebackground=hover,
+                         bd=0, relief="flat", cursor="hand2", padx=self._px(4), pady=0, width=width,
+                         highlightthickness=0, takefocus=0)
+
+    def _build_ui(self):
+        pad = self._px(12)
+        wrap = self.w - self._px(44)
+
+        self.outer = tk.Frame(self.root, bg=BORDER)      # 1px 描边，替代旧版纯色方块
+        self.outer.pack(fill="both", expand=True)
+
+        self.bar = tk.Frame(self.outer, bg=BG_BAR)
+        self.bar.pack(fill="x")
+
+        tk.Label(self.bar, text="⚡ 工单助手", font=("Microsoft YaHei UI", 9, "bold"),
+                 fg=ACCENT, bg=BG_BAR).pack(side="left", padx=(self._px(8), self._px(6)), pady=self._px(5))
+        self.lbl_relay = tk.Label(self.bar, text="⚪中继", font=("Microsoft YaHei UI", 8), fg=FG_DIM, bg=BG_BAR)
+        self.lbl_relay.pack(side="left", padx=(0, self._px(7)))
+        self.lbl_probe = tk.Label(self.bar, text="⚪探针", font=("Microsoft YaHei UI", 8), fg=FG_DIM, bg=BG_BAR)
+        self.lbl_probe.pack(side="left", padx=(0, self._px(7)))
+        self.lbl_phone = tk.Label(self.bar, text="⚪手机", font=("Microsoft YaHei UI", 8), fg=FG_DIM, bg=BG_BAR)
+        self.lbl_phone.pack(side="left")
+
+        self.btn_close = self._mk_btn(self.bar, "✕", self.close_app, hover="#E81123")
+        self.btn_close.pack(side="right", padx=(self._px(2), self._px(6)), pady=self._px(3))
+        self.btn_fold = self._mk_btn(self.bar, "➖", self.toggle_fold)
+        self.btn_fold.pack(side="right", padx=self._px(2), pady=self._px(3))
+        self.btn_pin = self._mk_btn(self.bar, "📌", self.toggle_pin, fg=ACCENT)
+        self.btn_pin.pack(side="right", padx=self._px(2), pady=self._px(3))
+        self.btn_home = self._mk_btn(self.bar, "🧭", self.recall)
+        self.btn_home.pack(side="right", padx=self._px(2), pady=self._px(3))
+
+        self.body = tk.Frame(self.outer, bg=BG_ROOT)
+        self.body.pack(fill="both", expand=True)
+
+        self.lbl_status = tk.Label(self.body, text="⚡ 状态: 监听就绪",
+                                   font=("Microsoft YaHei UI", 10, "bold"), fg=ACCENT, bg=BG_ROOT,
+                                   anchor="w", justify="left", wraplength=wrap)
+        self.lbl_status.pack(fill="x", padx=pad, pady=(self._px(9), self._px(2)))
+
+        self.lbl_profile = tk.Label(self.body, text="最近提炼 / 框选预览（双击复制）：",
+                                    font=("Microsoft YaHei UI", 8), fg=FG_DIM, bg=BG_ROOT, anchor="w")
+        self.lbl_profile.pack(fill="x", padx=pad, pady=(self._px(5), 0))
+
+        self.lbl_last = tk.Label(self.body, text="（尚无，按 F7/F8 提炼后在此核验）",
+                                 font=("Microsoft YaHei UI", 9), fg="#DCDCAA", bg=BG_ROOT,
+                                 anchor="nw", justify="left", wraplength=wrap, height=3)
+        self.lbl_last.pack(fill="x", padx=pad, pady=(0, self._px(8)))
+        self.lbl_last.bind("<Double-Button-1>", self._copy_last)
+
+        self.footer = tk.Frame(self.outer, bg=BG_BAR)
+        self.footer.pack(fill="x")
+        self.lbl_links = tk.Label(self.footer, text="正在检测中继服务…",
+                                  font=("Microsoft YaHei UI", 8), fg=FG_DIM, bg=BG_BAR, anchor="w")
+        self.lbl_links.pack(fill="x", padx=self._px(10), pady=(self._px(4), self._px(1)))
+        self.lbl_hint = tk.Label(self.footer, text="拖动移动 · Ctrl+Alt+H 召回 · Ctrl+Alt+M 折叠",
+                                 font=("Microsoft YaHei UI", 7), fg=FG_HINT, bg=BG_BAR, anchor="w")
+        self.lbl_hint.pack(fill="x", padx=self._px(10), pady=(0, self._px(4)))
+
+        for w in (self.outer, self.bar, self.body, self.footer, self.lbl_status,
+                  self.lbl_profile, self.lbl_last, self.lbl_links, self.lbl_hint,
+                  self.lbl_relay, self.lbl_probe, self.lbl_phone):
+            self._bind_drag(w)
+
+    def _bind_drag(self, widget):
+        widget.bind("<Button-1>", self._start_move)
+        widget.bind("<B1-Motion>", self._do_move)
+        widget.bind("<ButtonRelease-1>", lambda e: self.save_position())
+
+    # ---------------- 位置与几何 ----------------
+    def _screen(self):
+        return self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _hud_size(self):
+        return self.w, (self.h_folded if self.folded else self.h)
+
+    def _default_pos(self, sw, sh):
+        """默认右下角（内边距与任务栏预留也按 DPI 缩放）。"""
+        w, h = self._hud_size()
+        return default_position(w, h, sw, sh, self._px(DEFAULT_MARGIN), self._px(TASKBAR_RESERVE))
+
+    def _load_pos(self):
+        """读回上次位置；没有/损坏/越界都会自动回到右下角。"""
+        sw, sh = self._screen()
+        w, h = self._hud_size()
         if os.path.exists(POS_FILE_PATH):
             try:
-                with open(POS_FILE_PATH, "r", encoding="utf-8") as f:
-                    pos_data = json.load(f)
-                    init_pos = f"+{pos_data.get('x', 25)}+{pos_data.get('y', 25)}"
-            except Exception: pass
+                # utf-8-sig：hud_pos.json 可能被记事本/PowerShell 写成带 BOM
+                with open(POS_FILE_PATH, "r", encoding="utf-8-sig") as f:
+                    d = json.load(f)
+                if isinstance(d, dict) and "x" in d and "y" in d:
+                    self.pinned = bool(d.get("pinned", True))
+                    self.folded = bool(d.get("folded", False))
+                    w, h = self._hud_size()
+                    return int(d["x"]), int(d["y"])
+            except Exception:
+                pass
+        return self._default_pos(sw, sh)
 
-        self.root.geometry(f"460x276{init_pos}")
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.92)
-        self.root.overrideredirect(True)
-        self.root.configure(bg="#1E1E1E")
+    def _apply_geometry(self, initial=False):
+        """设置窗口尺寸与坐标（坐标一律夹取，永不出屏）。"""
+        sw, sh = self._screen()
+        w, h = self._hud_size()
+        if initial:
+            x, y = self._load_pos()
+            w, h = self._hud_size()
+        else:
+            x, y = self._target
+        nx, ny = clamp_position(x, y, w, h, sw, sh)
+        if initial and (nx, ny) != (int(x), int(y)):
+            self._pos_fixed = True
+            print(f"[HUD] 原坐标 ({x},{y}) 超出屏幕 {sw}x{sh}，已自动移回 ({nx},{ny})")
+        self._target = (nx, ny)
+        self.root.geometry(f"{w}x{h}+{nx}+{ny}")
+        if initial:
+            self.save_position()
 
-        self.root.bind("<Button-1>", self._start_move)
-        self.root.bind("<B1-Motion>", self._do_move)
-        self.root.bind("<ButtonRelease-1>", lambda e: self.save_position())
+    def _start_move(self, event):
+        self.x = event.x
+        self.y = event.y
 
-        top_frame = tk.Frame(self.root, bg="#252526")
-        top_frame.pack(fill="x")
-        top_frame.bind("<Button-1>", self._start_move)
-        top_frame.bind("<B1-Motion>", self._do_move)
-
-        cheat_sheet = (
-            "【操作指南】F9: 智能解答(免操作) | F10: 润色选中草稿\n"
-            "• F7/F8: 一键后台提取当前工单并提炼 (免框选)\n"
-            "• F6: 将选中的图片/视频链接直接下载到桌面\n"
-        )
-        lbl_guide = tk.Label(top_frame, text=cheat_sheet, font=("Microsoft YaHei UI", 8),
-                             fg="#9CDCFE", bg="#252526", justify="left", padx=8, pady=4)
-        lbl_guide.pack(side="left", fill="both", expand=True)
-        lbl_guide.bind("<Button-1>", self._start_move)
-        lbl_guide.bind("<B1-Motion>", self._do_move)
-
-        btn_close = tk.Button(top_frame, text=" ✕ ", font=("Microsoft YaHei UI", 9, "bold"), fg="#CCCCCC", bg="#252526", activebackground="#E81123", activeforeground="white", bd=0, relief="flat", cursor="hand2", command=self.close_app)
-        btn_close.pack(side="right", anchor="ne", padx=4, pady=4)
-
-        self.lbl_profile = tk.Label(self.root, text="最近提炼 / 框选预览：", font=("Microsoft YaHei UI", 8), fg="#808080", bg="#1E1E1E", anchor="w")
-        self.lbl_profile.pack(fill="x", padx=10, pady=(6, 0))
-
-        self.lbl_last = tk.Label(self.root, text="（尚无，按 F7/F8 提炼后在此核验）", font=("Microsoft YaHei UI", 9),
-                                 fg="#DCDCAA", bg="#1E1E1E", anchor="w", justify="left", wraplength=432)
-        self.lbl_last.pack(fill="x", padx=10, pady=(0, 4))
-
-        self.lbl_status = tk.Label(self.root, text="⚡ 状态: 监听就绪", font=("Microsoft YaHei UI", 9, "bold"), fg="#4EC9B0", bg="#1E1E1E", anchor="w")
-        self.lbl_status.pack(fill="x", padx=10, pady=(2, 6))
-
-    def _start_move(self, event): self.x = event.x; self.y = event.y
     def _do_move(self, event):
-        x = self.root.winfo_x() + (event.x - self.x)
-        y = self.root.winfo_y() + (event.y - self.y)
-        self.root.geometry(f"+{x}+{y}")
+        x = self._target[0] + (event.x - self.x)
+        y = self._target[1] + (event.y - self.y)
+        sw, sh = self._screen()
+        w, h = self._hud_size()
+        nx, ny = clamp_position(x, y, w, h, sw, sh)
+        self._target = (nx, ny)
+        self.root.geometry(f"{w}x{h}+{nx}+{ny}")
+
     def save_position(self):
         try:
-            with open(POS_FILE_PATH, "w", encoding="utf-8") as f: json.dump({"x": self.root.winfo_x(), "y": self.root.winfo_y()}, f)
-        except Exception: pass
+            with open(POS_FILE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"x": self._target[0], "y": self._target[1],
+                           "folded": self.folded, "pinned": self.pinned}, f)
+        except Exception:
+            pass
+
     def close_app(self):
-        self.save_position(); self.root.destroy(); os._exit(0)
+        """✕：保存位置后退出（只关悬浮窗，不影响中继服务）。"""
+        self.save_position()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    # ---------------- 折叠 / 置顶 / 召回 ----------------
+    def toggle_fold(self):
+        """折叠/展开（按钮与 Ctrl+Alt+M 都走这里，线程安全）。"""
+        self._q.put(self._do_toggle_fold)
+
+    def _do_toggle_fold(self):
+        self.folded = not self.folded
+        if self.folded:
+            self.body.pack_forget()
+            self.footer.pack_forget()
+            self.btn_fold.config(text="➕")
+        else:
+            self.body.pack(fill="both", expand=True)
+            self.footer.pack(fill="x")
+            self.btn_fold.config(text="➖")
+        self._apply_geometry(initial=False)
+        self.save_position()
+
+    def toggle_pin(self):
+        self._q.put(self._do_toggle_pin)
+
+    def _do_toggle_pin(self):
+        self.pinned = not self.pinned
+        self.root.attributes("-topmost", bool(self.pinned))
+        self.btn_pin.config(fg=ACCENT if self.pinned else FG_HINT)
+        if self.pinned:
+            self.root.lift()
+        self.save_position()
+
+    def recall(self):
+        """召回：拉回屏幕内 + 重新置顶（按钮 🧭 与 Ctrl+Alt+H 都走这里）。"""
+        self._q.put(self._do_recall)
+
+    def _do_recall(self):
+        sw, sh = self._screen()
+        w, h = self._hud_size()
+        x, y = self._default_pos(sw, sh)
+        self._target = (x, y)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.pinned = True
+        self.root.attributes("-topmost", True)
+        self.btn_pin.config(fg=ACCENT)
+        try:
+            self.root.lift()
+        except Exception:
+            pass
+        self.save_position()
+        self._apply_ui("🧭 悬浮窗已召回并置顶", ACCENT, None, None)
+        beep_start()
+
+    # ---------------- 线程安全 UI 队列 ----------------
+    def _drain_queue(self):
+        """把工作线程塞进来的界面更新在主线程执行（Tk 不是线程安全的）。"""
+        try:
+            while True:
+                fn = self._q.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(80, self._drain_queue)
+        except Exception:
+            pass
+
     def update_ui(self, status=None, status_color=None, last=None, last_color=None):
-        if status is not None: self.lbl_status.config(text=status)
-        if status_color is not None: self.lbl_status.config(fg=status_color)
-        if last is not None: self.lbl_last.config(text=last)
-        if last_color is not None: self.lbl_last.config(fg=last_color)
+        """对外接口保持不变（F6~F10 都在用），但改为排队到主线程执行。"""
+        self._q.put(lambda: self._apply_ui(status, status_color, last, last_color))
+
+    def _apply_ui(self, status=None, status_color=None, last=None, last_color=None):
+        try:
+            if status is not None:
+                self.lbl_status.config(text=status)
+            if status_color is not None:
+                self.lbl_status.config(fg=status_color)
+            if last is not None:
+                self.lbl_last.config(text=last)
+            if last_color is not None:
+                self.lbl_last.config(fg=last_color)
+        except Exception:
+            pass
+
+    def _copy_last(self, event=None):
+        txt = ""
+        try:
+            txt = self.lbl_last.cget("text") or ""
+        except Exception:
+            pass
+        if not txt or txt.startswith("（尚无"):
+            return
+        try:
+            pyperclip.copy(txt)
+            self._apply_ui("📋 已复制「最近提炼」内容到剪贴板", ACCENT, None, None)
+        except Exception:
+            pass
+
+    # ---------------- 连接状态灯（中继 / 探针 / 手机端） ----------------
+    def _poll_links(self):
+        def work():
+            info = fetch_diag_info()
+            self._q.put(lambda: self.set_links(info))
+        threading.Thread(target=work, daemon=True).start()
+        try:
+            self.root.after(5000, self._poll_links)
+        except Exception:
+            pass
+
+    def set_links(self, info):
+        """info=None 表示中继没响应；{'legacy': True} 表示中继是旧版代码。"""
+        try:
+            relay_ok = isinstance(info, dict)
+            legacy = bool(relay_ok and info.get("legacy"))
+            probe = (info or {}).get("probe") or {}
+            probe_ok = bool(relay_ok and not legacy and probe.get("online"))
+            probe_v = probe.get("version") or ""
+            # 连上了却不上报版本 = Tampermonkey 里还是旧脚本：必须黄灯提示，不能显示成正常
+            probe_old = probe_ok and not probe_v
+            phone_n = 0
+            if relay_ok and not legacy:
+                phone_n = int(((info.get("mobile") or {}).get("online_clients") or 0))
+
+            self.lbl_relay.config(text="🟢中继" if relay_ok else "🔴中继",
+                                  fg=ACCENT if relay_ok else DANGER)
+            if probe_old:
+                self.lbl_probe.config(text="🟡探针旧版", fg=WARN)
+            else:
+                self.lbl_probe.config(
+                    text=(f"🟢探针v{probe_v}" if probe_v else "🟢探针") if probe_ok else "🔴探针",
+                    fg=ACCENT if probe_ok else DANGER)
+            self.lbl_phone.config(text=(f"🟢手机{phone_n}" if phone_n else "⚪手机"),
+                                  fg=ACCENT if phone_n else FG_DIM)
+
+            if not relay_ok:
+                self.lbl_links.config(text=f"⚠️ 中继未响应：请启动 bridge_server.py（{BRIDGE_PORT} 端口）", fg=WARN)
+            elif legacy:
+                self.lbl_links.config(text="⚠️ 中继是旧版代码（无 /api/diag）：请重启 bridge_server.py", fg=WARN)
+            elif probe_old:
+                self.lbl_links.config(text="⚠️ 油猴里是旧脚本：请用 /probe.js 覆盖粘贴并 Ctrl+S", fg=WARN)
+            else:
+                tk_info = info.get("ticket") or {}
+                kb = info.get("kb") or {}
+                self.lbl_links.config(
+                    text=(f"{tk_info.get('conversations', 0)} 会话 · {info.get('categories', 0)} 分类 · "
+                          f"{kb.get('total_rows', '-')} 规章 | F6下载 F7提炼 F9解答 F10润色"),
+                    fg=FG_DIM)
+        except Exception:
+            pass
 
 hud = None
 
@@ -154,7 +527,7 @@ def on_f7():
     beep_start()
     
     try:
-        resp = requests.get('http://127.0.0.1:8765/api/ticket', timeout=2)
+        resp = requests.get(f'{BRIDGE_BASE}/api/ticket', timeout=2)
         data = resp.json()
         if not data or not data.get("playerInfo"):
             if hud: hud.update_ui(status="⚠️ 获取失败: 当前无活跃工单数据", status_color="#CE9178")
@@ -281,9 +654,45 @@ def register_hotkeys():
     keyboard.add_hotkey('f8', lambda: threading.Thread(target=on_f7, daemon=True).start())   # F8 = F7 别名（历史文档一直提到 F8）
     keyboard.add_hotkey('f9', lambda: threading.Thread(target=on_f9, daemon=True).start(), suppress=True)
     keyboard.add_hotkey('f10', lambda: threading.Thread(target=on_f10, daemon=True).start(), suppress=True)
+    # 悬浮窗自救热键：任何情况下都能把窗找回来（F 键被别的软件抢也不怕）
+    keyboard.add_hotkey('ctrl+alt+h', recall_hud)
+    keyboard.add_hotkey('ctrl+alt+m', toggle_hud_fold)
     keyboard.wait()
 
+
+def recall_hud():
+    """Ctrl+Alt+H：把悬浮窗拉回屏幕内并重新置顶。"""
+    if hud:
+        hud.recall()
+    else:
+        beep_error()
+
+
+def toggle_hud_fold():
+    """Ctrl+Alt+M：折叠 / 展开悬浮窗。"""
+    if hud:
+        hud.toggle_fold()
+
+
 if __name__ == "__main__":
+    enable_dpi_awareness()            # 先把 DPI 定下来，坐标才不会错乱
+    if not acquire_single_instance():
+        # 已有实例在跑：不要再开第二个（否则两套热键互相打架）
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "工单助手悬浮窗已经在运行了。\n\n"
+                "如果屏幕上看不到它，请按 Ctrl+Alt+H 召回；\n"
+                "或先在任务管理器结束 pythonw.exe，再重新启动。",
+                "工单助手", 0x40)
+        except Exception:
+            pass
+        sys.exit(0)
+
     threading.Thread(target=register_hotkeys, daemon=True).start()
     hud = HUDOverlay()
+    if getattr(hud, "_pos_fixed", False):
+        hud.root.after(200, lambda: hud.update_ui(
+            status="🛠 悬浮窗原坐标在屏幕外，已自动移回", status_color=WARN))
     hud.root.mainloop()

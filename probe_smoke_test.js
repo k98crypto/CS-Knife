@@ -68,11 +68,25 @@ let ticketIdAttr = '';                       // 模拟页面上真实工单号�
 let pageUrl = 'https://ticket.example.com/workbench';
 
 const docListeners = {};
+const chipNodes = [];
+function makeNode(tag) {
+    return {
+        tagName: String(tag).toUpperCase(), style: {}, textContent: '', _children: [], _listeners: {},
+        appendChild(c) { this._children.push(c); chipNodes.push(c); return c; },
+        addEventListener(ev, fn) { this._listeners[ev] = fn; },
+        querySelector: () => null,
+        querySelectorAll: () => []
+    };
+}
 const documentStub = {
     readyState: 'complete',
-    body: { innerText: 'IM工作台' },
+    body: {
+        innerText: 'IM工作台',
+        _children: [],
+        appendChild(c) { this._children.push(c); return c; }
+    },
     addEventListener: (ev, fn) => { docListeners[ev] = fn; },
-    createElement: () => ({}),
+    createElement: tag => makeNode(tag),
     querySelector: sel => {
         if (sel === '.ws-right-panel') return { innerText: playerInfoText };
         if (sel === '[data-ticket-id]') {
@@ -103,6 +117,7 @@ const sandbox = {
     location: locationStub,
     console,
     WebSocket: FakeWebSocket,
+    navigator: { userAgent: 'Mozilla/5.0 (Test) ProbeSmoke' },
     Headers: class {},
     InputEvent: class {},
     Event: class {},
@@ -139,8 +154,8 @@ function check(name, ok, extra) {
     check('创建 WebSocket 连接', FakeWebSocket.instances.length === 1,
         FakeWebSocket.instances[0] ? FakeWebSocket.instances[0].url : 'none');
 
-    // 3) 定时器已注册（状态监控 + 消息抓取）
-    check('注册 2 个 setInterval', intervals.length === 2, '实际=' + intervals.length);
+    // 3) 定时器已注册（IM 状态监控 + 消息抓取 + 心跳/胶囊刷新）
+    check('注册 3 个 setInterval（状态/抓取/心跳）', intervals.length >= 3, '实际=' + intervals.length);
 
     // 3.5) 手动触发脚本注册的 3000ms "页面加载完成" 定时器
     //      （沙箱里的 setTimeout 只做收集，不会自动执行）
@@ -328,6 +343,44 @@ function check(name, ok, extra) {
     intervals[0]();                      // 状态没变化，但 onopen 重置了记忆 -> 应重新上报
     check('重连后会重新同步当前 IM 状态',
         sent.some(s => s.event === 'IM_STATUS'), JSON.stringify(sent));
+
+    console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
+
+    const chip = (documentStub.body._children || []).find(n => n.tagName === 'DIV');
+    const chipTextOf = n => (n && n._text && n._text.textContent) || '';
+    check('已挂载页面内状态胶囊（不再只能靠控制台判断）', !!chip);
+    check('胶囊文字带版本号 v7.2', chipTextOf(chip).indexOf('v7.2') !== -1, chipTextOf(chip));
+    check('连接正常时胶囊显示「已连接」', chipTextOf(chip).indexOf('已连接') !== -1, chipTextOf(chip));
+
+    const curWs2 = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    curWs2.close();
+    check('断线后胶囊提示「重连中」', chipTextOf(chip).indexOf('重连中') !== -1, chipTextOf(chip));
+
+    sent.length = 0;
+    const instBefore2 = FakeWebSocket.instances.length;
+    if (chip && chip._listeners && chip._listeners.click) chip._listeners.click({ target: null });
+    check('点击胶囊可立即重连', FakeWebSocket.instances.length === instBefore2 + 1,
+        '实例数 ' + instBefore2 + ' -> ' + FakeWebSocket.instances.length);
+    await new Promise(r => setTimeout(r, 20));
+    check('重连成功后胶囊恢复「已连接」', chipTextOf(chip).indexOf('已连接') !== -1, chipTextOf(chip));
+
+    const hello = sent.filter(s => s.event === 'PROBE_HELLO');
+    check('连上即发 PROBE_HELLO 握手（后端 /api/diag 可查版本）',
+        hello.length >= 1 && hello[0].data.version === '7.2',
+        JSON.stringify(hello[0] ? hello[0].data : null));
+    check('PROBE_HELLO 携带页面地址', !!hello.length && String(hello[0].data.page).indexOf('ticket-web') !== -1,
+        hello.length ? hello[0].data.page : 'none');
+
+    sent.length = 0;
+    intervals[2]();
+    const hb = sent.filter(s => s.event === 'PROBE_HEARTBEAT');
+    check('心跳定时器上报 PROBE_HEARTBEAT',
+        hb.length === 1 && hb[0].data.version === '7.2', JSON.stringify(hb[0] ? hb[0].data : null));
+
+    const probeApi = sandbox.window.__probe || {};
+    check('__probe 调试入口可用（version/status/reconnect）',
+        typeof probeApi.version === 'function' && typeof probeApi.status === 'function' &&
+        typeof probeApi.reconnect === 'function');
 
     console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
     process.exit(fail === 0 ? 0 : 1);

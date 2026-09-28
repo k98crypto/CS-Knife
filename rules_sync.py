@@ -47,7 +47,8 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 def load_config() -> dict:
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        # utf-8-sig：兼容记事本/PowerShell 写出的带 BOM 的 UTF-8（否则 json.load 直接失败）
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except Exception:
         return {}

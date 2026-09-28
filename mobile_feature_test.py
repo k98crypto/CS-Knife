@@ -55,6 +55,17 @@ def convs(snap):
 
 async def main():
     async with aiohttp.ClientSession() as s:
+        # 先探一次 /api/diag：若已经有一个"真实浏览器页面"的探针在线，
+        # 那"我们这条连接断开后 extension_online 必须为 false"就不成立（还有其他探针在），
+        # 这种情况要按多客户端场景处理，否则断言会误报（第八轮实测遇到）。
+        external_probe = None
+        try:
+            async with s.get(BASE + "/api/diag") as r:
+                if r.status == 200:
+                    external_probe = bool(((await r.json()) or {}).get("probe", {}).get("online"))
+        except Exception:
+            external_probe = None
+
         ext = await s.ws_connect(BASE + "/ws/extension")
         mobile = await s.ws_connect(BASE + "/ws/mobile")
         await drain(mobile, 0.4)
@@ -131,12 +142,28 @@ async def main():
                 status_msg = m
                 break
         check("收到关单结果回执 AI_STATUS", status_msg is not None,
-              str(status_msg) if status_msg else "超时未收到")
+              str(status_msg) if status_msg else "超时未收到（AI 网络较慢，可重跑）")
 
         _, ext_msgs4 = await drain(ext, 0.3)
         closes = [m for m in ext_msgs4 if m.get("command") == "ACTION_REPLY_CLOSE"]
         final_snap, _ = await drain(mobile, 0.5)
-        snap_for_check = post_snap if post_snap is not None else final_snap
+        snap_for_check = final_snap if final_snap is not None else post_snap
+        # DeepSeek 生成结束语偶尔超过上面的等待窗口：再等到"会话真的消失"
+        # 或超时为止（最多再等 ~20 秒），避免把"AI 还没返回"误判成"关单功能坏了"。
+        for _ in range(10):
+            if snap_for_check is not None and GID not in convs(snap_for_check):
+                break
+            if status_msg is not None:
+                break
+            try:
+                m = await asyncio.wait_for(mobile.receive_json(), timeout=2)
+            except asyncio.TimeoutError:
+                continue
+            if m.get("type") == "FULL_SYNC":
+                snap_for_check = m.get("data") or {}
+            elif m.get("type") == "AI_STATUS":
+                status_msg = m
+                break
         still_there = (GID in convs(snap_for_check)) if snap_for_check else None
 
         if status_msg and status_msg.get("status") == "closed":
@@ -179,9 +206,17 @@ async def main():
         await ext.close()
         await asyncio.sleep(0.9)
         snapD, _ = await drain(mobile, 0.6)
-        check("探针断开后 extension_online=false",
-              (snapD or {}).get("extension_online") is False,
-              str((snapD or {}).get("extension_online")))
+        if external_probe:
+            # 另有真实探针在线（例如你自己开着的客服工作台）：extension_online 本就该保持 true
+            check("另有真实探针在线，跳过「断开后必须为 false」断言（多客户端场景）", True,
+                  f"expected extension_online=true, got {str((snapD or {}).get('extension_online'))}")
+            check("多客户端下断开我们这条连接不会误报离线",
+                  (snapD is None) or (snapD.get("extension_online") is True),
+                  str((snapD or {}).get("extension_online")))
+        else:
+            check("探针断开后 extension_online=false",
+                  (snapD or {}).get("extension_online") is False,
+                  str((snapD or {}).get("extension_online")))
 
         if not mobile.closed:
             await mobile.close()

@@ -38,7 +38,9 @@ BASE_DIR = get_real_base_dir()
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 try:
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f: config = json.load(f)
+    # utf-8-sig：兼容带 BOM 的 config.json（记事本另存/PowerShell 重定向都可能加 BOM，
+    # 否则 json.load 会失败并静默回退到默认配置 —— 表现为"密钥/端口突然失效"）
+    with open(CONFIG_PATH, 'r', encoding='utf-8-sig') as f: config = json.load(f)
 except Exception:
     config = {"port": 8765, "bark_key": "YOUR_BARK_KEY"}
 
@@ -64,6 +66,8 @@ state = {
     "alarm_status": False,
     "im_status": 1,                 # 1=IM在线 2=IM忙碌 3=IM离线（由探针上报真实值）
     "extension_online": False,      # 电脑端探针是否在线（决定手机端能否远程操作）
+    "probe_version": "",            # 探针（油猴脚本）版本号，来自 PROBE_HELLO/PROBE_HEARTBEAT
+    "probe_last_seen": 0,           # 探针最近一次心跳时间戳（秒），手机端可据此判断新鲜度
     "category_options": [],         # 从网页级联选择器抓到的真实问题分类（供 AI 选分类）
     "companies": { "main": { "name": "示例专线", "status": 1, "conversations": {} } }
 }
@@ -78,6 +82,33 @@ _IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，�
 
 # 最近一次有消息活动的工单 ID（供 /api/ticket 定位"当前工单"，比按插入顺序取最后一个更准）
 _LAST_ACTIVE = {"gid": None}
+
+# ==================== 探针自检元数据（排障用，见 GET /api/diag） ====================
+# 作用：把"油猴脚本到底加载了没、跑的是哪一版"从猜测变成可查事实。
+# _PROBE_CONNS 按"每条连接"记录，避免旧脚本（不上报版本）连接后
+# 还继续显示上一次的版本号（第七轮实测到的误导：界面显示 v7.2，实际浏览器里是旧脚本）。
+_PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
+_PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
+SERVER_START = time.time()
+SERVER_VER = "7.2"
+
+
+def _probe_refresh():
+    """按"最近一次上报"刷新全局探针元数据；没有任何上报时清空（不回显旧值）。"""
+    live = [v for v in _PROBE_CONNS.values() if v.get("last_seen")]
+    if not live:
+        _PROBE_META.update({"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0})
+        state["probe_version"] = ""
+        state["probe_last_seen"] = 0
+        return
+    newest = max(live, key=lambda v: v["last_seen"])
+    _PROBE_META["version"] = newest.get("version", "") or ""
+    _PROBE_META["page"] = newest.get("page", "") or ""
+    _PROBE_META["ua"] = newest.get("ua", "") or ""
+    _PROBE_META["last_seen"] = newest["last_seen"]
+    _PROBE_META["hello_count"] = sum(1 for v in live if v.get("hello"))
+    state["probe_version"] = _PROBE_META["version"]
+    state["probe_last_seen"] = int(_PROBE_META["last_seen"])
 
 
 async def safe_send(client, payload):
@@ -623,12 +654,178 @@ async def api_categories(request):
         "hint": "若 options 为空，请确认电脑端探针已连上，并已打开过一次工单（含问题分类选择器）",
     })
 
+def _kb_stats():
+    """知识库概况（诊断页用）。任何异常都不能影响诊断接口本身。"""
+    try:
+        sheets = getattr(core, "sheet_stats", {}) or {}
+        return {
+            "static_chars": len(getattr(core, "kb_static", "") or ""),
+            "entries": len(getattr(core, "kb_entries", []) or []),
+            "sheets": len(sheets),
+            "total_rows": sum(sheets.values()),
+            "rules_mtime": int(core.rules_mtime() or 0),
+        }
+    except Exception as e:
+        return {"error": str(e)[:80]}
+
+
+async def api_diag(request):
+    """一键自检：中继 / 探针 / 手机端 到底谁没在线（排障第一入口）。"""
+    convs = state["companies"]["main"]["conversations"]
+    now = time.time()
+    last_seen = _PROBE_META.get("last_seen") or 0
+    return web.json_response({
+        "ok": True,
+        "server_ver": SERVER_VER,
+        "server": {
+            "port": PORT,
+            "ip": get_local_ip(),
+            "pid": os.getpid(),
+            "uptime_sec": int(now - SERVER_START),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(SERVER_START)),
+        },
+        "probe": {
+            "online": bool(active_clients["extension"]),
+            "version": _PROBE_META.get("version") or "",
+            "version_reported": bool(_PROBE_META.get("version")),
+            "page": _PROBE_META.get("page") or "",
+            "last_seen_sec": (int(now - last_seen) if last_seen else None),
+            "hello_count": _PROBE_META.get("hello_count", 0),
+            "expected_version": SERVER_VER,
+        },
+        "mobile": {"online_clients": len(active_clients["mobile"])},
+        "ticket": {
+            "active_gid": _LAST_ACTIVE.get("gid"),
+            "active_name": (convs.get(_LAST_ACTIVE.get("gid")) or {}).get("name", ""),
+            "conversations": len(convs),
+        },
+        "kb": _kb_stats(),
+        "categories": len(state.get("category_options") or []),
+        "config": {
+            "rules_auto_sync": bool(config.get("rules_auto_sync", True)),
+            "rules_sync_interval_minutes": config.get("rules_sync_interval_minutes", 30),
+            "kb_retrieval_enabled": bool(config.get("kb_retrieval_enabled", True)),
+            "kb_retrieval_top_k": config.get("kb_retrieval_top_k", 25),
+            "local_excel": os.path.basename(str(config.get("local_excel_path", ""))),
+            "close_category_path": config.get("close_category_path"),
+        },
+        "hint": "probe.online=false => 油猴脚本没跑起来；probe.version 落后 => TM 里是旧脚本",
+    })
+
+
+async def probe_js_handler(request):
+    """把项目里最新的探针脚本直接发给浏览器。
+
+    用途：打开 `http://IP:8765/probe.js` 即可核对油猴里那版是不是最新；
+    加 `?download=1` 直接下载。省去"脚本从哪拷"的沟通成本。
+    """
+    path = os.path.join(BASE_DIR, "probe.js")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            body = f.read()
+    except Exception:
+        return web.json_response({"ok": False, "error": "probe.js 不存在于项目目录"}, status=404)
+    headers = {"Cache-Control": "no-store"}
+    if request.query.get("download"):
+        headers["Content-Disposition"] = 'attachment; filename="probe.js"'
+    return web.Response(text=body, content_type="application/javascript", headers=headers)
+
+
+# 诊断页：纯服务端渲染 + meta 自动刷新（不用 JS，iOS 上也不会有缓存/点击问题）
+DIAG_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>示例公司 系统自检</title>
+<style>
+ body{margin:0;padding:16px;background:#0F1115;color:#E6E6E6;
+      font:15px/1.6 -apple-system,"Microsoft YaHei UI",system-ui,sans-serif}
+ h1{font-size:18px;margin:0 0 12px}
+ .card{background:#181B21;border:1px solid #262B34;border-radius:12px;padding:12px 14px;margin-bottom:12px}
+ .k{color:#8A93A0;font-size:13px}
+ .v{font-weight:600;word-break:break-all}
+ .ok{color:#4EC9B0}.bad{color:#F44747}
+ .row{display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px dashed #232830}
+ .row:last-child{border-bottom:none}
+ a{color:#63B3ED}
+</style></head><body>
+<h1>🩺 示例公司 系统自检 <span class="k">（每 5 秒自动刷新）</span></h1>
+$CARDS
+<p class="k">探针未连接？看手册第 12.2 节：确认 Tampermonkey 里贴的是最新
+<a href="/probe.js">probe.js</a>（v$EXPECT_VER）且脚本已启用，然后刷新工作台页面。</p>
+</body></html>"""
+
+
+def _diag_dot(ok, text):
+    return '<span class="%s">%s</span>' % ("ok" if ok else "bad", text)
+
+
+async def diag_page_handler(request):
+    """给人看的自检页：中继 / 探针 / 手机端 / 知识库 一屏看懂。"""
+    now = time.time()
+    last_seen = _PROBE_META.get("last_seen") or 0
+    convs = state["companies"]["main"]["conversations"]
+    probe_online = bool(active_clients["extension"])
+    probe_v = _PROBE_META.get("version") or ""
+    probe_old = probe_online and not probe_v      # 连上了却不上报版本 = 油猴里是旧脚本
+    if probe_old:
+        probe_line = '🟡 已连接 · 未上报版本（旧脚本）'
+    elif probe_online:
+        probe_line = '🟢 已连接' + ((" · v" + probe_v) if probe_v else "")
+    else:
+        probe_line = '🔴 未连接'
+    kb = _kb_stats()
+
+    def row(label, value):
+        return '<div class="row"><span>%s</span><span class="v">%s</span></div>' % (label, value)
+
+    cards = []
+    cards.append('<div class="card"><div class="k">中继服务 bridge_server.py</div>' +
+                 row("状态", _diag_dot(True, "🟢 运行中 · 已运行 %d 秒" % int(now - SERVER_START))) +
+                 row("监听地址", "http://%s:%s · pid %s" % (get_local_ip(), PORT, os.getpid())) +
+                 '</div>')
+
+    cards.append('<div class="card"><div class="k">电脑端探针（油猴脚本）</div>' +
+                 row("连接状态", _diag_dot(probe_online and not probe_old, probe_line)) +
+                 row("最近心跳", ("%d 秒前" % int(now - last_seen)) if last_seen else "无") +
+                 row("当前页面", _PROBE_META.get("page") or "-") +
+                 row("脚本版本", "%s（期望 v%s）" % (("v" + probe_v) if probe_v else "未上报", SERVER_VER)) +
+                 '</div>')
+
+    if probe_old:
+        cards.append('<div class="card"><div class="k">⚠️ 需要更新油猴脚本</div>'
+                     '<div class="v">探针已连上，但不上报版本号 —— 说明 Tampermonkey 里仍是旧脚本（&lt; v'
+                     + SERVER_VER + '）。<br>把 <a href="/probe.js">/probe.js</a> 的内容整段覆盖粘贴 → Ctrl+S → '
+                     '刷新工作台页面即可。</div></div>')
+
+    cards.append('<div class="card"><div class="k">手机端</div>' +
+                 row("在线连接数", len(active_clients["mobile"])) +
+                 '</div>')
+
+    cards.append('<div class="card"><div class="k">工单与知识库</div>' +
+                 row("会话数", len(convs)) +
+                 row("问题分类数", len(state.get("category_options") or [])) +
+                 row("规章条目", "%s 条 / %s 张表" % (kb.get("total_rows", kb.get("error", "-")),
+                                                      kb.get("sheets", "-"))) +
+                 row("常驻静态区", "%s 字符" % kb.get("static_chars", "-")) +
+                 '</div>')
+
+    html = DIAG_HTML.replace("$CARDS", "".join(cards)).replace("$EXPECT_VER", SERVER_VER)
+    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
 async def ws_ext_handler(request):
     # heartbeat=30：定期 ping，及时发现 iOS 退后台/网络抖动造成的死连接
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     active_clients["extension"].add(ws)
+    _PROBE_CONNS.setdefault(ws, {})
     state["extension_online"] = True
+    # 排障用横幅：一眼看出"电脑端探针到底连上来了没"（含来源页，便于识破多开/错页面）
+    print(f"[探针] ✅ 已连接 · 来源: {request.headers.get('Referer', '未知')}")
+    # 8 秒内不上报版本 => 油猴里还是旧脚本（< 7.2），主动喊一嗓子
+    asyncio.create_task(_probe_hello_watchdog(ws))
     for m in list(active_clients["mobile"]):
         await safe_send(m, {"type": "FULL_SYNC", "data": state})
     # 探针一连上就请它回报网页上的真实问题分类（供手机端 AI 一键关单选分类）
@@ -655,6 +852,26 @@ async def ws_ext_handler(request):
                             _IM_AUTH_FP["value"] = fp
                             print(f"[OK] 探针认证头已更新：{len(headers_data)} 个字段（内容变更）")
                     continue  # 不回复探针，且绝不写入 state
+
+                # 探针握手 / 心跳：让"脚本加载了没、哪一版"变成后端可查事实
+                if ev in ("PROBE_HELLO", "PROBE_HEARTBEAT"):
+                    data = pkt.get("data") or {}
+                    rec = _PROBE_CONNS.setdefault(ws, {})
+                    rec["version"] = (str(data.get("version") or rec.get("version") or "")[:16])
+                    if data.get("page"):
+                        rec["page"] = str(data["page"])[:200]
+                    if data.get("ua"):
+                        rec["ua"] = str(data["ua"])[:120]
+                    rec["last_seen"] = time.time()
+                    if ev == "PROBE_HELLO":
+                        rec["hello"] = True
+                    _probe_refresh()
+                    if ev == "PROBE_HELLO":
+                        print(f"[探针] 🚀 握手成功：v{rec['version'] or '未知版本'} · {rec.get('page') or '未提供页面地址'}")
+                        print(f"[探针] 提示：手机端为空时请在电脑上打开一个工单（诊断页 http://127.0.0.1:{PORT}/diag）")
+                        for m in list(active_clients["mobile"]):
+                            await safe_send(m, {"type": "FULL_SYNC", "data": state})
+                    continue
 
                 # 探针回报的问题分类（用于手机端 AI 自动选分类关单）
                 if ev == "CATEGORY_OPTIONS":
@@ -749,12 +966,35 @@ async def ws_ext_handler(request):
                     asyncio.create_task(handle_ai_automation(gid))
     finally:
         active_clients["extension"].discard(ws)
+        _PROBE_CONNS.pop(ws, None)
+        _probe_refresh()
         if not active_clients["extension"]:
             # 电脑端网页关闭/探针掉线：手机端必须能看出来，避免显示过期状态
             state["extension_online"] = False
+            print("[探针] ❌ 已断开（网页被关闭 / 网络抖动 / 油猴脚本被停用）")
             for m in list(active_clients["mobile"]):
                 await safe_send(m, {"type": "FULL_SYNC", "data": state})
     return ws
+
+
+async def _probe_hello_watchdog(ws, delay=8.0):
+    """连接 8 秒仍未上报版本 => 说明 Tampermonkey 里是旧脚本（< v7.2）。
+
+    这正是"脚本到底加载了没"最容易误判的场景：连接正常（所以看起来一切 OK），
+    但新功能（自检胶囊 / 状态上报 / 问题分类）统统没有。
+    """
+    try:
+        await asyncio.sleep(delay)
+    except Exception:
+        return
+    if ws not in active_clients["extension"]:
+        return
+    if (_PROBE_CONNS.get(ws) or {}).get("version"):
+        return
+    print("[探针] ⚠️ 已连接但未上报版本 => Tampermonkey 里仍是旧脚本（< v7.2）")
+    print(f"[探针] ⚠️ 请打开 http://127.0.0.1:{PORT}/probe.js 取最新脚本，整段覆盖粘贴后 Ctrl+S 保存")
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "FULL_SYNC", "data": state})
 
 async def handle_ai_close(group_id: str):
     """手机端「AI 回复并关单」。
@@ -946,8 +1186,11 @@ app = web.Application()
 app.on_startup.append(_on_startup)
 app.on_cleanup.append(_on_cleanup)
 app.router.add_get("/", index_handler)
+app.router.add_get("/diag", diag_page_handler)
+app.router.add_get("/probe.js", probe_js_handler)
 app.router.add_get("/api/ticket", api_current_ticket)
 app.router.add_get("/api/categories", api_categories)
+app.router.add_get("/api/diag", api_diag)
 app.router.add_get("/ws/extension", ws_ext_handler)
 app.router.add_get("/ws/mobile", ws_mobile_handler)
 
@@ -956,5 +1199,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("[启动] IM 移动端中继与 AI 自动托管服务已启动！")
     print(f"手机访问: http://{local_ip}:{PORT}")
+    print(f"系统自检: http://127.0.0.1:{PORT}/diag   （探针/手机端是否在线一屏看懂）")
+    print(f"探针脚本: http://127.0.0.1:{PORT}/probe.js （核对油猴里那版是否最新 v{SERVER_VER}）")
     print("=" * 60)
     web.run_app(app, host="0.0.0.0", port=PORT)

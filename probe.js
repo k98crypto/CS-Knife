@@ -1,21 +1,34 @@
 // ==UserScript==
-// @name         客服助手 - 智能工单探针 (V7 靶点精调与数组覆盖版)
+// @name         客服助手 - 智能工单探针 (V7.2 自检可见版)
 // @namespace    http://tampermonkey.net/
-// @version      7.1
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连
+// @version      7.2
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连、页面内状态胶囊（一眼确认脚本是否生效）
 // @match        *://ticket.example.com/*
+// @match        *://ticket.example.com/*
+// @run-at       document-idle
+// @noframes
 // @grant        none
 // ==/UserScript==
 
 (function() {
     'use strict';
-    console.log("🚀 [客服助手探针 V7.1] 真实靶点定位系统与防暴雷机制已就绪！");
+
+    const PROBE_VERSION = "7.2";
+    console.log("🚀 [客服助手探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
+    console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
     let audioCtx = null;
     let sirenInterval = null;
     let isManualOffline = false;
     let lastIMStatus = null;          // 上一次上报过的 IM 状态，用于变化检测
     window.__im_auth_headers = {};
+
+    // ==================== 自检状态（页面内胶囊 + __probe 调试入口） ====================
+    let chipEl = null;                // 页面内状态胶囊 DOM
+    let chipKind = 'idle';            // idle | connected | waiting | dead
+    let chipDetail = "";              // 附加说明（如"3 秒后重连"）
+    let chipHidden = false;           // 用户手动关掉胶囊后不再自动弹出
+    let lastSendAt = 0;               // 最近一次成功发出的时间戳
 
     // ==================== 工具函数 ====================
     // 归一化文本：去掉所有空白字符，兼容 "IM离线" 与 "IM 离线" 两种写法
@@ -39,6 +52,84 @@
         if (!panes.length) return [];
         const last = panes[panes.length - 1];
         return Array.from(last.querySelectorAll('.el-cascader-node')).filter(n => n.offsetParent !== null);
+    }
+
+    // ==================== 页面内状态胶囊（一眼确认"油猴脚本到底生效了没"） ====================
+    // 旧版全靠控制台日志判断，客服看不到日志就以为"脚本没了"。
+    // 这里在页面左下角常驻一个小胶囊：绿=已连上中继，黄=正在重连，红=没连上。
+    // 单击胶囊 = 立刻重连；点右侧 ✕ = 收起（刷新页面后重新出现）。
+    const CHIP_STYLE = {
+        connected: { bg: "#1B4B36", fg: "#7CE3B0", dot: "🟢", label: "已连接" },
+        waiting:   { bg: "#4A3C10", fg: "#F0C674", dot: "🟡", label: "重连中" },
+        dead:      { bg: "#4A1D1A", fg: "#F28B82", dot: "🔴", label: "未连接" },
+        idle:      { bg: "#2A2F3A", fg: "#AAB2BF", dot: "⚪", label: "启动中" }
+    };
+
+    function ensureChip() {
+        if (chipEl) return chipEl;
+        try {
+            if (!document || !document.body || typeof document.body.appendChild !== "function") return null;
+            if (typeof document.createElement !== "function") return null;
+            const box = document.createElement("div");
+            if (!box || !box.style) return null;
+            box.style.cssText = [
+                "position:fixed", "left:12px", "bottom:12px", "z-index:2147483000",
+                "display:flex", "align-items:center", "gap:6px",
+                "padding:5px 10px", "border-radius:14px",
+                "font:12px/1.4 'Microsoft YaHei UI',system-ui,sans-serif",
+                "box-shadow:0 2px 10px rgba(0,0,0,.35)", "cursor:pointer",
+                "user-select:none", "opacity:.93", "pointer-events:auto"
+            ].join(";");
+
+            const txt = document.createElement("span");
+            box.appendChild(txt);
+
+            const closeBtn = document.createElement("span");
+            closeBtn.textContent = "✕";
+            closeBtn.style.cssText = "opacity:.6;padding:0 2px;font-size:11px";
+            box.appendChild(closeBtn);
+
+            box.addEventListener("click", function (ev) {
+                if (ev && ev.target === closeBtn) {
+                    chipHidden = true;
+                    box.style.display = "none";
+                    return;
+                }
+                console.log("🔄 [探针] 手动触发重连…");
+                reconnectAttempts = 0;
+                connectBrain();
+            });
+
+            document.body.appendChild(box);
+            chipEl = box;
+            chipEl._text = txt;
+            return chipEl;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function setChip(kind, detail) {
+        chipKind = kind || 'idle';
+        chipDetail = detail || "";
+        renderChip();
+    }
+
+    function renderChip() {
+        if (chipHidden) return;
+        reassertChipText();
+    }
+
+    function reassertChipText() {
+        const el = ensureChip();
+        if (!el || !el._text || !el.style) return;
+        const cfg = CHIP_STYLE[chipKind] || CHIP_STYLE.idle;
+        const extra = chipDetail ? "（" + chipDetail + "）" : "";
+        try {
+            el._text.textContent = cfg.dot + " 探针 v" + PROBE_VERSION + " · " + cfg.label + extra;
+            el.style.background = cfg.bg;
+            el.style.color = cfg.fg;
+        } catch (e) {}
     }
 
     // ==================== 工单身份识别（区分不同玩家，手机端才能分别显示） ====================
@@ -274,6 +365,7 @@
         if (ws && ws.readyState === WebSocket.OPEN) {
             try {
                 ws.send(JSON.stringify(payload));
+                lastSendAt = Date.now();
                 return true;
             } catch (e) {
                 return false;
@@ -286,10 +378,12 @@
     function scheduleReconnect() {
         if (reconnectAttempts >= maxReconnectAttempts) {
             console.error("❌ [探针] 重连已达上限，请确认中继服务 (bridge_server.py) 是否已启动");
+            setChip('dead', "重连已放弃，点此重试");
             return;
         }
         reconnectAttempts++;
         const delay = Math.min(3000 * reconnectAttempts, 30000);
+        setChip('waiting', (delay / 1000) + " 秒后第 " + reconnectAttempts + " 次重连");
         clearTimeout(wsReconnectTimer);
         wsReconnectTimer = setTimeout(connectBrain, delay);
         console.warn("⚠️ [探针] " + (delay / 1000) + " 秒后进行第 " + reconnectAttempts + " 次重连...");
@@ -319,6 +413,11 @@
             console.log("✅ [探针] WebSocket 连接成功");
             reconnectAttempts = 0;   // 连接成功后才重置重连计数
             lastIMStatus = null;     // 重连后强制把当前 IM 状态重新同步一次
+            setChip('connected', "");
+            // 握手：把"油猴脚本到底跑了没、跑的哪一版"变成后端可查的事实（GET /api/diag）
+            const pageUrl = (function () { try { return location.href; } catch (e) { return ""; } })();
+            const ua = (typeof navigator !== "undefined" && navigator.userAgent) ? navigator.userAgent.slice(0, 120) : "";
+            sendToBrain({ event: "PROBE_HELLO", data: { version: PROBE_VERSION, page: pageUrl, ua: ua } });
             // 延迟发送 HEADERS_SYNC，确保 fetch 拦截器已捕获 Token
             setTimeout(() => {
                 if (window.__im_auth_headers && Object.keys(window.__im_auth_headers).length > 0) {
@@ -330,12 +429,13 @@
         };
 
         ws.onclose = (e) => {
-            console.warn("⚠️ [探针] WebSocket 断开 (code=" + e.code + ")");
+            console.warn("⚠️ [探针] WebSocket 断开 (code=" + e.code + ")，准备重连");
             scheduleReconnect();
         };
 
         ws.onerror = () => {
-            console.error("❌ [探针] WebSocket 错误（中继服务可能未启动）");
+            console.error("❌ [探针] WebSocket 错误（中继服务 bridge_server.py 可能未启动）");
+            setChip('dead', "请确认中继服务已启动");
         };
 
         ws.onmessage = (event) => {
@@ -482,7 +582,36 @@
         window._lastChatHash = currentHash;
     }, 2000);
 
+    // ==================== 定时任务 3：心跳 + 胶囊状态刷新 ====================
+    // 心跳让后端 /api/diag 能显示"探针活着、跑的是哪一版"，胶囊让客服肉眼可见。
+    setInterval(() => {
+        if (!sendToBrain({
+            event: "PROBE_HEARTBEAT",
+            data: {
+                version: PROBE_VERSION,
+                page: (function () { try { return location.href; } catch (e) { return ""; } })(),
+                lastSendAgoMs: lastSendAt ? (Date.now() - lastSendAt) : -1
+            }
+        })) {
+            return;                       // 未连接时不刷新胶囊文字，避免盖掉重连倒计时
+        }
+        if (chipKind !== 'connected') setChip('connected', "");
+    }, 30000);
+
+    // ==================== 调试入口（客服/运维可在控制台直接调用） ====================
+    window.__probe = {
+        version: function () { console.log("探针版本 v" + PROBE_VERSION); return PROBE_VERSION; },
+        status: function () {
+            const st = { version: PROBE_VERSION, kind: chipKind, detail: chipDetail,
+                         wsState: ws ? ws.readyState : -1, online: !!(ws && ws.readyState === WebSocket.OPEN) };
+            console.table ? console.table(st) : console.log(st);
+            return st;
+        },
+        reconnect: function () { reconnectAttempts = 0; connectBrain(); return "已触发重连"; }
+    };
+
     // ==================== 启动 ====================
+    setChip('idle', "");
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', connectBrain);
     else connectBrain();
 })();
