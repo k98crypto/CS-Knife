@@ -37,8 +37,10 @@ wheels/
 build/
 dist/
 *.spec.bak
-# PyInstaller 生成的 exe（可选，如果需要版本控制可注释掉）
+# PyInstaller 生成的 exe
 launcher.exe
+# Windows 启动脚本（本地使用，不上传）
+launcher.bat
 
 # ==================== IDE 与编辑器 ====================
 # VS Code
