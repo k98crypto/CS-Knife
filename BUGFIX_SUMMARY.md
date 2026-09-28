@@ -265,12 +265,93 @@ node probe_smoke_test.js probe.js -> 18 通过 / 0 失败
 | `token_leak_test.py` | 启服 + 模拟探针/手机端，验证 Token 不进入广播载荷（含去重验证） |
 | `agent_core_test.py` | 验证疑难单标记归一化、AI 报错不外发、前后端契约一致性 |
 
-### 本轮**未**处理（P1/P2，留待后续）
+### 第四轮修复（P1 / P2）
 
-`HTML_CONTENT` 的 XSS（第 274 行 `innerHTML`）、H5 按钮无 `readyState` 检查、
-H5 无限重连无退避、`json.loads` 无 try、`conversations[gid]` / `m['sender']` 无 `.get()` 防御、
-emoji 在 stdout 重定向时崩溃、`push_bark` 的 `group_id` 参数未使用、
-`sanitize_reply` 的 `(?i)bug` 误伤 `debug`、DeepSeek 调用无重试等。
+#### P1-C2: emoji 导致 stdout 重定向时服务崩溃
+
+- **文件**: `bridge_server.py:419,420`、`launcher.py:15,47`（原行号）
+- **现象**: `python bridge_server.py > log.txt` 立即抛 `UnicodeEncodeError: 'gbk' codec can't encode '\U0001f680'` 并退出进程
+- **成因**: stdout 非真实控制台时 Python 用 `locale.getpreferredencoding()`（GBK）编码，非 BMP 字符（🚀 🔑 🗑️ 👉）无法编码
+- **修复**:
+  - 三个入口文件统一加 `stream.reconfigure(errors="replace")` 安全网（兼容 `pythonw` 下 `stdout is None`）
+  - 控制台 `print` 的非 BMP emoji 改为 ASCII 标记（`[启动]` `[OK]` `[清理]` `[错误]`）
+  - Bark 通知标题保留 emoji（走 URL 编码，不受控制台影响）
+- **验证**: 不设 `PYTHONIOENCODING` + 重定向 stdout → **服务进程存活 = True**，stderr 无错误
+
+#### P1-D1: H5 手机端存储型 XSS
+
+- **文件**: `bridge_server.py` 内嵌 `HTML_CONTENT`（原第 274、252-255 行）
+- **问题**: 玩家消息/昵称直接拼进 `innerHTML`，玩家可发 `<img src=x onerror=...>` 在**客服手机上执行脚本**
+- **修复**:
+  - 新增 `esc()` HTML 转义，昵称/最后消息/正文全部转义
+  - 会话卡片 `onclick="pushChat('${gid}')"` 改为 `data-gid` + **事件委托**（内联 onclick 靠转义防不住属性逃逸）
+  - `msg-row` class 限制为 `player`/`agent` 白名单，防 class 注入
+  - `msgs` 增加 `Array.isArray` 兜底
+
+#### P1-D2: H5 断线时按钮"失灵"
+
+- **文件**: 内嵌 H5（原第 212/219/281/283/286/288 行）
+- **修复**: 新增 `sendMsg()` 安全发送；`execCommand`/`toggleAFK` 断线时明确提示；`toggleAFK` 加 `globalState` 空值保护
+
+#### P1-D3: H5 无限重连无退避
+
+- **修复**: 指数退避（2s→30s 上限，最多 20 次）、连接前清理旧句柄、补 `onerror`、计数在 `onopen` 才重置、下行 `JSON.parse` 加 try
+
+#### P1-E1: `json.loads` 无容错（2 处）
+
+- **修复**: 非法 JSON / 非 dict 载荷直接 `continue`，不再打断 WS 连接
+
+#### P1-E2/E3/E4: 脏数据 KeyError
+
+- **修复**: `build_chat_history_str` 用 `.get()` + 过滤非 dict/空文本；会话写入统一 `setdefault` 兜底；
+  `PLAYER_MESSAGE` 入库前过滤脏消息；`SEND_REPLY` 增加 `gid`/`text` 空值校验
+
+#### P2-E5: `/api/ticket` 定位不准
+
+- **修复**: 新增 `_LAST_ACTIVE` 记录最近有活动的工单，优先返回，失效则回退
+
+#### P2-E6: `push_bark` 的 `group_id` 参数从未使用
+
+- **修复**: 真正用于正文尾部标注来源；`group=客服` 改为 `urllib.parse.quote('客服')` 正确编码
+
+#### P2-E8: 断连清理可能 KeyError
+
+- **修复**: `remove(ws)` → `discard(ws)`（2 处）
+
+#### P2-F1 / F3: 公关净化误伤 + 接口无重试
+
+- **F1**: `(?i)bug` → `\bbug\b`，`debug` 不再变成 `de异常情况`
+- **F3**: 网络异常重试 1 次（间隔 1s）；HTTP 非 200 不重试；失败一律返回 `""`
+
+#### 第四轮验证汇总
+
+```
+python -m py_compile 4 个文件        -> 4/4 [OK]
+python agent_core_test.py            -> 16 通过 / 0 失败
+node h5_security_test.js             -> 15 通过 / 0 失败
+node --check probe.js                -> 退出码 0
+node probe_smoke_test.js probe.js    -> 18 通过 / 0 失败
+python token_leak_test.py            -> 无泄露（退出码 0）
+
+崩溃复现测试（不设 PYTHONIOENCODING + 重定向 stdout）:
+  服务进程存活 = True ／ stderr 无错误        <- 原崩溃点已修复
+
+端到端: 首页 HTTP 200，13791 字节
+  esc(): True ／ data-gid: True ／ sendMsg: True ／ 残留 onclick="pushChat(: False
+```
+
+#### 新增回归测试
+
+| 文件 | 用途 |
+|------|------|
+| `h5_security_test.js` | 从 `bridge_server.py` 提取内嵌 H5 脚本，用 Node 假 DOM 验证 XSS 修复、断线容错、重连退避、脏包容错 |
+
+#### 仍留有（低优先级 / 需权衡）
+
+- H5 走明文 `ws://`（需 TLS 证书；内网部署或加 `wss` 可缓解）
+- `semi_runner.pyw` 的密钥熔断仅覆盖 `sk-` 前缀
+- 多客户端并发下的 `state` 竞态（aiohttp 单事件循环下当前安全）
+- 表格实时同步（当前只读权限，采用本地 Excel 方案）
 
 ---
 *此文档由 AI Bug 排查 Agent 自动生成*

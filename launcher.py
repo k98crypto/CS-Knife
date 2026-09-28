@@ -3,6 +3,15 @@ import sys
 import os
 import time
 
+# ==================== 控制台输出健壮性（防止编码问题导致进程崩溃） ====================
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name, None)
+    if _stream is not None:
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
 def get_real_path():
     """获取脚本的绝对物理路径，免疫打包虚拟环境"""
     if getattr(sys, 'frozen', False):

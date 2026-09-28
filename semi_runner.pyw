@@ -10,6 +10,16 @@ import pyperclip
 import requests
 import urllib.request
 
+# ==================== 控制台输出健壮性（防止编码问题导致进程崩溃） ====================
+# pythonw 运行时 sys.stdout 为 None；被重定向时若遇到非 BMP 字符会抛 UnicodeEncodeError。
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name, None)
+    if _stream is not None:
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
 # ==================== 路径解析增强（修复打包后__file__失效问题） ====================
 def get_real_base_dir():
     """获取脚本/打包后的真实物理路径，免疫 PyInstaller 虚拟环境"""
@@ -148,8 +158,8 @@ def on_f7():
         raw_info = data.get("playerInfo", "")
         formatted_info = raw_info.replace(" | ", "\n").replace(": ", "\n")
         
-        msgs = data.get("msgs", [])
-        chat_text = "\n".join([f"{'【玩家】' if m['sender']=='player' else '【客服】'}: {m['text']}" for m in msgs[-6:]])
+        msgs = [m for m in data.get("msgs", []) if isinstance(m, dict) and m.get("text")]
+        chat_text = "\n".join([f"{'【玩家】' if m.get('sender')=='player' else '【客服】'}: {m.get('text')}" for m in msgs[-6:]])
         summary = core.summarize_player_issue(chat_text)
 
         # ★ 安全闸：提炼失败时不输出半成品（避免把空内容粘给客服）

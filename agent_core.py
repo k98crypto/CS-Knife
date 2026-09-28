@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import time
 import random
 import logging
 import requests
@@ -115,24 +116,29 @@ class CustomerServiceCore:
             ],
             "temperature": 0.2
         }
-        try:
-            resp = requests.post(DEEPSEEK_API_URL, headers=self.headers, json=payload, timeout=20)
+        last_err = ""
+        for attempt in range(2):          # 网络抖动时重试 1 次（HTTP 错误不重试）
+            try:
+                resp = requests.post(DEEPSEEK_API_URL, headers=self.headers, json=payload, timeout=20)
+            except Exception as e:
+                last_err = f"网络异常: {e}"
+                if attempt == 0:
+                    time.sleep(1.0)
+                continue
             if resp.status_code == 200:
                 try:
                     return resp.json()["choices"][0]["message"]["content"].strip()
                 except Exception as e:
                     print(f"[agent_core] DeepSeek 响应解析失败: {e}", file=sys.stderr)
                     return ""
-            # ★ 关键：失败时返回空字符串，绝不能把 "[接口错误: xxx]" 这类占位符当正文返回，
-            #   否则会被当成 NORMAL 回复粘贴进回复框 / 直接发给玩家。
+            # HTTP 非 200 属接口/鉴权问题，重试无意义
             print(f"[agent_core] DeepSeek 接口错误 HTTP {resp.status_code}", file=sys.stderr)
             return ""
-        except Exception as e:
-            print(f"[agent_core] DeepSeek 网络异常: {e}", file=sys.stderr)
-            return ""
+        print(f"[agent_core] DeepSeek 调用失败: {last_err}", file=sys.stderr)
+        return ""
 
     def sanitize_reply(self, text: str) -> str:
-        text = re.sub(r'(?i)bug', '异常情况', text)
+        text = re.sub(r'(?i)\bbug\b', '异常情况', text)
         text = re.sub(r'漏洞|程序错误', '当前情况', text)
         text = re.sub(r'补偿您|赔偿您|补发给您', '为您记录并跟进', text)
         # 防呆隔离：严禁把“群内客服/内部群”字眼发给玩家

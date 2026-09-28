@@ -168,6 +168,9 @@ node --check probe.js
 # 油猴脚本功能冒烟测试（18 项，模拟浏览器环境，无需打开浏览器）
 node probe_smoke_test.js probe.js
 
+# 手机端 H5 安全回归测试（15 项：XSS / 断线容错 / 重连退避）
+node h5_security_test.js
+
 # 业务核心回归测试（疑难单标记归一化 / AI 报错不外发 / 前后端契约）
 python agent_core_test.py
 

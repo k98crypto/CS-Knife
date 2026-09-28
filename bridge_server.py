@@ -7,6 +7,18 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 from aiohttp import web
+
+# ==================== 控制台输出健壮性（防止编码问题导致服务崩溃） ====================
+# Windows 上若 stdout 被重定向到文件/管道/后台任务，Python 会用 locale 编码（GBK）输出，
+# 遇到非 BMP 字符（如 🚀）会抛 UnicodeEncodeError，直接让服务进程退出。
+# 这里把 errors 改为 replace，保证任何输出环境下都不会因编码问题中断服务。
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name, None)
+    if _stream is not None:
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
 # ==================== 路径解析增强（修复打包后__file__失效问题） ====================
 def get_real_base_dir():
     """获取脚本/打包后的真实物理路径，免疫 PyInstaller 虚拟环境"""
@@ -27,7 +39,7 @@ try:
     from agent_core import CustomerServiceCore
     core = CustomerServiceCore()
 except ImportError:
-    print("❌ 致命错误: 无法导入 agent_core.py")
+    print("[错误] 无法导入 agent_core.py，服务无法启动")
     sys.exit(1)
 
 BARK_SERVER_URL = f"https://api.day.app/{config.get('bark_key', 'YOUR_BARK_KEY')}"
@@ -54,11 +66,22 @@ active_clients = {"extension": set(), "mobile": set()}
 IM_AUTH_HEADERS = {}
 _IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，避免重复覆盖与日志刷屏
 
-def push_bark(title, body, group_id):
+# 最近一次有消息活动的工单 ID（供 /api/ticket 定位"当前工单"，比按插入顺序取最后一个更准）
+_LAST_ACTIVE = {"gid": None}
+
+def push_bark(title, body, group_id=""):
+    """推送 Bark 通知。
+
+    group_id: 可选，用于在正文尾部标注来源（如工单标识），便于在通知列表区分。
+    """
     if not BARK_SERVER_URL or "YOUR_BARK_KEY" in BARK_SERVER_URL: return
+    if group_id:
+        body = f"{body} [{group_id}]"
     def _run():
         try:
-            target = f"{BARK_SERVER_URL.rstrip('/')}/{urllib.parse.quote(title)}/{urllib.parse.quote(body)}?group=客服&sound=chime&isArchive=1"
+            target = (f"{BARK_SERVER_URL.rstrip('/')}/"
+                      f"{urllib.parse.quote(title)}/{urllib.parse.quote(body)}"
+                      f"?group={urllib.parse.quote('客服')}&sound=chime&isArchive=1")
             urllib.request.urlopen(urllib.request.Request(target, headers={"User-Agent": "Mozilla/5.0"}), timeout=3)
         except Exception: pass
     # 修复 BUG-009：事件循环可能已关闭时改用线程池
@@ -74,8 +97,18 @@ def push_bark(title, body, group_id):
 
 def build_chat_history_str(group_id: str) -> str:
     msgs = state["companies"]["main"]["conversations"].get(group_id, {}).get("msgs", [])
+    if not isinstance(msgs, list):
+        return ""
     recent_msgs = msgs[-8:] if len(msgs) > 8 else msgs
-    return "\n".join([f"{'【玩家】' if m['sender'] == 'player' else '【客服】'} {m['text']}" for m in recent_msgs])
+    lines = []
+    for m in recent_msgs:
+        if not isinstance(m, dict):
+            continue
+        text = m.get("text", "")
+        if not text:
+            continue
+        lines.append(f"{'【玩家】' if m.get('sender') == 'player' else '【客服】'} {text}")
+    return "\n".join(lines)
 
 async def handle_ai_automation(group_id: str):
     history_str = build_chat_history_str(group_id)
@@ -102,7 +135,12 @@ async def handle_ai_automation(group_id: str):
     if reply:
         now_str = datetime.now().strftime("%H:%M:%S")
         if state["afk_mode"]:
-            state["companies"]["main"]["conversations"][group_id]["msgs"].append({"sender": "agent", "text": reply, "time": now_str})
+            conv = state["companies"]["main"]["conversations"].setdefault(
+                group_id, {"name": group_id, "msgs": []})
+            if not isinstance(conv.get("msgs"), list):
+                conv["msgs"] = []
+            conv["msgs"].append({"sender": "agent", "text": reply, "time": now_str})
+            _LAST_ACTIVE["gid"] = group_id
             for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
 
             if "TIMEOUT_CLOSE" in tag:
@@ -198,6 +236,22 @@ HTML_CONTENT = """<!DOCTYPE html>
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
     let audioCtx = null; let sirenInterval = null;
+    let wsAttempts = 0;
+
+    // HTML 转义：玩家消息与昵称属于不可信输入，直接拼进 innerHTML 会造成存储型 XSS
+    function esc(s) {
+        return String(s === null || s === undefined ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // 安全发送：连接不可用时静默忽略，避免点击按钮抛 TypeError 导致按钮"失灵"
+    function sendMsg(obj) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try { ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+        }
+        return false;
+    }
 
     function playMobileSiren() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -215,35 +269,53 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     function toggleAFK() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (!globalState) return;                       // 尚未同步到服务端状态，避免空指针
         const isAFK = !globalState.afk_mode;
-        ws.send(JSON.stringify({ action: 'TOGGLE_AFK', status: isAFK }));
+        if (!sendMsg({ action: 'TOGGLE_AFK', status: isAFK })) {
+            alert('连接已断开，正在重连，请稍后再试');
+        }
     }
 
     function silenceAlarm() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         document.getElementById('alarm-overlay').classList.remove('active');
         stopMobileSiren();
-        ws.send(JSON.stringify({ action: 'SILENCE_ALARM' })); 
+        sendMsg({ action: 'SILENCE_ALARM' }); 
     }
     
     function initWS() {
+      // 清理旧连接，避免句柄泄漏与多路重连
+      if (ws) {
+        ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+        try { ws.close(); } catch (e) {}
+        ws = null;
+      }
       ws = new WebSocket((window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws/mobile');
+      ws.onopen = () => { wsAttempts = 0; };   // 连接成功才重置重连计数
       ws.onmessage = (e) => {
-        const payload = JSON.parse(e.data);
+        let payload;
+        try { payload = JSON.parse(e.data); } catch (err) { return; }   // 脏包不打断脚本
+        if (!payload) return;
         if (payload.type === 'FULL_SYNC') { 
             globalState = payload.data; 
             renderAll(); 
             const btn = document.getElementById('afk-btn');
-            if(globalState.afk_mode) { btn.className = 'afk-toggle active'; btn.innerText = '🚀 AFK 已接管'; }
+            if(globalState && globalState.afk_mode) { btn.className = 'afk-toggle active'; btn.innerText = '🚀 AFK 已接管'; }
             else { btn.className = 'afk-toggle'; btn.innerText = '🔒 电脑半自动'; }
-            if(globalState.alarm_status) { document.getElementById('alarm-overlay').classList.add('active'); playMobileSiren(); }
+            if(globalState && globalState.alarm_status) { document.getElementById('alarm-overlay').classList.add('active'); playMobileSiren(); }
             else { document.getElementById('alarm-overlay').classList.remove('active'); stopMobileSiren(); }
         }
         else if (payload.type === 'FILL_DRAFT') {
-            document.getElementById('chat-input').value = payload.content;
+            document.getElementById('chat-input').value = payload.content || '';
         }
       };
-      ws.onclose = () => setTimeout(initWS, 2500);
+      ws.onerror = () => { /* 出错后浏览器会触发 onclose，由 onclose 统一调度重连 */ };
+      // 指数退避重连（2s→4s→…→30s 上限，最多 20 次），替代原先的固定 2.5s 无限重连
+      ws.onclose = () => {
+        if (wsAttempts >= 20) { console.error('[手机端] 重连次数已达上限，请刷新页面'); return; }
+        wsAttempts++;
+        setTimeout(initWS, Math.min(2000 * wsAttempts, 30000));
+      };
     }
 
     function renderAll() {
@@ -254,19 +326,30 @@ HTML_CONTENT = """<!DOCTYPE html>
       if(keys.length === 0) { container.innerHTML = '<div style="text-align:center; padding: 40px; color: #666;">暂无会话</div>'; return; }
       
       container.innerHTML = keys.map(gid => {
-        const c = compData.conversations[gid];
-        const lastMsg = c.msgs.length > 0 ? c.msgs[c.msgs.length-1].text : '...';
-        return `<div class="conv-card" onclick="pushChat('${gid}')">
-            <div class="avatar">${(c.name || '玩').charAt(0)}</div>
-            <div class="conv-meta"><div class="conv-name">${c.name || gid}</div><div class="conv-lastmsg">${lastMsg}</div></div>
+        const c = compData.conversations[gid] || {};
+        const msgs = Array.isArray(c.msgs) ? c.msgs : [];
+        const lastMsg = msgs.length > 0 ? (msgs[msgs.length - 1] || {}).text : '...';
+        const name = c.name || gid;
+        // 全部走 esc() 转义；gid 改用 data-* 传递，避免内联 onclick 属性逃逸
+        return `<div class="conv-card" data-gid="${esc(gid)}">
+            <div class="avatar">${esc(String(name).charAt(0) || '玩')}</div>
+            <div class="conv-meta"><div class="conv-name">${esc(name)}</div><div class="conv-lastmsg">${esc(lastMsg || '...')}</div></div>
           </div>`;
       }).join('');
+
+      // 事件委托绑定（不再把数据拼进 onclick）
+      container.querySelectorAll('.conv-card').forEach(el => {
+        el.addEventListener('click', () => pushChat(el.dataset.gid));
+      });
       
       if (activeGroupId && compData.conversations[activeGroupId]) renderChatStream(compData.conversations[activeGroupId]);
     }
 
     function pushChat(gid) {
-      activeGroupId = gid; const conv = globalState.companies['main'].conversations[gid];
+      if (!globalState || !gid) return;
+      const conv = globalState.companies['main'].conversations[gid];
+      if (!conv) return;
+      activeGroupId = gid;
       document.getElementById('chat-player-name').innerText = conv.name || gid;
       renderChatStream(conv); document.getElementById('chat-view').classList.add('active');
     }
@@ -278,21 +361,30 @@ HTML_CONTENT = """<!DOCTYPE html>
       const currentScroll = stream.scrollTop;
       const isAtBottom = (stream.scrollHeight - stream.clientHeight) <= currentScroll + 20;
       
-      stream.innerHTML = (conv.msgs || []).map(m => `<div class="msg-row ${m.sender}"><div class="msg-bubble">${m.text}</div></div>`).join('');
+      const rows = Array.isArray(conv.msgs) ? conv.msgs : [];
+      // sender 仅允许 player/agent，防止通过 class 注入；text 全量转义，防存储型 XSS
+      stream.innerHTML = rows.map(m => {
+        const who = (m && m.sender === 'player') ? 'player' : 'agent';
+        return `<div class="msg-row ${who}"><div class="msg-bubble">${esc((m || {}).text)}</div></div>`;
+      }).join('');
       if (isAtBottom) stream.scrollTop = stream.scrollHeight;
     }
 
     function execCommand(cmd) {
       if (!activeGroupId) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+          alert('连接已断开，正在重连，请稍后再试');
+          return;
+      }
       if (cmd === 'F9') {
-          ws.send(JSON.stringify({ action: 'TRIGGER_F9', groupID: activeGroupId }));
+          sendMsg({ action: 'TRIGGER_F9', groupID: activeGroupId });
       } else if (cmd === 'HANGUP') {
-          ws.send(JSON.stringify({ action: 'EXT_COMMAND', command: 'ACTION_HANGUP', groupID: activeGroupId }));
+          sendMsg({ action: 'EXT_COMMAND', command: 'ACTION_HANGUP', groupID: activeGroupId });
       } else {
           const input = document.getElementById('chat-input'); const text = input.value.trim();
-          if (cmd === 'CLOSE') ws.send(JSON.stringify({ action: 'EXT_COMMAND', command: 'ACTION_REPLY_CLOSE', groupID: activeGroupId, content: text, category: "其他" }));
+          if (cmd === 'CLOSE') sendMsg({ action: 'EXT_COMMAND', command: 'ACTION_REPLY_CLOSE', groupID: activeGroupId, content: text, category: "其他" });
           else if (cmd === 'SEND' && text) {
-              ws.send(JSON.stringify({ action: 'SEND_REPLY', groupID: activeGroupId, content: text }));
+              sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text });
           }
           input.value = '';
       }
@@ -307,7 +399,10 @@ HTML_CONTENT = """<!DOCTYPE html>
 async def api_current_ticket(request):
     conversations = state["companies"]["main"]["conversations"]
     if not conversations: return web.json_response({})
-    gid = list(conversations.keys())[-1]
+    # 优先返回最近有消息活动的工单；若已失效则回退到后插入的会话
+    gid = _LAST_ACTIVE["gid"]
+    if gid not in conversations:
+        gid = list(conversations.keys())[-1]
     return web.json_response(conversations[gid])
 
 async def index_handler(request):
@@ -320,7 +415,12 @@ async def ws_ext_handler(request):
     try:
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                pkt = json.loads(msg.data)
+                try:
+                    pkt = json.loads(msg.data)
+                except Exception:
+                    continue          # 忽略非法 JSON，不让脏包打断连接
+                if not isinstance(pkt, dict):
+                    continue
                 ev = pkt.get("event")
                 # 处理 HEADERS_SYNC 事件（探针注入认证头）
                 if ev == "HEADERS_SYNC":
@@ -332,7 +432,7 @@ async def ws_ext_handler(request):
                             IM_AUTH_HEADERS.clear()
                             IM_AUTH_HEADERS.update(headers_data)
                             _IM_AUTH_FP["value"] = fp
-                            print(f"🔑 探针认证头已更新：{len(headers_data)} 个字段（内容变更）")
+                            print(f"[OK] 探针认证头已更新：{len(headers_data)} 个字段（内容变更）")
                     continue  # 不回复探针，且绝不写入 state
                 
                 if ev == "ABNORMAL_OFFLINE":
@@ -341,7 +441,7 @@ async def ws_ext_handler(request):
                     # 推送给手机端
                     for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
                     # 推送 Bark 通知（P0 修复：缺失的 Bark 警报）
-                    push_bark("🚨 异常掉线警报", "VPN 或网页网络连接断开，请立即检查！", "alarm")
+                    push_bark("🚨 异常掉线警报", "VPN 或网页网络连接断开，请立即检查！")
                     # 向探针发送确认回执（修复 BUG-002：防止重复上报）
                     await ws.send_json({"command": "ALARM_CONFIRMED"})
                     
@@ -362,16 +462,25 @@ async def ws_ext_handler(request):
                         # 删除最旧的会话
                         oldest_gid = next(iter(target["conversations"]))
                         del target["conversations"][oldest_gid]
-                        print(f"🗑️ 清理旧会话：{oldest_gid}")
+                        print(f"[清理] 移除最早会话：{oldest_gid}")
                     
-                    c = target["conversations"].setdefault(gid, {"name": payload.get("playerInfo", "玩家").split('|')[0][:6], "msgs": []})
-                    c["msgs"] = payload.get("messages", [])  # 覆盖数组，杜绝雪球
+                    if not gid:
+                        continue
+                    c = target["conversations"].setdefault(
+                        gid, {"name": str(payload.get("playerInfo", "玩家")).split('|')[0][:6], "msgs": []})
+                    raw_msgs = payload.get("messages", [])
+                    # 覆盖数组杜绝雪球；同时过滤脏数据（非 dict / 缺 text），避免下游 KeyError
+                    if isinstance(raw_msgs, list):
+                        c["msgs"] = [m for m in raw_msgs if isinstance(m, dict) and m.get("text")]
+                    else:
+                        c["msgs"] = []
                     c["playerInfo"] = payload.get("playerInfo", "")
+                    _LAST_ACTIVE["gid"] = gid
                     
                     for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
                     asyncio.create_task(handle_ai_automation(gid))
     finally:
-        active_clients["extension"].remove(ws)
+        active_clients["extension"].discard(ws)
     return ws
 
 async def ws_mobile_handler(request):
@@ -382,7 +491,12 @@ async def ws_mobile_handler(request):
     try:
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                pkt = json.loads(msg.data)
+                try:
+                    pkt = json.loads(msg.data)
+                except Exception:
+                    continue          # 忽略非法 JSON，不让脏包打断连接
+                if not isinstance(pkt, dict):
+                    continue
                 act = pkt.get("action")
                 
                 if act == "TOGGLE_AFK":
@@ -399,7 +513,13 @@ async def ws_mobile_handler(request):
                 elif act == "SEND_REPLY":
                     gid = pkt.get("groupID")
                     text = pkt.get("content")
-                    state["companies"]["main"]["conversations"][gid]["msgs"].append({"sender": "agent", "text": text, "time": datetime.now().strftime("%H:%M:%S")})
+                    if not gid or not text:
+                        continue
+                    conv = state["companies"]["main"]["conversations"].setdefault(gid, {"name": gid, "msgs": []})
+                    if not isinstance(conv.get("msgs"), list):
+                        conv["msgs"] = []
+                    conv["msgs"].append({"sender": "agent", "text": text, "time": datetime.now().strftime("%H:%M:%S")})
+                    _LAST_ACTIVE["gid"] = gid
                     for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
                     # 修复 BUG-011：过滤 action 字段，仅转发必要字段
                     for ext in list(active_clients["extension"]): 
@@ -409,7 +529,7 @@ async def ws_mobile_handler(request):
                             "content": text
                         })
     finally:
-        active_clients["mobile"].remove(ws)
+        active_clients["mobile"].discard(ws)
     return ws
 
 app = web.Application()
@@ -421,7 +541,7 @@ app.router.add_get("/ws/mobile", ws_mobile_handler)
 if __name__ == "__main__":
     local_ip = get_local_ip()
     print("=" * 60)
-    print("🚀 IM 移动端中继与 AI 自动托管服务已启动！")
-    print(f"👉 iPhone 访问: http://{local_ip}:{PORT}")
+    print("[启动] IM 移动端中继与 AI 自动托管服务已启动！")
+    print(f"手机访问: http://{local_ip}:{PORT}")
     print("=" * 60)
     web.run_app(app, host="0.0.0.0", port=PORT)
