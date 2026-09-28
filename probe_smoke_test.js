@@ -67,10 +67,11 @@ let playerInfoText = '玩家A\nUID:12345';
 let ticketIdAttr = '';                       // 模拟页面上真实工单号（data-ticket-id）
 let pageUrl = 'https://ticket.example.com/workbench';
 
+const docListeners = {};
 const documentStub = {
     readyState: 'complete',
     body: { innerText: 'IM工作台' },
-    addEventListener: () => {},
+    addEventListener: (ev, fn) => { docListeners[ev] = fn; },
     createElement: () => ({}),
     querySelector: sel => {
         if (sel === '.ws-right-panel') return { innerText: playerInfoText };
@@ -276,6 +277,57 @@ function check(name, ok, extra) {
     sandbox.window.__im_auth_headers = { 'x-cs-token': 'abc123' };
     const t500 = timeouts.filter(t => t.ms === 500);
     check('onopen 注册 500ms 延迟的 HEADERS_SYNC', t500.length >= 1, '数量=' + t500.length);
+
+    console.log('\n[8] IM 状态同步（修复"手动离线同步不过去"）');
+
+    // 前置：确保 WS 处于 OPEN（前面的断线重连用例可能还没走完 onopen）
+    const curWs = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    if (curWs.readyState !== FakeWebSocket.OPEN) {
+        curWs.readyState = FakeWebSocket.OPEN;
+        if (curWs.onopen) curWs.onopen();
+    }
+    check('前置：WebSocket 已就绪', curWs.readyState === FakeWebSocket.OPEN);
+
+    // 8a. 手动点工作台的「IM离线」-> 必须上报状态，但绝对不能误报警
+    if (docListeners.click) docListeners.click({ target: { innerText: 'IM离线' } });
+    statusText = 'IM离线';
+    sent.length = 0;
+    intervals[0]();
+    const imsA = sent.filter(s => s.event === 'IM_STATUS');
+    check('手动离线会上报 IM_STATUS(status=3)',
+        imsA.length === 1 && imsA[0].data.status === 3, JSON.stringify(imsA));
+    check('手动离线带 manual=true 标记',
+        imsA.length === 1 && imsA[0].data.manual === true);
+    check('手动离线不触发 ABNORMAL_OFFLINE（不误报警）',
+        sent.filter(s => s.event === 'ABNORMAL_OFFLINE').length === 0);
+
+    // 8b. 切回在线 -> 上报状态 + 恢复事件
+    statusText = 'IM在线';
+    sent.length = 0;
+    intervals[0]();
+    check('切回在线会上报 IM_STATUS(status=1)',
+        sent.some(s => s.event === 'IM_STATUS' && s.data.status === 1), JSON.stringify(sent));
+    check('从离线恢复会发 ALARM_RECOVERED', sent.some(s => s.event === 'ALARM_RECOVERED'));
+
+    // 8c. 忙碌状态也要上报（旧版完全不报）
+    statusText = 'IM忙碌';
+    sent.length = 0;
+    intervals[0]();
+    check('忙碌会上报 IM_STATUS(status=2)',
+        sent.some(s => s.event === 'IM_STATUS' && s.data.status === 2), JSON.stringify(sent));
+    check('忙碌不会误触发警报事件',
+        !sent.some(s => s.event === 'ABNORMAL_OFFLINE' || s.event === 'ALARM_RECOVERED'));
+
+    // 8d. WS 重连后必须重新同步一次当前状态（否则服务端会一直用旧值）
+    const wsLast = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    wsLast.close();
+    const rt = timeouts.filter(t => t.ms > 0).pop();
+    if (rt) rt.fn();
+    await new Promise(r => setTimeout(r, 30));
+    sent.length = 0;
+    intervals[0]();                      // 状态没变化，但 onopen 重置了记忆 -> 应重新上报
+    check('重连后会重新同步当前 IM 状态',
+        sent.some(s => s.event === 'IM_STATUS'), JSON.stringify(sent));
 
     console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
     process.exit(fail === 0 ? 0 : 1);

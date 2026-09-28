@@ -155,8 +155,36 @@ async def main():
             check("失败原因有明确提示",
                   bool(status_msg and status_msg.get("message")), str(status_msg))
 
+        # ---------- 5. 探针在线状态 + IM 状态上报 ----------
+        print("\n[5] 探针在线状态与 IM 状态上报")
+        await mobile.send_json({"action": "REQUEST_SNAPSHOT"})
+        snapA, _ = await drain(mobile, 0.4)
+        check("探针在线时 extension_online=true",
+              (snapA or {}).get("extension_online") is True,
+              str((snapA or {}).get("extension_online")))
+
+        await ext.send_json({"event": "IM_STATUS", "data": {"status": 3, "manual": True}})
+        await asyncio.sleep(0.4)
+        snapB, _ = await drain(mobile, 0.4)
+        check("探针上报手动离线 -> im_status=3",
+              (snapB or {}).get("im_status") == 3, str((snapB or {}).get("im_status")))
+
+        await ext.send_json({"event": "IM_STATUS", "data": {"status": 2, "manual": False}})
+        await asyncio.sleep(0.4)
+        snapC, _ = await drain(mobile, 0.4)
+        check("探针上报忙碌 -> im_status=2",
+              (snapC or {}).get("im_status") == 2, str((snapC or {}).get("im_status")))
+
+        # 关掉电脑端网页 -> 手机必须能看出探针已离线（否则会一直显示过期状态）
         await ext.close()
-        await mobile.close()
+        await asyncio.sleep(0.9)
+        snapD, _ = await drain(mobile, 0.6)
+        check("探针断开后 extension_online=false",
+              (snapD or {}).get("extension_online") is False,
+              str((snapD or {}).get("extension_online")))
+
+        if not mobile.closed:
+            await mobile.close()
 
     print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
     return 0 if failed == 0 else 1

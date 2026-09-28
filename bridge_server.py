@@ -62,7 +62,8 @@ def get_local_ip():
 state = {
     "afk_mode": False,
     "alarm_status": False,
-    "im_status": 1,                 # 1=IM在线 2=IM忙碌 3=IM离线（供手机端显示与远程切换）
+    "im_status": 1,                 # 1=IM在线 2=IM忙碌 3=IM离线（由探针上报真实值）
+    "extension_online": False,      # 电脑端探针是否在线（决定手机端能否远程操作）
     "category_options": [],         # 从网页级联选择器抓到的真实问题分类（供 AI 选分类）
     "companies": { "main": { "name": "示例专线", "status": 1, "conversations": {} } }
 }
@@ -192,14 +193,15 @@ HTML_CONTENT = """<!DOCTYPE html>
     @supports (height: 100dvh) { #app { height: 100dvh; } }
     header { flex: 0 0 auto; padding: calc(var(--safe-top) + 10px) 16px 12px; display: flex; justify-content: space-between; align-items: center; background: var(--bg); border-bottom: 1px solid var(--line); }
     .page-title { font-size: 19px; font-weight: 600; letter-spacing: .2px; }
-    .afk-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; color: var(--text-secondary); background: #2A2B2D; padding: 6px 12px; border-radius: 999px; user-select: none; }
-    .afk-toggle.active { background: rgba(168, 199, 250, 0.18); color: var(--accent); border: 1px solid var(--accent); }
+    .afk-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; color: var(--text-secondary); background: #2A2B2D; padding: 6px 12px; border-radius: 999px; user-select: none; border: 1px solid transparent; font-family: inherit; line-height: 1.45; cursor: pointer; -webkit-appearance: none; appearance: none; }
+    .afk-toggle:active { opacity: .7; }
+    .afk-toggle.active { background: rgba(168, 199, 250, 0.18); color: var(--accent); border-color: var(--accent); }
     .hdr-right { display: flex; align-items: center; gap: 6px; }
     .status-menu { position: absolute; right: 14px; top: calc(var(--safe-top) + 46px); min-width: 136px; z-index: 200;
                    background: var(--card-bg); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
                    display: none; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
     .status-menu.show { display: block; }
-    .status-item { padding: 11px 16px; font-size: 14px; color: var(--text-primary); border-bottom: 1px solid var(--line); }
+    .status-item { display: block; width: 100%; text-align: left; font-family: inherit; background: transparent; border: none; border-bottom: 1px solid var(--line); padding: 11px 16px; font-size: 14px; color: var(--text-primary); cursor: pointer; -webkit-appearance: none; appearance: none; }
     .status-item:last-child { border-bottom: none; }
     .status-item:active { background: #2A2B2D; }
     #toast { position: fixed; left: 0; right: 0; bottom: calc(var(--safe-bottom) + 84px); margin: 0 auto;
@@ -212,7 +214,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     .view { display: none; position: absolute; left: 0; right: 0; top: 0; bottom: 0; flex-direction: column; background: var(--bg); }
     .view.active { display: flex; }
     .conv-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; touch-action: pan-y; padding-bottom: calc(var(--safe-bottom) + 12px); }
-    .conv-card { display: flex; gap: 12px; align-items: center; padding: 12px 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
+    .conv-card { display: flex; gap: 12px; align-items: center; padding: 12px 16px; background: var(--bg); border-bottom: 1px solid var(--line); cursor: pointer; }
     .conv-card:active { background: #1B1C1E; }
     .avatar { flex: 0 0 auto; width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, #1A73E8, #A8C7FA); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 17px; color: #131314; }
     .conv-body { flex: 1 1 auto; min-width: 0; }
@@ -224,11 +226,12 @@ HTML_CONTENT = """<!DOCTYPE html>
     .conv-empty { padding: 56px 24px; text-align: center; color: #6B7075; font-size: 14px; line-height: 1.9; }
     
     .chat-nav { flex: 0 0 auto; padding: calc(var(--safe-top) + 6px) 12px 10px; display: flex; align-items: center; gap: 10px; background: var(--card-bg); border-bottom: 1px solid var(--line); }
-    .back-btn { flex: 0 0 auto; background: none; border: none; color: var(--accent); font-size: 22px; padding: 4px 8px; }
+    .back-btn { flex: 0 0 auto; background: none; border: none; color: var(--accent); font-size: 22px; padding: 4px 8px; cursor: pointer; }
     .chat-title { flex: 1 1 auto; min-width: 0; font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     
     .action-bar { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 12px; background: var(--card-bg); border-bottom: 1px solid var(--line); overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    .action-btn { flex: 0 0 auto; padding: 7px 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--text-primary); font-size: 13px; }
+    .action-btn { flex: 0 0 auto; padding: 7px 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--text-primary); font-size: 13px; font-family: inherit; cursor: pointer; -webkit-appearance: none; appearance: none; }
+    .action-btn:active { opacity: .75; }
     .action-btn.ai { color: var(--accent); border-color: var(--accent); background: rgba(168,199,250,0.1); }
     
     .chat-stream { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; touch-action: pan-y; padding: 14px 12px 18px; display: flex; flex-direction: column; gap: 12px; }
@@ -258,13 +261,13 @@ HTML_CONTENT = """<!DOCTYPE html>
   <header>
     <div class="page-title">Agent Workspace</div>
     <div class="hdr-right">
-      <div class="afk-toggle" id="im-status-btn" onclick="toggleStatusMenu(event)">🟢 IM在线</div>
-      <div class="afk-toggle" id="afk-btn" onclick="toggleAFK()">🔒 半自动</div>
+      <button type="button" class="afk-toggle" id="im-status-btn" onclick="toggleStatusMenu(event)">🟢 IM在线</button>
+      <button type="button" class="afk-toggle" id="afk-btn" onclick="toggleAFK()">🔒 半自动</button>
     </div>
     <div class="status-menu" id="status-menu">
-      <div class="status-item" onclick="setIMStatus(1)">🟢 IM 在线</div>
-      <div class="status-item" onclick="setIMStatus(2)">🟡 IM 忙碌</div>
-      <div class="status-item" onclick="setIMStatus(3)">🔴 IM 离线</div>
+      <button type="button" class="status-item" onclick="setIMStatus(1)">🟢 IM 在线</button>
+      <button type="button" class="status-item" onclick="setIMStatus(2)">🟡 IM 忙碌</button>
+      <button type="button" class="status-item" onclick="setIMStatus(3)">🔴 IM 离线</button>
     </div>
   </header>
   <div id="toast"></div>
@@ -345,9 +348,19 @@ HTML_CONTENT = """<!DOCTYPE html>
     // ==================== 远程 IM 状态切换（在线 / 忙碌 / 离线） ====================
     const IM_STATUS_TEXT = { 1: '🟢 IM在线', 2: '🟡 IM忙碌', 3: '🔴 IM离线' };
 
+    // 电脑端探针是否在线：离线时远程操作没有意义，直接给出明确提示而不是静默失败
+    function extensionOffline() {
+        return !globalState || globalState.extension_online === false;
+    }
+
     function renderIMStatus() {
         const el = document.getElementById('im-status-btn');
         if (!el) return;
+        if (extensionOffline()) {
+            el.innerText = '⚫ 电脑未连接';
+            el.className = 'afk-toggle';
+            return;
+        }
         const st = (globalState && globalState.im_status) || 1;
         el.innerText = IM_STATUS_TEXT[st] || IM_STATUS_TEXT[1];
         el.className = 'afk-toggle' + (st === 1 ? ' active' : '');
@@ -355,6 +368,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     function toggleStatusMenu(ev) {
         if (ev && ev.stopPropagation) ev.stopPropagation();
+        if (extensionOffline()) { toast('电脑端未连接，请先打开客服工作台'); return; }
         const m = document.getElementById('status-menu');
         if (m) m.classList.toggle('show');
     }
@@ -362,6 +376,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     function setIMStatus(st) {
         const m = document.getElementById('status-menu');
         if (m) m.classList.remove('show');
+        if (extensionOffline()) { toast('电脑端未连接，无法切换状态'); return; }
         if (!sendMsg({ action: 'SET_IM_STATUS', status: st })) {
             toast('连接已断开，正在重连');
             return;
@@ -417,10 +432,10 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     function toggleAFK() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        if (!globalState) return;                       // 尚未同步到服务端状态，避免空指针
+        if (extensionOffline()) { toast('电脑端未连接，无法切换托管模式'); return; }
         const isAFK = !globalState.afk_mode;
         if (!sendMsg({ action: 'TOGGLE_AFK', status: isAFK })) {
-            alert('连接已断开，正在重连，请稍后再试');
+            toast('连接已断开，正在重连');
         }
     }
 
@@ -552,6 +567,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     function execCommand(cmd) {
       if (!activeGroupId) return;
+      if (extensionOffline()) { toast('电脑端未连接，请先打开客服工作台'); return; }
       if (!ws || ws.readyState !== WebSocket.OPEN) {
           alert('连接已断开，正在重连，请稍后再试');
           return;
@@ -612,6 +628,9 @@ async def ws_ext_handler(request):
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     active_clients["extension"].add(ws)
+    state["extension_online"] = True
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "FULL_SYNC", "data": state})
     # 探针一连上就请它回报网页上的真实问题分类（供手机端 AI 一键关单选分类）
     await safe_send(ws, {"command": "REQUEST_CATEGORIES"})
     try:
@@ -645,6 +664,22 @@ async def ws_ext_handler(request):
                         print(f"[分类] 已获取 {len(state['category_options'])} 个问题分类")
                         for m in list(active_clients["mobile"]):
                             await safe_send(m, {"type": "FULL_SYNC", "data": state})
+                    continue
+
+                # 探针上报的 IM 状态（含手动离线 / 忙碌，手机端据此显示真实状态）
+                if ev == "IM_STATUS":
+                    data = pkt.get("data") or {}
+                    try:
+                        st = int(data.get("status", 1))
+                    except Exception:
+                        st = 1
+                    if st not in (1, 2, 3):
+                        st = 1
+                    state["im_status"] = st
+                    if st == 1:
+                        state["alarm_status"] = False
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     continue
 
                 if ev == "ABNORMAL_OFFLINE":
@@ -714,6 +749,11 @@ async def ws_ext_handler(request):
                     asyncio.create_task(handle_ai_automation(gid))
     finally:
         active_clients["extension"].discard(ws)
+        if not active_clients["extension"]:
+            # 电脑端网页关闭/探针掉线：手机端必须能看出来，避免显示过期状态
+            state["extension_online"] = False
+            for m in list(active_clients["mobile"]):
+                await safe_send(m, {"type": "FULL_SYNC", "data": state})
     return ws
 
 async def handle_ai_close(group_id: str):

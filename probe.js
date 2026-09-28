@@ -14,6 +14,7 @@
     let audioCtx = null;
     let sirenInterval = null;
     let isManualOffline = false;
+    let lastIMStatus = null;          // 上一次上报过的 IM 状态，用于变化检测
     window.__im_auth_headers = {};
 
     // ==================== 工具函数 ====================
@@ -317,6 +318,7 @@
         ws.onopen = () => {
             console.log("✅ [探针] WebSocket 连接成功");
             reconnectAttempts = 0;   // 连接成功后才重置重连计数
+            lastIMStatus = null;     // 重连后强制把当前 IM 状态重新同步一次
             // 延迟发送 HEADERS_SYNC，确保 fetch 拦截器已捕获 Token
             setTimeout(() => {
                 if (window.__im_auth_headers && Object.keys(window.__im_auth_headers).length > 0) {
@@ -398,23 +400,41 @@
     let pageLoadComplete = false;
     setTimeout(() => { pageLoadComplete = true; }, 3000);
 
-    // ==================== 定时任务 1：VPN 掉线火警监控 ====================
-    let lastIMStatus = null;
+    // ==================== 定时任务 1：IM 状态同步 + 掉线火警监控 ====================
+    function imStatusCode(text) {
+        return text === 'IM在线' ? 1 : (text === 'IM忙碌' ? 2 : 3);
+    }
     setInterval(() => {
         if (!pageLoadComplete) return;
 
-        const currentStatus = findIMStatusText();
-        if (currentStatus === lastIMStatus) return;   // 状态未变化，不重复上报
+        const currentStatus = findIMStatusText();     // 'IM在线' | 'IM忙碌' | 'IM离线' | null
+        if (!currentStatus || currentStatus === lastIMStatus) return;   // 未变化不重复上报
 
-        if (currentStatus === 'IM离线' && !isManualOffline) {
-            playSiren();
-            sendToBrain({ event: "ABNORMAL_OFFLINE" });
-        } else if (currentStatus === 'IM在线') {
-            isManualOffline = false;
-            stopSiren();
-            sendToBrain({ event: "ALARM_RECOVERED" });
-        }
+        const prev = lastIMStatus;
         lastIMStatus = currentStatus;
+
+        // 1) 无论手动还是异常，都把真实状态同步给后端
+        //    （否则手机端会一直显示旧状态，手动挂"离线"更是永远同步不过去）
+        sendToBrain({
+            event: "IM_STATUS",
+            data: { status: imStatusCode(currentStatus), manual: isManualOffline }
+        });
+
+        // 2) 只有"异常掉线"才拉警报；手动离线不报警
+        if (currentStatus === 'IM离线') {
+            if (isManualOffline) {
+                stopSiren();
+            } else {
+                playSiren();
+                sendToBrain({ event: "ABNORMAL_OFFLINE" });
+            }
+        } else {
+            stopSiren();
+            if (prev === 'IM离线' && currentStatus === 'IM在线') {
+                isManualOffline = false;
+                sendToBrain({ event: "ALARM_RECOVERED" });
+            }
+        }
     }, 2000);
 
     // ==================== 定时任务 2：工单消息抓取与上报 ====================

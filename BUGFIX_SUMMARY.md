@@ -555,4 +555,80 @@ AI 关单实测链路（真实 DeepSeek 调用）:
    有固定字段的话把 DOM 片段发我，可精确到字段级
 
 ---
+
+## 🐞 第七轮（2026/9/28）：手机端状态显示与按钮点击修复
+
+用户反馈：**手机显示「IM在线 / 电脑半自动」，但实际已挂 IM离线且电脑网页已关闭；
+两个按钮点不动。** 定位到两个独立根因：
+
+### BUG-028：手动离线永远同步不到手机
+
+- **根因**：`probe.js` 的 IM 状态监控只在**异常掉线**时才上报：
+  ```js
+  if (currentStatus === 'IM离线' && !isManualOffline) {   // 手动离线被直接跳过
+      playSiren();
+      sendToBrain({ event: "ABNORMAL_OFFLINE" });
+  }
+  ```
+  再加上 `'IM忙碌'` 根本不在上报分支里、WS 重连后也不重发状态，
+  于是服务端 `state.im_status` 永远是初始值 **1（IM在线）**。
+- **修复**：
+  - 新增 `IM_STATUS` 事件，**任何状态变化都上报**（在线/忙碌/离线，含手动离线），
+    附带 `manual` 标记用于区分手动与异常
+  - 报警逻辑单独处理：只有**非手动**的离线才 `playSiren()` + `ABNORMAL_OFFLINE`
+  - `ws.onopen` 里重置 `lastIMStatus = null`，**重连后强制重新同步一次当前状态**
+  - `lastIMStatus` 声明上移到文件顶部，避免闭包时序问题
+
+### BUG-029：探针离线时手机端仍显示过期状态
+
+- **根因**：服务端不记录"探针是否在线"，电脑网页一关，手机端继续显示最后一次的状态。
+- **修复**：
+  - 初始 `state` 新增 `extension_online: false`
+  - 探针连接 → `true` 并广播；探针断开（且无其它探针）→ `false` 并广播
+  - H5 `renderIMStatus()` 优先显示 **⚫ 电脑未连接**
+
+### BUG-030：iOS 上 `div` 的 onclick 不触发（按钮点不动）
+
+- **根因**：顶部两个开关是 `<div onclick="...">`。
+  iOS Safari 对**非按钮元素**的点击派发不可靠（同页的 `<button>` 元素都正常）。
+- **修复**：
+  - 顶部开关与状态菜单项全部改为真正的 `<button type="button">`
+  - CSS 补 `cursor: pointer` + `-webkit-appearance: none` + 按钮样式复位
+  - `.conv-card` / `.action-btn` / `.back-btn` 一并补 `cursor: pointer`
+
+### 附带改进：不再"静默失败"
+
+原来 `toggleAFK()` 里 `if (!globalState) return;` 会让按钮看起来像坏了。现改为：
+
+- 新增 `extensionOffline()` 判断
+- `toggleAFK` / `toggleStatusMenu` / `setIMStatus` / `execCommand` 在电脑端未连接时
+  **弹出明确提示**（"电脑端未连接，请先打开客服工作台"），而不是默默无反应
+
+### 验证
+
+```
+node probe_smoke_test.js probe.js    -> 35 通过 / 0 失败   (原 26，新增 9)
+node h5_security_test.js             -> 34 通过 / 0 失败
+python agent_core_test.py            -> 16 通过 / 0 失败
+python rules_sync_test.py            -> 18 通过 / 0 失败
+python token_leak_test.py            -> 通过
+python multi_conv_test.py            -> 通过
+python mobile_feature_test.py        -> 19 通过 / 0 失败   (原 15，新增 4)
+总体失败项: 0
+
+关键新增断言：
+  手动离线会上报 IM_STATUS(status=3)  -> [{"event":"IM_STATUS","data":{"status":3,"manual":true}}]
+  手动离线不触发 ABNORMAL_OFFLINE（不误报警）
+  忙碌会上报 IM_STATUS(status=2)      -> 旧版完全不报
+  重连后会重新同步当前 IM 状态
+  探针上报手动离线 -> im_status=3
+  探针断开后 extension_online=false
+```
+
+### 文档同步
+
+`使用手册.md` 6.4 节补充「⚫ 电脑未连接」状态说明；
+新增 **12.10 节：手机顶部按钮点不动**（含 iPhone 清缓存方法）。
+
+---
 *此文档由 AI Bug 排查 Agent 自动生成*
