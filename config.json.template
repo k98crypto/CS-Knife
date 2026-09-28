@@ -2,5 +2,12 @@
   "port": 8765,
   "bark_key": "YOUR_BARK_KEY",
   "deepseek_api_key": "sk-YOUR_DEEPSEEK_API_KEY",
-  "rules_sync_url": "https://example.com/api/export_rules_csv"
+  
+  "rules_sync_url": "",
+  "rules_app_token": "YOUR_APP_TOKEN",
+  "rules_sheet_id": "YOUR_SHEET_ID",
+  "rules_access_token": "YOUR_RULES_ACCESS_TOKEN",
+  
+  "use_local_excel": true,
+  "local_excel_path": "rules.xlsx"
 }
