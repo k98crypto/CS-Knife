@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         客服助手 - 智能工单探针 (V7.2 自检可见版)
+// @name         客服助手 - 智能工单探针 (V7.4 免框选与动作回执版)
 // @namespace    http://tampermonkey.net/
-// @version      7.2
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连、页面内状态胶囊（一眼确认脚本是否生效）
+// @version      7.4
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选
 // @match        *://ticket.example.com/*
 // @match        *://ticket.example.com/*
 // @run-at       document-idle
@@ -13,14 +13,26 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "7.2";
+    const PROBE_VERSION = "7.4";
     console.log("🚀 [客服助手探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
+
+    // ==================== 可调参数（也可在控制台改 __probe.config.xxx） ====================
+    const PROBE_CONFIG = {
+        keepManualOffline: true,    // 手动挂"离线"后，网页自己跳回在线 -> 自动改回离线（离线守护）
+        manualGraceMs: 1500,        // 你自己点完状态后多久内不"抢"（留给你自己操作的时间）
+        guardWindowMs: 10000,       // 两次离线守护之间的最小间隔（避免和网页互刷）
+        guardMaxPerWindow: 3,       // 每次窗口内最多硬顶几次，超过就如实上报（不和网页无限对抗）
+        forceStatusOnConnect: true  // 连上中继就立刻复核一次真实状态（服务端重启后不会残留旧状态）
+    };
 
     let audioCtx = null;
     let sirenInterval = null;
     let isManualOffline = false;
     let lastIMStatus = null;          // 上一次上报过的 IM 状态，用于变化检测
+    let lastUserStatusClickAt = 0;    // 用户最近一次自己点状态的时间（区分"人点的" vs "网页自己跳的"）
+    let lastGuardAt = 0;              // 上次离线守护动作时间
+    let guardHits = 0;                // 当前窗口内已硬顶次数
     window.__im_auth_headers = {};
 
     // ==================== 自检状态（页面内胶囊 + __probe 调试入口） ====================
@@ -37,13 +49,49 @@
     }
 
     // 查找当前 IM 状态文本，返回 'IM离线' / 'IM在线' / 'IM忙碌'，找不到返回 null
+    // ★ V7.3 修复：只认"看得见"的节点，且优先用状态显示区（而不是下拉菜单里的选项）。
+    //   旧版按 DOM 顺序取第一个文字匹配的节点，页面里只要存在一个隐藏的「IM在线」选项，
+    //   就可能把"手动离线"读成"在线" —— 这就是手机端状态自己变成在线的原因之一。
+    function isVisibleEl(el) {
+        if (!el) return false;
+        if (el.offsetParent) return true;                  // 常规可见（有定位祖先）
+        if (el.offsetParent === null) {                    // 明确为 null：可能是 fixed 定位，也可能是真隐藏
+            try {
+                const r = el.getBoundingClientRect();
+                if (r && r.width > 0 && r.height > 0) return true;
+                return false;                              // 尺寸为 0 -> 确实是隐藏的
+            } catch (e) { return true; }                   // 取不到尺寸就不武断判隐藏
+        }
+        return true;                                       // 既无 offsetParent 也无尺寸信息 -> 不拦
+    }
+
+    function statusTextOf(el) {
+        if (!el) return null;
+        const t = normText(el.innerText);
+        return (t === 'IM离线' || t === 'IM在线' || t === 'IM忙碌') ? t : null;
+    }
+
+    function isMenuOption(el) {
+        try {
+            if (el.classList && el.classList.contains('el-dropdown-menu__item')) return true;
+        } catch (e) {}
+        return String(el.className || "").indexOf('el-dropdown-menu__item') !== -1;
+    }
+
     function findIMStatusText() {
         const nodes = document.querySelectorAll('.el-dropdown-menu__item, span, div, button');
+        let menuFallback = null;
         for (let i = 0; i < nodes.length; i++) {
-            const t = normText(nodes[i].innerText);
-            if (t === 'IM离线' || t === 'IM在线' || t === 'IM忙碌') return t;
+            const t = statusTextOf(nodes[i]);
+            if (!t) continue;
+            if (!isVisibleEl(nodes[i])) continue;          // 隐藏的下拉选项绝不能当"当前状态"
+            if (isMenuOption(nodes[i])) {                  // 菜单里的选项只作兜底
+                if (!menuFallback) menuFallback = t;
+                continue;
+            }
+            return t;                                      // 状态显示区优先
         }
-        return null;
+        return menuFallback;
     }
 
     // 取级联选择器"最后一层面板"里的可见选项（Element UI 级联为逐层懒加载）
@@ -52,6 +100,16 @@
         if (!panes.length) return [];
         const last = panes[panes.length - 1];
         return Array.from(last.querySelectorAll('.el-cascader-node')).filter(n => n.offsetParent !== null);
+    }
+
+    // ==================== 问题分类缓存（避免"下拉框自己跑下来"） ====================
+    // 用户自己点开分类下拉时顺手把选项缓存下来；后端来问时优先给缓存，不再主动去点开。
+    const CATEGORY_CACHE_MS = 30 * 60 * 1000;
+    const categoryCache = { options: [], at: 0 };
+    function cacheCategoryOptions(opts) {
+        if (!opts || !opts.length) return;
+        categoryCache.options = opts.slice(0, 200);
+        categoryCache.at = Date.now();
     }
 
     // ==================== 页面内状态胶囊（一眼确认"油猴脚本到底生效了没"） ====================
@@ -172,19 +230,82 @@
         return "";
     }
 
+    // ==================== 玩家身份解析（手机端卡片标题就靠它） ====================
+    // 踩坑：右侧面板第一行往往是"玩家信息"这种**栏目名**，旧代码直接把它当玩家名，
+    // 于是手机端 9 个会话全叫"玩家信息"，根本分不清谁是谁。
+    const GENERIC_PANEL_WORDS = ['玩家信息', '玩家资料', '玩家详情', '客户信息', '用户信息',
+                                 '基本信息', '会员信息', '信息', '玩家', '客户'];
+    const FIELD_KEYS = '昵称|玩家昵称|玩家名|角色名|角色昵称|角色|游戏名|用户名|姓名|名字|昵称/账号';
+
+    function cleanFieldValue(v) {
+        let t = String(v || "").replace(/[|｜]/g, ' ').trim();
+        t = t.replace(/[（(][^)）]*[)）]/g, ' ').trim();        // 去掉括号里的补充说明
+        if (!t || t.length > 24) return "";
+        if (t.indexOf('：') !== -1 || t.indexOf(':') !== -1) return "";   // "key: value" 不是名字
+        if (/^\d+$/.test(t)) return "";
+        if (GENERIC_PANEL_WORDS.indexOf(t) !== -1) return "";
+        if (/^(UID|ID|账号|订单|工单|时间|渠道|区服|服务器|等级|VIP|状态|来源)/i.test(t)) return "";
+        return t;
+    }
+
+    // 从右侧面板文本里解析 { name, uid }
+    function parsePlayerIdentity(playerInfo) {
+        const raw = String(playerInfo || "").replace(/\n+/g, ' | ');
+        let name = "", uid = "";
+        const mu = raw.match(/(?:UID|uid|账号|account)\s*[:：]\s*([A-Za-z0-9_-]{2,24})/);
+        if (mu) uid = mu[1];
+
+        // 1) 明确的昵称字段优先：昵称：张三
+        try {
+            const m1 = raw.match(new RegExp('(?:' + FIELD_KEYS + ')\\s*[:：]\\s*([^|]{1,30})'));
+            if (m1) name = cleanFieldValue(m1[1]);
+        } catch (e) {}
+
+        // 2) 逐段挑"看起来像名字"的段落
+        if (!name) {
+            const parts = raw.split('|');
+            for (let i = 0; i < parts.length; i++) {
+                let seg = String(parts[i]).trim();
+                try { seg = seg.replace(new RegExp('^(?:' + FIELD_KEYS + ')\\s*[:：]\\s*'), ''); } catch (e) {}
+                const v = cleanFieldValue(seg);
+                if (v) { name = v; break; }
+            }
+        }
+        // 3) 实在没有昵称：用 UID 后 4 位兜底，至少能区分不同玩家
+        if (!name && uid) name = '玩家' + String(uid).slice(-4);
+        return { name: name, uid: uid };
+    }
+
     // 返回 { gid, name }：gid 稳定且能区分玩家；name 用于手机端会话列表显示
+    let lastIdentity = null;      // { gid, playerKey }
     function buildTicketIdentity(playerInfo, messages) {
-        const firstLine = String(playerInfo || "").split('|')[0].trim().slice(0, 20);
-        const name = firstLine || "玩家";
+        const ident = parsePlayerIdentity(playerInfo);
+        const name = ident.name || "玩家";
+
+        // ★ 玩家指纹只用"身份"字段，**绝不含聊天内容**：
+        //   旧版把"第一条玩家消息"混进指纹，列表虚拟滚动/重新渲染就会换指纹，
+        //   同一个工单被算成两个会话 —— 手机端于是出现重复卡片。
+        const playerKey = (ident.uid || '') + "##" + (ident.name || '');
         let gid = pickTicketId();
-        if (!gid) {
-            // 兜底：用"玩家信息 + 该工单最早一条玩家消息"生成稳定摘要
+
+        if (gid) {
+            // 有工单号：若上次只有兜底 id 且还是同一个玩家，继续沿用兜底 id（避免分裂成两条）
+            if (lastIdentity && lastIdentity.playerKey === playerKey
+                && lastIdentity.gid && lastIdentity.gid.charAt(0) === 'P') {
+                gid = lastIdentity.gid;
+            }
+        } else if (playerKey.trim() !== '##') {
+            gid = "P" + simpleHash(playerKey);
+        } else {
+            // 连昵称/UID 都读不到：才退回"面板文本 + 首条玩家消息"（并尽量保持连续）
             let seedText = "";
             for (let i = 0; i < messages.length; i++) {
                 if (messages[i].sender === 'player') { seedText = messages[i].text; break; }
             }
             gid = "P" + simpleHash((playerInfo || "") + "##" + seedText);
         }
+
+        lastIdentity = { gid: gid, playerKey: playerKey };
         return { gid: gid, name: name };
     }
 
@@ -239,14 +360,18 @@
     }
 
     // ==================== 手动状态切换监听 ====================
+    // 记录"人点击"的时间，用于把"客服自己选的"和"网页自己跳的"区分开：
+    // 只有"网页自己跳"的状态才会被离线守护改回去。
     document.addEventListener('click', (e) => {
         initAudio();
         if (e.target && e.target.innerText) {
             const text = normText(e.target.innerText);
             if (text === 'IM离线') {
                 isManualOffline = true;
+                lastUserStatusClickAt = Date.now();
             } else if (text === 'IM在线' || text === 'IM忙碌') {
                 isManualOffline = false;
+                lastUserStatusClickAt = Date.now();
                 stopSiren();
             }
         }
@@ -268,15 +393,23 @@
         return originalFetch.apply(this, args);
     };
 
+    // ==================== 动作结果回报（手机端不再"点完没反应"） ====================
+    // 手机端点挂起/关单/发送后，探针把"到底点到没有、页面按钮叫什么"回传，
+    // 由中继转成手机上的提示，避免"没反应"变成无从排查。
+    function reportActionResult(command, ok, detail) {
+        sendToBrain({ event: "ACTION_RESULT", data: { command: command, ok: !!ok, detail: detail || "" } });
+        console.log((ok ? "✅ [探针] " : "❌ [探针] ") + command + " -> " + (detail || (ok ? "成功" : "失败")));
+    }
+
     // ==================== DOM 操作器 ====================
     const Operator = {
         fillReplyBox: function(text) {
             const composer = document.querySelector('.editor-composer');
-            if (!composer) return;
+            if (!composer) return false;
             const inputBox = composer.querySelector('textarea')
                 || composer.querySelector('input')
                 || (composer.getAttribute('contenteditable') ? composer : null);
-            if (!inputBox) return;
+            if (!inputBox) return false;
             if (inputBox.tagName === 'TEXTAREA' || inputBox.tagName === 'INPUT') {
                 inputBox.value = text;
                 inputBox.dispatchEvent(new Event('input', { bubbles: true }));
@@ -284,17 +417,48 @@
                 inputBox.innerText = text;
                 inputBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
             }
+            return true;
         },
-        selectCategory: function(l1, l2, l3) {
-            Operator.selectCategoryByKeyword(l3 || "", [l1, l2]);
+        selectCategory: function(l1, l2, l3, fallbackKeyword) {
+            Operator.selectCategoryByKeyword(l3 || "", [l1, l2], fallbackKeyword);
         },
-        // 逐级下钻选择问题分类：优先按关键字匹配，其次按提示路径，最后落回第一项。
-        // 叶子节点"点击即选中并关闭"，因此全程只对末级做一次选择点击，不会误改分类。
-        selectCategoryByKeyword: function(keyword, pathHint) {
-            const trigger = document.querySelector('.el-cascader input, input[placeholder="请选择问题分类"]');
-            if (!trigger) { console.warn("⚠️ [探针] 未找到问题分类选择器，跳过分类选择"); return; }
+        // 逐级下钻选择问题分类：关键字匹配 -> 路径提示 -> 兜底分类关键字。
+        // ★ 全都匹配不上时**宁可不选**并如实回报候选列表（旧的"取第一项兜底"会把分类选错，
+        //   客服还以为 AI 选对了）。叶节点"点击即选中并关闭"，全程只对末级点一次。
+        selectCategoryByKeyword: function(keyword, pathHint, fallbackKeyword) {
             const kw = normText(keyword || "");
+            const fb = normText(fallbackKeyword || "");
             const hints = (pathHint || []).map(normText);
+
+            // 情况 A：扁平下拉（el-select），直接在下拉项里找关键字
+            const flatTrigger = document.querySelector('.el-select input, input[placeholder*="分类"], input[placeholder*="类型"]');
+            const isCascader = !!document.querySelector('.el-cascader input, input[placeholder="请选择问题分类"]');
+            if (!isCascader && flatTrigger) {
+                flatTrigger.click();
+                setTimeout(() => {
+                    const items = Array.from(document.querySelectorAll('.el-select-dropdown__item, .el-dropdown-menu__item, li'))
+                        .filter(isVisibleEl)
+                        .map(n => ({ el: n, text: normText(n.innerText) }))
+                        .filter(o => o.text && o.text.length <= 20);
+                    const hit = items.find(o => o.text === kw) || items.find(o => o.text.indexOf(kw) !== -1)
+                        || (fb ? (items.find(o => o.text === fb) || items.find(o => o.text.indexOf(fb) !== -1)) : null);
+                    if (hit) {
+                        try { hit.el.click(); } catch (e) {}
+                        reportActionResult("SELECT_CATEGORY", true, "已选择分类：" + hit.text);
+                    } else {
+                        try { document.body.click(); } catch (e) {}
+                        reportActionResult("SELECT_CATEGORY", false,
+                            "下拉里没有匹配「" + (keyword || "") + "」的分类；可选：" + items.map(o => o.text).join(" / "));
+                    }
+                }, 350);
+                return;
+            }
+
+            const trigger = document.querySelector('.el-cascader input, input[placeholder="请选择问题分类"]');
+            if (!trigger) {
+                reportActionResult("SELECT_CATEGORY", false, "未找到问题分类选择器（既不是级联选择器也不是下拉框）");
+                return;
+            }
             trigger.click();
 
             let depth = 0;
@@ -302,17 +466,25 @@
                 if (depth > 4) { try { document.body.click(); } catch (e) {} return; }
                 const list = lastPaneNodes();
                 if (!list.length) return;                 // 面板消失 => 已完成选择
+                const texts = list.map(n => normText(n.innerText));
                 let target = null;
-                if (kw) target = list.find(n => normText(n.innerText).includes(kw));
-                if (!target && hints[depth]) target = list.find(n => normText(n.innerText).includes(hints[depth]));
-                if (!target) target = list[0];            // 兜底：取第一项，保证关单不卡住
+                if (kw) target = list.find(n => normText(n.innerText) === kw) || list.find(n => normText(n.innerText).indexOf(kw) !== -1);
+                if (!target && hints[depth]) target = list.find(n => normText(n.innerText).indexOf(hints[depth]) !== -1);
+                if (!target && fb && depth > 0) target = list.find(n => normText(n.innerText).indexOf(fb) !== -1);
+                if (!target) {
+                    try { document.body.click(); } catch (e) {}
+                    reportActionResult("SELECT_CATEGORY", false,
+                        "分类候选里没有匹配「" + (keyword || "") + "」的项（第 " + (depth + 1) + " 层）；本层可选：" + texts.slice(0, 12).join(" / "));
+                    return;
+                }
+                const picked = normText(target.innerText || "");
                 const before = document.querySelectorAll(".el-cascader-menu").length;
                 try { target.click(); } catch (e) {}
                 depth++;
                 setTimeout(() => {
                     const after = document.querySelectorAll(".el-cascader-menu").length;
                     if (after <= before) {                // 点的是叶子：已选中并关闭
-                        console.log("✅ [探针] 已选择问题分类：", normText(target.innerText || ""));
+                        reportActionResult("SELECT_CATEGORY", true, "已选择分类：" + picked);
                         return;
                     }
                     step();
@@ -321,35 +493,86 @@
             setTimeout(step, 300);
         },
         // 只读预览一级分类（不做任何选择，仅用于回报给后端/AI 参考）
+        // ★ 客户反馈"电脑网页的问题分类下拉老是自己跑下来"：旧版每次探针连上都点开一次。
+        //   现在：① 优先用缓存（用户自己点开时顺手采集，零打扰）；
+        //        ② 缓存过期才点开一次，读完立刻再点一下收起。
         peekCategoryOptions: function() {
             return new Promise((resolve) => {
+                if (categoryCache.options.length && (Date.now() - categoryCache.at) < CATEGORY_CACHE_MS) {
+                    resolve(categoryCache.options.slice());
+                    return;
+                }
                 const trigger = document.querySelector('.el-cascader input, input[placeholder="请选择问题分类"]');
                 if (!trigger) { resolve([]); return; }
+                const already = lastPaneNodes().map(n => normText(n.innerText)).filter(Boolean);
+                if (already.length) {                    // 面板本来就开着：直接读，绝不再点
+                    cacheCategoryOptions(already);
+                    resolve(already.slice());
+                    return;
+                }
                 trigger.click();
                 setTimeout(() => {
                     const opts = lastPaneNodes().map(n => normText(n.innerText)).filter(Boolean).slice(0, 100);
-                    try { document.body.click(); } catch (e) {}   // 点空白处关闭，不触发选择
+                    cacheCategoryOptions(opts);
+                    try { trigger.click(); } catch (e) {}    // 再点一下收起，不留下"自己跑下来"的下拉
                     resolve(opts);
                 }, 350);
             });
         },
-        safeClickActionBtn: function(btnName) {
-            const btns = Array.from(document.querySelectorAll('.im-action-btn'));
-            const targetBtn = btns.find(b => b.innerText && b.innerText.trim() === btnName);
-            if (targetBtn) targetBtn.click();
+        // 列出当前页面上的操作按钮（排障用：手机点"挂起"没反应时，一眼看出页面按钮叫什么）
+        listActionButtons: function() {
+            return Array.from(document.querySelectorAll('.im-action-btn, button, .el-button, [role="button"]'))
+                .filter(isVisibleEl)
+                .map(el => normText(el.innerText || el.textContent || ""))
+                .filter(t => t && t.length <= 8)
+                .filter((t, i, arr) => arr.indexOf(t) === i)
+                .slice(0, 30);
+        },
+        // 点击页面上的操作按钮：关键字匹配（完全相等优先、其次包含），
+        // 优先点真正的按钮类元素，其次才退到 span/div；只点短标签，避免误点整块容器。
+        // 返回 true/false —— 找不到就如实回报，绝不静默。
+        safeClickActionBtn: function(keywords) {
+            const kws = (Array.isArray(keywords) ? keywords : [keywords]).map(normText).filter(Boolean);
+            if (!kws.length) return false;
+            const collect = sel => Array.from(document.querySelectorAll(sel))
+                .filter(isVisibleEl)
+                .map(el => ({ el: el, text: normText(el.innerText || el.textContent || "") }))
+                .filter(o => o.text && o.text.length <= 8);
+            const groups = [
+                collect('.im-action-btn, button, .el-button, [role="button"]'),
+                collect('span, div, a')
+            ];
+            for (let g = 0; g < groups.length; g++) {
+                const list = groups[g];
+                if (!list.length) continue;
+                for (let k = 0; k < kws.length; k++) {
+                    for (let i = list.length - 1; i >= 0; i--) {      // 从后往前：更可能是叶子节点
+                        if (list[i].text === kws[k]) { list[i].el.click(); return true; }
+                    }
+                    for (let i = list.length - 1; i >= 0; i--) {
+                        if (list[i].text.indexOf(kws[k]) !== -1) { list[i].el.click(); return true; }
+                    }
+                }
+            }
+            return false;
         },
         switchIMStatus: function(targetStatus) {
             if (!targetStatus) return;
+            // 触发下拉：只点"看得见"的状态显示区，避免点到隐藏节点
             const statusTrigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
-                const t = normText(el.innerText);
-                return t.includes('IM在线') || t.includes('IM离线') || t.includes('IM忙碌');
+                const t = statusTextOf(el);
+                if (!t) return false;
+                if (isMenuOption(el)) return false;
+                return isVisibleEl(el);
             });
             if (statusTrigger) statusTrigger.click();
 
             setTimeout(() => {
-                const items = Array.from(document.querySelectorAll('.el-dropdown-menu__item'));
-                const target = items.find(item => normText(item.innerText).includes(targetStatus));
+                const items = Array.from(document.querySelectorAll('.el-dropdown-menu__item'))
+                    .filter(item => isVisibleEl(item));      // 只点可见的菜单项
+                const target = items.find(item => normText(item.innerText).indexOf(normText(targetStatus)) !== -1);
                 if (target) target.click();
+                else console.warn("⚠️ [探针] 未找到可见的 IM 状态选项：" + targetStatus);
             }, 200);
         }
     };
@@ -374,19 +597,59 @@
         return false;
     }
 
-    // 断线重连调度（指数退避，最多 maxReconnectAttempts 次）
+    // 断线重连调度（指数退避 3s→30s 封顶）
+    // ★ V7.3：不再"重试 10 次就彻底放弃"。旧版放弃后手机端会一直停在旧状态，
+    //   看起来就像"我明明设了离线却显示在线"。现在即使中继没启动，也会每 30 秒继续试。
     function scheduleReconnect() {
-        if (reconnectAttempts >= maxReconnectAttempts) {
-            console.error("❌ [探针] 重连已达上限，请确认中继服务 (bridge_server.py) 是否已启动");
-            setChip('dead', "重连已放弃，点此重试");
-            return;
-        }
         reconnectAttempts++;
         const delay = Math.min(3000 * reconnectAttempts, 30000);
-        setChip('waiting', (delay / 1000) + " 秒后第 " + reconnectAttempts + " 次重连");
+        if (reconnectAttempts === maxReconnectAttempts) {
+            console.warn("⚠️ [探针] 已连续重连 " + maxReconnectAttempts + " 次仍失败：请确认中继服务 (bridge_server.py) 是否已启动");
+            setChip('dead', "中继未启动？点此重试");
+        } else if (reconnectAttempts < maxReconnectAttempts) {
+            setChip('waiting', (delay / 1000) + " 秒后第 " + reconnectAttempts + " 次重连");
+        } else {
+            setChip('waiting', "持续重连中（每 30 秒一次）");
+        }
         clearTimeout(wsReconnectTimer);
         wsReconnectTimer = setTimeout(connectBrain, delay);
-        console.warn("⚠️ [探针] " + (delay / 1000) + " 秒后进行第 " + reconnectAttempts + " 次重连...");
+    }
+
+    // 读一次页面上的真实状态并上报（forced=true 时即使没变化也上报，用于"复核"）
+    function readAndReportIMStatus(forced) {
+        const st = findIMStatusText();
+        if (!st) return false;
+        if (!forced && st === lastIMStatus) return false;
+        lastIMStatus = st;
+        sendToBrain({
+            event: "IM_STATUS",
+            data: { status: imStatusCode(st), manual: isManualOffline, forced: !!forced }
+        });
+        console.log("📡 [探针] 状态复核：" + st + (forced ? "（服务端请求）" : ""));
+        return true;
+    }
+
+    // 离线守护：客服手动挂了"离线"，网页却自己跳回"在线/忙碌" -> 改回离线并如实上报
+    function restoreManualOffline(flippedTo) {
+        const now = Date.now();
+        if (now - lastGuardAt > PROBE_CONFIG.guardWindowMs) {
+            guardHits = 0;                                   // 距上次久远 -> 新窗口，重新计数
+        } else if (now - lastGuardAt < 1500) {
+            return true;                                     // 刚点过，等网页反应，不重复点
+        }
+        if (guardHits >= PROBE_CONFIG.guardMaxPerWindow) {
+            // 网页就是不让改：不再硬顶，按网页真实状态上报，避免两边互相刷
+            console.warn("⚠️ [探针] 网页反复把状态改回「" + flippedTo + "」，已停止强改，按网页真实状态上报");
+            sendToBrain({ event: "IM_STATUS", data: { status: imStatusCode(flippedTo), manual: false, guarded: false, giveup: true } });
+            return false;
+        }
+        lastGuardAt = now;
+        guardHits++;
+        console.warn("🛡️ [探针] 检测到网页把状态自动改成了「" + flippedTo + "」，按你的手动离线设置改回「IM离线」（第 " + guardHits + " 次）");
+        Operator.switchIMStatus('IM离线');
+        lastIMStatus = 'IM离线';                             // 先把手机端稳住，不再显示在线
+        sendToBrain({ event: "IM_STATUS", data: { status: 3, manual: true, guarded: true } });
+        return true;
     }
 
     function connectBrain() {
@@ -418,6 +681,10 @@
             const pageUrl = (function () { try { return location.href; } catch (e) { return ""; } })();
             const ua = (typeof navigator !== "undefined" && navigator.userAgent) ? navigator.userAgent.slice(0, 120) : "";
             sendToBrain({ event: "PROBE_HELLO", data: { version: PROBE_VERSION, page: pageUrl, ua: ua } });
+            // ★ V7.3：一连上就复核一次真实状态。
+            //   中继服务重启后内存里的状态是默认值，旧版只有"状态变化"才上报，
+            //   于是手机端会一直停在"在线"（哪怕你早就手动挂了离线）。
+            if (PROBE_CONFIG.forceStatusOnConnect) setTimeout(() => readAndReportIMStatus(true), 100);
             // 延迟发送 HEADERS_SYNC，确保 fetch 拦截器已捕获 Token
             setTimeout(() => {
                 if (window.__im_auth_headers && Object.keys(window.__im_auth_headers).length > 0) {
@@ -456,17 +723,27 @@
 
             if (cmd.command === "FILL_DRAFT") {
                 if (cmd.content) Operator.fillReplyBox(cmd.content);
-                if (cmd.category) Operator.selectCategory("一级分类", "二级分类", cmd.category);
+                if (cmd.category) Operator.selectCategory("一级分类", "二级分类", cmd.category, cmd.defaultCategory);
             }
             else if (cmd.command === "ACTION_REPLY_CLOSE") {
-                if (cmd.content) Operator.fillReplyBox(cmd.content);
+                const filled = cmd.content ? Operator.fillReplyBox(cmd.content) : false;
+                if (cmd.content && !filled) reportActionResult("ACTION_REPLY_CLOSE", false, "未找到回复输入框(.editor-composer)，已停止关单");
+                if (!cmd.content) reportActionResult("ACTION_REPLY_CLOSE", true, "（无结束语，直接关单）");
                 const path = cmd.categoryPath || ["一级分类", "二级分类"];
                 if (cmd.category) {
-                    Operator.selectCategory(path[0], path[1], cmd.category);
+                    Operator.selectCategory(path[0], path[1], cmd.category, cmd.defaultCategory);
                     // 留足级联下钻时间，避免分类还没选完就点了"回复并关单"
-                    setTimeout(() => Operator.safeClickActionBtn('回复并关单'), 2200);
+                    setTimeout(() => {
+                        const ok = Operator.safeClickActionBtn(['回复并关单', '回复并关闭', '回复关闭', '关单']);
+                        reportActionResult("ACTION_REPLY_CLOSE", ok,
+                            ok ? "已点击「回复并关单」" : ("未找到「回复并关单」按钮，页面按钮：" + Operator.listActionButtons().join("/")));
+                    }, 2200);
                 } else {
-                    setTimeout(() => Operator.safeClickActionBtn('回复并关单'), 800);
+                    setTimeout(() => {
+                        const ok = Operator.safeClickActionBtn(['回复并关单', '回复并关闭', '回复关闭', '关单']);
+                        reportActionResult("ACTION_REPLY_CLOSE", ok,
+                            ok ? "已点击「回复并关单」" : ("未找到关单按钮，页面按钮：" + Operator.listActionButtons().join("/")));
+                    }, 800);
                 }
             }
             else if (cmd.command === "REQUEST_CATEGORIES") {
@@ -480,15 +757,50 @@
                 });
             }
             else if (cmd.command === "ACTION_HANGUP") {
-                Operator.safeClickActionBtn('挂起');
+                const ok = Operator.safeClickActionBtn(['挂起', '暂挂', '挂起工单', '暂停会话', '暂停']);
+                reportActionResult("ACTION_HANGUP", ok,
+                    ok ? "已点击「挂起」" : ("未找到「挂起」按钮，页面上的按钮：" + Operator.listActionButtons().join("/")));
+            }
+            else if (cmd.command === "ACTION_RESUME") {
+                const ok = Operator.safeClickActionBtn(['恢复', '恢复会话', '继续', '重新接入', '接单', '接入']);
+                reportActionResult("ACTION_RESUME", ok,
+                    ok ? "已点击「恢复」" : ("未找到「恢复」按钮，页面上的按钮：" + Operator.listActionButtons().join("/")));
+            }
+            else if (cmd.command === "LIST_ACTIONS") {
+                // 排障：把页面上的按钮清单回报给手机/中继
+                const labels = Operator.listActionButtons();
+                reportActionResult("LIST_ACTIONS", labels.length > 0,
+                    labels.length ? ("页面按钮：" + labels.join(" / ")) : "没扫到任何操作按钮");
             }
             else if (cmd.command === "SEND_REPLY") {
-                Operator.fillReplyBox(cmd.content);
-                setTimeout(() => Operator.safeClickActionBtn('回复'), 500);
+                const filled = Operator.fillReplyBox(cmd.content);
+                if (!filled) {
+                    reportActionResult("SEND_REPLY", false, "未找到回复输入框(.editor-composer)，消息没发出去");
+                } else {
+                    setTimeout(() => {
+                        const ok = Operator.safeClickActionBtn(['发送', '回复', '发送消息']);
+                        reportActionResult("SEND_REPLY", ok,
+                            ok ? "已填入并点击发送" : "已填入，但没找到「发送」按钮，请手动按回车");
+                    }, 500);
+                }
             }
             else if (cmd.command === "CHANGE_STATUS") {
                 const map = { 1: 'IM在线', 2: 'IM忙碌', 3: 'IM离线' };
+                // 这是"人在手机端点的"，属于用户意图：同步手动标记 + 记一次点击时间，
+                // 免得离线守护把用户刚点的"在线"又改回去。
+                isManualOffline = (cmd.status === 3);
+                lastUserStatusClickAt = Date.now();
+                lastIMStatus = null;                 // 下一次 tick 重新读 DOM 并如实上报
+                console.log("📲 [探针] 收到手机端切换状态指令：" + (map[cmd.status] || cmd.status));
                 Operator.switchIMStatus(map[cmd.status]);
+            }
+            else if (cmd.command === "REQUEST_IM_STATUS") {
+                // 手机端一打开 / 回到前台就来要一次真实状态（"从电脑网页获取一下"）
+                readAndReportIMStatus(true);
+            }
+            else if (cmd.command === "POLICY") {
+                if (cmd.keepManualOffline !== undefined) PROBE_CONFIG.keepManualOffline = !!cmd.keepManualOffline;
+                console.log("⚙️ [探针] 策略同步：手动离线守护 = " + (PROBE_CONFIG.keepManualOffline ? "开启" : "关闭"));
             }
             else if (cmd.command === "SILENCE_ALARM") {
                 stopSiren();
@@ -508,7 +820,18 @@
         if (!pageLoadComplete) return;
 
         const currentStatus = findIMStatusText();     // 'IM在线' | 'IM忙碌' | 'IM离线' | null
-        if (!currentStatus || currentStatus === lastIMStatus) return;   // 未变化不重复上报
+        if (!currentStatus) return;
+
+        // ★ V7.3 离线守护：客服手动挂了"离线"，网页却自己跳回"在线/忙碌"（很多 IM 在窗口
+        //   重新获得焦点时会自动上线）——在你离开页面/切窗口的那一刻就把它改回离线。
+        //   只处理"网页自己跳的"：你自己点的状态有 manualGraceMs 的免打扰时间。
+        if (currentStatus !== lastIMStatus && currentStatus !== 'IM离线'
+            && isManualOffline && PROBE_CONFIG.keepManualOffline
+            && (Date.now() - lastUserStatusClickAt) > PROBE_CONFIG.manualGraceMs) {
+            if (restoreManualOffline(currentStatus)) return;   // 已改回离线并上报
+        }
+
+        if (currentStatus === lastIMStatus) return;   // 未变化不重复上报
 
         const prev = lastIMStatus;
         lastIMStatus = currentStatus;
@@ -561,6 +884,12 @@
 
         if (messages.length === 0) return;
 
+        // 顺手采集问题分类：用户自己点开分类下拉时零打扰地缓存下来
+        try {
+            const vis = lastPaneNodes().map(n => normText(n.innerText)).filter(Boolean);
+            if (vis.length) cacheCategoryOptions(vis);
+        } catch (e) {}
+
         // 识别当前工单：不同玩家/工单必须得到不同的 groupID，手机端才会分开显示
         const ident = buildTicketIdentity(playerInfo, messages);
 
@@ -574,11 +903,24 @@
         // 未连接时不更新 hash，等重连后自动补发
         if (!sendToBrain(payload)) return;
 
-        const lastSender = messages[messages.length - 1].sender;
-        if (lastSender === 'player' ||
-            (window._lastChatHash && currentHash.length > window._lastChatHash.length)) {
-            playDingDong();
+        // ★ 只有「当前这个会话末尾真的多了玩家新消息」才响铃。
+        //   旧逻辑只看"最后一条是不是玩家发的"，于是点开历史工单、切会话、恢复挂起工单
+        //   都会响 —— 那些只是"翻了翻记录"，不是新消息。
+        const prevState = window._lastChatState;
+        const texts = messages.map(m => m.text);
+        let isNewPlayerMsg = false;
+        if (prevState && prevState.gid === ident.gid && prevState.texts.length <= texts.length) {
+            let samePrefix = true;                       // 历史消息必须没变（纯追加才算新消息）
+            for (let i = 0; i < prevState.texts.length; i++) {
+                if (prevState.texts[i] !== texts[i]) { samePrefix = false; break; }
+            }
+            if (samePrefix && texts.length > prevState.texts.length) {
+                isNewPlayerMsg = messages.slice(prevState.texts.length).some(m => m.sender === 'player');
+            }
         }
+        if (isNewPlayerMsg) playDingDong();
+
+        window._lastChatState = { gid: ident.gid, texts: texts };
         window._lastChatHash = currentHash;
     }, 2000);
 
@@ -601,12 +943,18 @@
     // ==================== 调试入口（客服/运维可在控制台直接调用） ====================
     window.__probe = {
         version: function () { console.log("探针版本 v" + PROBE_VERSION); return PROBE_VERSION; },
+        config: PROBE_CONFIG,          // 可直接改：__probe.config.keepManualOffline = false
         status: function () {
             const st = { version: PROBE_VERSION, kind: chipKind, detail: chipDetail,
+                         imStatus: lastIMStatus, manualOffline: isManualOffline,
+                         keepManualOffline: PROBE_CONFIG.keepManualOffline,
+                         guardHits: guardHits,
                          wsState: ws ? ws.readyState : -1, online: !!(ws && ws.readyState === WebSocket.OPEN) };
             console.table ? console.table(st) : console.log(st);
             return st;
         },
+        // 立刻去读一次页面上的真实状态并上报（手机端"重新获取状态"走的就是这个）
+        refreshStatus: function () { return readAndReportIMStatus(true) ? "已上报当前状态" : "未读到 IM 状态"; },
         reconnect: function () { reconnectAttempts = 0; connectBrain(); return "已触发重连"; }
     };
 

@@ -46,9 +46,13 @@ function makeEl(id) {
     };
 }
 
+// 顶部两个下拉现在是"自绘按钮 + 底部面板"，假 DOM 里只需要普通元素
 const els = {};
-const IDS = ['afk-btn', 'alarm-overlay', 'chat-input', 'conv-container',
-             'chat-stream', 'chat-player-name', 'chat-view', 'list-view'];
+const IDS = ['im-pill', 'im-label', 'im-dot', 'afk-pill', 'afk-label', 'afk-dot',
+             'sheet', 'sheet-title', 'sheet-body', 'sheet-backdrop',
+             'link-chips', 'brand-sub', 'player-card', 'toast',
+             'alarm-overlay', 'chat-input', 'conv-container',
+             'chat-stream', 'chat-player-name', 'chat-ticket-id', 'chat-view', 'list-view'];
 IDS.forEach(i => { els[i] = makeEl(i); });
 
 const documentStub = {
@@ -66,9 +70,10 @@ const FakeWebSocket = class {
         this.onopen = this.onclose = this.onerror = this.onmessage = null;
         FakeWebSocket.instances.push(this);
     }
-    send() {}
+    send(data) { FakeWebSocket.sent.push(JSON.parse(data)); }   // 记录下行动作，供断言
     close() { this.readyState = 3; }
 };
+FakeWebSocket.sent = [];
 FakeWebSocket.CONNECTING = 0; FakeWebSocket.OPEN = 1;
 FakeWebSocket.CLOSING = 2; FakeWebSocket.CLOSED = 3;
 FakeWebSocket.instances = [];
@@ -226,6 +231,177 @@ check('会话列表是独立滚动容器', /\.conv-list\s*\{[^}]*overflow-y:\s*a
 check('聊天记录是独立滚动容器', /\.chat-stream\s*\{[^}]*overflow-y:\s*auto/.test(py));
 check('页面切换改用 display 而非 transform', py.indexOf('.view.active { display: flex; }') !== -1);
 check('弹性高度用 min-height:0 收敛（保证内部能滚动）', (py.match(/min-height:\s*0/g) || []).length >= 3);
+
+console.log('\n[9] 顶部两个下拉（V7.4：自绘按钮 + 底部面板，不再用原生 select）');
+check('顶栏是自绘胶囊按钮 id="im-pill"', py.indexOf('id="im-pill"') !== -1);
+check('顶栏是自绘胶囊按钮 id="afk-pill"', py.indexOf('id="afk-pill"') !== -1);
+check('点击打开底部选择面板（openSheet）',
+    py.indexOf("openSheet('im')") !== -1 && py.indexOf("openSheet('mode')") !== -1);
+check('没有原生 <select>（避免"框框"与卡顿）', py.indexOf('<select') === -1);
+check('旧的"IM 状态按钮 + 弹出菜单"已移除',
+    py.indexOf('id="status-menu"') === -1 && py.indexOf('toggleStatusMenu') === -1);
+check('品牌名过长会省略号截断（左上角不再越界）',
+    /\.brand-name\{[^}]*overflow:hidden/.test(py) && /\.brand-name\{[^}]*text-overflow:ellipsis/.test(py));
+
+console.log('\n[10] 手机端启动不编造状态（V7.4：先从电脑网页取）');
+check('状态未核实前显示「正在获取…」', h5code.indexOf('正在获取…') !== -1);
+check('电脑端未连接时显示「电脑未连接」', h5code.indexOf('电脑未连接') !== -1);
+check('依赖服务端 im_status_known 标志（未核实不亮绿灯）', h5code.indexOf('im_status_known') !== -1);
+check('会主动向电脑端索要真实状态（REQUEST_IM_STATUS）',
+    h5code.indexOf("action: 'REQUEST_IM_STATUS'") !== -1);
+
+// 行为：先来一份"未核实"的快照 -> 胶囊必须是"正在获取"，不能显示在线
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true,
+    im_status: 1, im_status_known: false,
+    companies: { main: { conversations: {} } }
+} });
+check('im_status_known=false -> 胶囊显示「正在获取…」而不是在线',
+    els['im-label'].innerText === '正在获取…', els['im-label'].innerText);
+
+// 行为：探针核实后（离线）-> 胶囊显示离线，且不会再被顶成在线
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true,
+    im_status: 3, im_status_known: true, im_status_manual: true,
+    companies: { main: { conversations: {} } }
+} });
+check('核实为离线 -> 胶囊显示「IM 离线」', els['im-label'].innerText === 'IM 离线', els['im-label'].innerText);
+
+// 行为：点胶囊打开面板 -> 三个状态 + 当前项打勾
+sandbox.openSheet('im');
+check('IM 面板列出在线/忙碌/离线', ['IM 在线', 'IM 忙碌', 'IM 离线'].every(s => els['sheet-body'].innerHTML.indexOf(s) !== -1),
+    els['sheet-body'].innerHTML.slice(0, 80));
+check('当前状态被打勾（离线）',
+    /class="sheet-item cur"[^>]*data-set="im:3"/.test(els['sheet-body'].innerHTML), els['sheet-body'].innerHTML.slice(0, 120));
+check('面板已显示', els['sheet'].classList.contains('show'));
+sandbox.closeSheet();
+check('取消后关闭面板', !els['sheet'].classList.contains('show'));
+
+// 行为：探针掉线 -> 胶囊显示"电脑未连接"，不亮绿灯
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: false,
+    im_status: 3, im_status_known: false,
+    companies: { main: { conversations: {} } }
+} });
+check('电脑端掉线 -> 胶囊显示「电脑未连接」', els['im-label'].innerText === '电脑未连接', els['im-label'].innerText);
+
+console.log('\n[10.5] 回复模式三档（V7.4：AI 自动起草可以关掉了）');
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, auto_draft: true, reply_mode: 'semi', alarm_status: false, extension_online: true,
+    im_status: 1, im_status_known: true,
+    companies: { main: { conversations: {} } }
+} });
+check('默认显示「半自动」', els['afk-label'].innerText === '半自动', els['afk-label'].innerText);
+sandbox.openSheet('mode');
+check('模式面板列出 手动/半自动/AFK 三档',
+    ['手动', '半自动', 'AFK 全自动'].every(s => els['sheet-body'].innerHTML.indexOf(s) !== -1),
+    els['sheet-body'].innerHTML.slice(0, 100));
+check('半自动是当前项并打勾', /data-set="mode:semi"[^>]*|\s*<span class="tick">/.test(els['sheet-body'].innerHTML)
+    && els['sheet-body'].innerHTML.indexOf('mode:semi') !== -1, els['sheet-body'].innerHTML.slice(0, 140));
+check('手动档明确写着"AI 不自动起草"（能关掉）',
+    els['sheet-body'].innerHTML.indexOf('AI 不自动起草') !== -1, els['sheet-body'].innerHTML.slice(0, 160));
+wsInst.readyState = 1;
+FakeWebSocket.sent.length = 0;
+sandbox.setReplyMode('manual');
+let modeMsgs = FakeWebSocket.sent.filter(m => m.action === 'SET_MODE');
+check('选「手动」-> 下发 SET_MODE mode=manual',
+    modeMsgs.length === 1 && modeMsgs[0].mode === 'manual', JSON.stringify(modeMsgs));
+check('选完后胶囊立刻变「手动」（关掉自动起草）', els['afk-label'].innerText === '手动', els['afk-label'].innerText);
+FakeWebSocket.sent.length = 0;
+sandbox.setReplyMode('afk');
+check('选「AFK 全自动」-> 下发 SET_MODE mode=afk',
+    FakeWebSocket.sent.some(m => m.action === 'SET_MODE' && m.mode === 'afk'), JSON.stringify(FakeWebSocket.sent));
+check('胶囊变「AFK 全自动」', els['afk-label'].innerText === 'AFK 全自动', els['afk-label'].innerText);
+
+console.log('\n[11] 顶栏连接状态条（中继 / 探针 / 会话数）');
+check('渲染连接状态条', (els['link-chips'].innerHTML || '').indexOf('中继') !== -1, els['link-chips'].innerHTML.slice(0, 60));
+check('状态条里带探针在线状态', (els['link-chips'].innerHTML || '').indexOf('电脑探针') !== -1);
+
+console.log('\n[13] 卡片信息更全（V7.4：玩家名不再是"玩家信息"）');
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true, im_status: 1, im_status_known: true,
+    companies: { main: { conversations: {
+        'T-INFO': { name: '张三', updatedAt: nowMs, playerInfo: '玩家信息 | 昵称：张三 | UID:10001 | 区服:S12',
+                    msgs: [{ sender: 'player', text: '抽卡没到账', ts: nowMs }] }
+    } } }
+} });
+const infoHtml = els['conv-container'].innerHTML;
+check('卡片显示玩家名（不是"玩家信息"）', infoHtml.indexOf('张三') !== -1, infoHtml.slice(0, 80));
+check('卡片带 UID 副信息，便于分清是谁',
+    infoHtml.indexOf('UID 10001') !== -1, infoHtml.slice(0, 200));
+const infoCards = els['conv-container']._cards || [];
+if (infoCards.length) infoCards[0]._click();
+check('聊天页顶部有玩家信息卡', (els['player-card'].innerText || '').indexOf('👤') !== -1, els['player-card'].innerText);
+check('长信息默认折叠（露 2 行 + "展开全部"提示）',
+    (els['player-card'].innerText || '').indexOf('展开全部') !== -1
+    && (els['player-card'].innerText || '').indexOf('UID:10001') === -1, els['player-card'].innerText);
+sandbox.togglePlayerCard();
+check('点一下展开全部（能看到 UID/区服）',
+    (els['player-card'].innerText || '').indexOf('UID:10001') !== -1
+    && (els['player-card'].innerText || '').indexOf('区服') !== -1, els['player-card'].innerText);
+
+console.log('\n[12] 手机端挂起 / 恢复（V7.4：补上"恢复" + 结果提示）');
+check('操作栏同时有「挂起」与「恢复」按钮',
+    py.indexOf("execCommand('HANGUP')") !== -1 && py.indexOf("execCommand('RESUME')") !== -1);
+fullSync({ 'T-R1': { name: '玩家庚', updatedAt: nowMs, msgs: [{ sender: 'player', text: '帮我看看', ts: nowMs }] } });
+const cardsR = els['conv-container']._cards || [];
+check('准备好一个可操作的会话', cardsR.length === 1, '数量=' + cardsR.length);
+if (cardsR.length) cardsR[0]._click();
+wsInst.readyState = 1;                     // OPEN（前面的断线用例把它设成了 CLOSED）
+FakeWebSocket.sent.length = 0;
+sandbox.execCommand('HANGUP');
+let acts = FakeWebSocket.sent.filter(m => m.action === 'EXT_COMMAND');
+check('点「挂起」-> 下发 ACTION_HANGUP 给探针',
+    acts.length === 1 && acts[0].command === 'ACTION_HANGUP', JSON.stringify(acts));
+check('挂起后立刻提示"已请求…"（不再静默）',
+    (els['toast'].innerText || '').indexOf('挂起') !== -1, els['toast'].innerText);
+FakeWebSocket.sent.length = 0;
+sandbox.execCommand('RESUME');
+acts = FakeWebSocket.sent.filter(m => m.action === 'EXT_COMMAND');
+check('点「恢复」-> 下发 ACTION_RESUME 给探针',
+    acts.length === 1 && acts[0].command === 'ACTION_RESUME', JSON.stringify(acts));
+check('恢复后立刻提示"已请求…"',
+    (els['toast'].innerText || '').indexOf('恢复') !== -1, els['toast'].innerText);
+onmsg({ type: 'AI_STATUS', status: 'error',
+        message: '挂起失败 · 未找到「挂起」按钮，页面上的按钮：转交他人/结束会话' });
+check('探针回报失败原因 -> 手机端弹出具体原因（含页面真实按钮名）',
+    (els['toast'].innerText || '').indexOf('未找到') !== -1, els['toast'].innerText);
+
+console.log('\n[14] 需要人工介入（V7.4：表格没答案 -> 横幅 + 专属提示音 + 置顶）');
+check('有"需要人工"横幅与"知道了"按钮',
+    py.indexOf('id="human-banner"') !== -1 && py.indexOf('ackHumanAlert()') !== -1);
+check('专属提示音与"新消息叮咚""掉线警报"分开实现（playHumanAlert）',
+    h5code.indexOf('function playHumanAlert') !== -1 && h5code.indexOf('function playDingDong') === -1
+    && h5code.indexOf('playMobileSiren') !== -1);
+check('收到 HUMAN_ALERT 事件会立刻提示', h5code.indexOf("payload.type === 'HUMAN_ALERT'") !== -1);
+check('置顶会话排在列表最前', h5code.indexOf('convs[a].pinned') !== -1 || h5code.indexOf('&& convs[a].pinned') !== -1);
+check('确认告警走 ACK_ALERT', h5code.indexOf("action: 'ACK_ALERT'") !== -1);
+
+// 行为：FULL_SYNC 带告警 -> 横幅出现，内容含问题总结
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true, im_status: 1, im_status_known: true,
+    human_alerts: [{ id: 'A-1', ts: nowMs, groupID: 'T-AL', name: '玩家丁', summary: '充值未到账，要求补发',
+                     reason: '表格里没有对应答案，已发送安抚话术' }],
+    companies: { main: { conversations: {
+        'T-PIN': { name: '玩家戊', updatedAt: nowMs - 999999, msgs: [{ sender: 'player', text: '排序测试', ts: nowMs - 999999 }] },
+        'T-AL': { name: '玩家丁', updatedAt: nowMs, pinned: true, alert: true,
+                  msgs: [{ sender: 'player', text: '充值没到账', ts: nowMs }] }
+    } } }
+} });
+check('告警横幅已显示', els['human-banner'].classList.contains('show'));
+check('横幅标题带玩家名', (els['hb-title'].innerText || '').indexOf('玩家丁') !== -1, els['hb-title'].innerText);
+check('横幅带问题总结', (els['hb-text'].innerText || '').indexOf('充值未到账') !== -1, els['hb-text'].innerText);
+const pinHtml = els['conv-container'].innerHTML;
+check('置顶会话排在最前（尽管时间更早）',
+    pinHtml.indexOf('T-AL') < pinHtml.indexOf('T-PIN'), pinHtml.slice(0, 120));
+check('置顶/需人工会话有 📌🙋 标记',
+    pinHtml.indexOf('pin-badge') !== -1 && pinHtml.indexOf('📌') !== -1 && pinHtml.indexOf('🙋') !== -1);
+wsInst.readyState = 1;
+FakeWebSocket.sent.length = 0;
+sandbox.ackHumanAlert();
+check('点"知道了" -> 下发 ACK_ALERT 并收起横幅',
+    FakeWebSocket.sent.some(m => m.action === 'ACK_ALERT') && !els['human-banner'].classList.contains('show'),
+    JSON.stringify(FakeWebSocket.sent));
 
 console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
 process.exit(fail === 0 ? 0 : 1);

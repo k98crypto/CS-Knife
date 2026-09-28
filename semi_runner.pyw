@@ -149,6 +149,19 @@ def beep_error():
     time.sleep(0.05)
     winsound.Beep(400, 150)
 
+# ★ 人工介入专属长报警：三短（700Hz）一长（500Hz），
+#   与"新消息/成功/失败"提示音、与"掉线警报"（探针的连续警笛）都明显不同。
+ALERT_SEEN = set()
+def long_human_alarm():
+    try:
+        for _ in range(3):
+            winsound.Beep(700, 320)
+            time.sleep(0.10)
+        time.sleep(0.18)
+        winsound.Beep(500, 700)
+    except Exception:
+        pass
+
 class HUDOverlay:
     """桌面悬浮窗（始终置顶 + 可折叠 + 可召回 + 连接状态灯）。
 
@@ -164,6 +177,8 @@ class HUDOverlay:
         self.root.title("工单助手 HUD")
         self.pinned = True
         self.folded = False
+        self.mode = "semi"            # 当前回复模式（由中继同步，本窗口不维护独立副本）
+        self.mode_owner = "default"   # 谁设的：mobile=手机端优先
         self._q = queue.Queue()
         self._pos_fixed = False
         # 记录"我们想要的坐标"。不要依赖 winfo_x()：窗口还没映射时它返回 0，
@@ -230,6 +245,11 @@ class HUDOverlay:
         self.btn_pin.pack(side="right", padx=self._px(2), pady=self._px(3))
         self.btn_home = self._mk_btn(self.bar, "🧭", self.recall)
         self.btn_home.pack(side="right", padx=self._px(2), pady=self._px(3))
+        # ★ 自动化开关（默认半自动=只把草稿填进输入框，不发送）
+        #   点一下循环：🤖半自动 → 🚀AFK → ✋手动 → 🤖半自动
+        #   显示内容始终来自中继（手机端改了这里 5 秒内跟着变；冲突时以手机端为准）
+        self.btn_mode = self._mk_btn(self.bar, "🤖半自动", self.cycle_mode, fg=ACCENT, width=9)
+        self.btn_mode.pack(side="right", padx=self._px(2), pady=self._px(3))
 
         self.body = tk.Frame(self.outer, bg=BG_ROOT)
         self.body.pack(fill="both", expand=True)
@@ -493,12 +513,87 @@ class HUDOverlay:
                     text=(f"{tk_info.get('conversations', 0)} 会话 · {info.get('categories', 0)} 分类 · "
                           f"{kb.get('total_rows', '-')} 规章 | F6下载 F7提炼 F9解答 F10润色"),
                     fg=FG_DIM)
+                self._handle_human_alerts(info.get("alerts") or [])
+                self._sync_mode_ui(info)
+        except Exception:
+            pass
+
+    # ---------------- 自动化开关（回复模式） ----------------
+    def cycle_mode(self):
+        """循环切换：🤖半自动（起草到输入框，不发送）→ 🚀AFK（直接发）→ ✋手动（只提醒）。"""
+        order = ["semi", "afk", "manual"]
+        cur = self.mode if self.mode in order else "semi"
+        nxt = order[(order.index(cur) + 1) % len(order)]
+        threading.Thread(target=self._push_mode, args=(nxt,), daemon=True).start()
+
+    def _push_mode(self, mode):
+        """把选择推给中继。手机端刚设过时会被拒绝（以手机端为准），这里如实提示。"""
+        try:
+            r = requests.post(f"{BRIDGE_BASE}/api/mode",
+                              json={"mode": mode, "source": "desktop"}, timeout=2)
+            d = r.json() or {}
+        except Exception as e:
+            self.update_ui(status=f"❌ 切换失败：{str(e)[:24]}", status_color=DANGER)
+            return
+        if d.get("ok"):
+            self.update_ui(status=f"✅ 回复模式：{d.get('mode_label') or mode}", status_color=ACCENT)
+        else:
+            self.update_ui(status=f"⚠️ {d.get('note') or '切换被拒绝（以手机端为准）'}", status_color=WARN)
+
+    def _sync_mode_ui(self, info):
+        """从中继同步模式显示（本窗口不自己记状态，手机端改了这里会跟着变）。"""
+        ar = ((info or {}).get("auto_reply") or {})
+        m = str(ar.get("mode") or "semi")
+        if m not in ("manual", "semi", "afk"):
+            m = "semi"
+        self.mode = m
+        self.mode_owner = str(ar.get("mode_owner") or "default")
+        short = {"manual": "✋手动", "semi": "🤖半自动", "afk": "🚀AFK"}[m]
+        suffix = "·手机" if self.mode_owner == "mobile" else ""
+        try:
+            self.btn_mode.config(text=short + suffix, fg=ACCENT if m == "afk" else FG_DIM)
+        except Exception:
+            pass
+
+    def _handle_human_alerts(self, alerts):
+        """人工介入告警（表格里没有答案时）：长报警 + 自动复制玩家信息&问题总结。
+
+        与"新消息叮咚""功能成功/失败""掉线警报"都不同的一种声音：三短一长。
+        """
+        if not alerts:
+            return
+        fresh = [a for a in alerts if isinstance(a, dict) and str(a.get("id")) not in ALERT_SEEN]
+        if not fresh:
+            return
+        a = fresh[0]
+        for x in fresh:
+            ALERT_SEEN.add(str(x.get("id")))
+        # 复制给客服（直接可粘到群里/做成工单备注）
+        text = (f"玩家信息：{a.get('playerInfo') or a.get('name') or ''}\n"
+                f"问题总结：{a.get('summary') or ''}\n"
+                f"处理建议：{a.get('reason') or '表格里没有对应答案'}\n"
+                f"工单：{a.get('groupID') or ''}")
+        try:
+            pyperclip.copy(text)
+            copied = "已复制到剪贴板"
+        except Exception:
+            copied = "复制失败"
+        self.update_ui(status=f"🙋 需要人工：{a.get('name') or a.get('groupID')}",
+                       status_color=WARN,
+                       last=f"[人工] 玩家信息+问题总结{copied}：{' '.join(str(a.get('summary') or '').split())[:100]}",
+                       last_color="#E5C07B")
+        # 长报警放到线程里，别卡住 5 秒轮询
+        threading.Thread(target=long_human_alarm, daemon=True).start()
+        # 告诉中继"已经提醒过"，避免重复鸣笛
+        try:
+            requests.post(f"{BRIDGE_BASE}/api/alerts/ack", json={"ids": [a.get("id")]}, timeout=2)
         except Exception:
             pass
 
 hud = None
 
-def safe_capture_selection(min_len=2) -> str:
+def safe_capture_selection(min_len=2, quiet=False) -> str:
+    """取当前选中文本。quiet=True 时不弹提示/不响警报（供"免框选"回退流程使用）。"""
     try: pyperclip.copy("")
     except Exception: pass
     time.sleep(0.04)
@@ -509,14 +604,37 @@ def safe_capture_selection(min_len=2) -> str:
         raw = pyperclip.paste().strip()
         if raw: break
     if not raw or len(raw) < min_len:
-        if hud: hud.update_ui(status="⚠️ 拦截: 未选中文本或选区为空", status_color="#CE9178")
-        beep_error()
+        if not quiet:
+            if hud: hud.update_ui(status="⚠️ 拦截: 未选中文本或选区为空", status_color="#CE9178")
+            beep_error()
         return ""
     if "sk-" in raw or raw.startswith("sk-"):
         if hud: hud.update_ui(status="🛑 危险熔断: 检测到 API Key，已拦截！", status_color="#F44747")
         beep_error()
         return ""
     return raw
+
+
+def fetch_ticket_history(limit=8) -> str:
+    """从当前工单抓聊天记录，作为 F9 的"免框选"输入（手册一直写的免框选，之前其实要选字）。"""
+    try:
+        data = requests.get(f'{BRIDGE_BASE}/api/ticket', timeout=2).json()
+    except Exception:
+        return ""
+    msgs = [m for m in (data.get("msgs") or []) if isinstance(m, dict) and m.get("text")]
+    if not msgs:
+        return ""
+    return "\n".join([f"{'【玩家】' if m.get('sender') == 'player' else '【客服】'}: {m.get('text')}"
+                      for m in msgs[-limit:]])
+
+
+def fill_into_page(reply: str) -> bool:
+    """把文案直接填进网页回复框（不依赖光标焦点）。失败返回 False，调用方再退回 Ctrl+V。"""
+    try:
+        r = requests.post(f'{BRIDGE_BASE}/api/fill_draft', json={"content": reply}, timeout=2)
+        return r.status_code == 200 and bool((r.json() or {}).get("ok"))
+    except Exception:
+        return False
 
 def on_f7():
     """一键免框选抓取提炼出库"""
@@ -584,11 +702,19 @@ def on_f6():
 
 def on_f9():
     global current_ticket_context
-    text = safe_capture_selection()
-    if not text: return
+    text = safe_capture_selection(quiet=True)
+    source = "框选内容"
+    if not text:
+        # ★ 免框选：没选中文字时，直接用当前工单的聊天记录（手册一直是这么写的）
+        text = fetch_ticket_history()
+        source = "当前工单聊天记录"
+    if not text:
+        if hud: hud.update_ui(status="⚠️ 没选中文字，也没抓到工单记录：请先在网页打开工单", status_color="#CE9178")
+        beep_error()
+        return
     beep_start()
     current_ticket_context = text
-    if hud: hud.update_ui(status="⚡ 正在智能分析工单状态...", status_color="#DCDCAA")
+    if hud: hud.update_ui(status=f"⚡ 正在智能分析工单状态…（{source}）", status_color="#DCDCAA")
 
     try:
         tag, reply = core.process_ticket_f9(text)
@@ -604,14 +730,18 @@ def on_f9():
             return
 
         pyperclip.copy(reply)
+        # 优先让探针直接写网页回复框（不依赖光标焦点，避免 Ctrl+V 粘到别处）
+        into_page = fill_into_page(reply)
+        if not into_page:
+            time.sleep(0.1)
+            keyboard.send('ctrl+v')
         if hud: hud.update_ui(last=f"[F9·{tag}] {' '.join(str(reply).split())[:120]}", last_color="#4EC9B0")
-        time.sleep(0.1)
-        keyboard.send('ctrl+v')
+        where = "网页回复框" if into_page else "当前光标处(剪贴板粘贴)"
 
         if tag == "GREETING":
-            if hud: hud.update_ui(status="👋【开场】已填入开场白", status_color="#4EC9B0"); beep_success()
+            if hud: hud.update_ui(status=f"👋【开场】已填入{where}", status_color="#4EC9B0"); beep_success()
         elif tag == "NEED_INFO":
-            if hud: hud.update_ui(status="📸【要信息】已填入截图追问", status_color="#4EC9B0"); beep_success()
+            if hud: hud.update_ui(status=f"📸【要信息】已填入{where}", status_color="#4EC9B0"); beep_success()
         elif tag == "TIMEOUT_CLOSE":
             if hud: hud.update_ui(status="🚪【超时关单】玩家超2h未回可关单", status_color="#FFA500")
             winsound.Beep(1800, 200)
@@ -622,7 +752,7 @@ def on_f9():
             if "【规章库未收录" in reply:
                 if hud: hud.update_ui(status="⚠️ 规章未收录！建议上报群聊", status_color="#CE9178")
             else:
-                if hud: hud.update_ui(status="✅ 官方解答已填入", status_color="#4EC9B0")
+                if hud: hud.update_ui(status=f"✅ 官方解答已填入{where}", status_color="#4EC9B0")
             beep_success()
     except Exception as e:
         if hud: hud.update_ui(status=f"❌ 处理异常: {str(e)[:25]}", status_color="#F44747"); beep_error()
@@ -640,10 +770,13 @@ def on_f10():
             beep_error()
             return
         pyperclip.copy(final_reply)
+        into_page = fill_into_page(final_reply)          # 同 F9：优先直接写网页回复框
+        if not into_page:
+            time.sleep(0.1)
+            keyboard.send('ctrl+v')
         if hud: hud.update_ui(last=f"[F10·润色] {' '.join(str(final_reply).split())[:120]}", last_color="#C586C0")
-        time.sleep(0.1)
-        keyboard.send('ctrl+v')
-        if hud: hud.update_ui(status="✅ 话术已公关润色并自动替换", status_color="#4EC9B0")
+        if hud: hud.update_ui(status=("✅ 话术已公关润色并替换" + ("（网页回复框）" if into_page else "（光标处）")),
+                              status_color="#4EC9B0")
         beep_success()
     except Exception as e:
         if hud: hud.update_ui(status=f"❌ 润色异常: {str(e)[:25]}", status_color="#F44747"); beep_error()

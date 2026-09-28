@@ -18,7 +18,7 @@ except Exception:
     pass
 
 BASE = "http://127.0.0.1:8765"
-TEST_VER = "7.2"
+TEST_VER = "7.4"
 TEST_PAGE = "https://ticket.example.com/imChat/workstation"
 
 passed = 0
@@ -84,6 +84,8 @@ async def main():
 
         for key in ("server", "probe", "mobile", "ticket", "kb", "config"):
             check(f"包含 {key} 区块", isinstance(diag.get(key), dict))
+        check("包含 im 区块（手机端状态从哪来，一眼可查）", isinstance(diag.get("im"), dict),
+              str(diag.get("im")))
         check("probe.expected_version 提示期望版本", bool((diag.get("probe") or {}).get("expected_version")),
               str((diag.get("probe") or {}).get("expected_version")))
         check("server.ip / port 可读",

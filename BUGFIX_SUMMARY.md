@@ -627,7 +627,7 @@ python mobile_feature_test.py        -> 19 通过 / 0 失败   (原 15，新增 
 
 ### 文档同步
 
-`使用手册.md` 6.4 节补充「⚫ 电脑未连接」状态说明；
+`README.md` 6.4 节补充「⚫ 电脑未连接」状态说明；
 新增 **12.10 节：手机顶部按钮点不动**（含 iPhone 清缓存方法）。
 
 ---
@@ -743,6 +743,263 @@ hud_pos.json -> {"x": 1932, "y": 777, ...}       # 已自动夹回屏内（物�
 1. IM 官方 HTTP 接口的抓包（拉工单列表 / 发送消息）
 2. 三级问题分类的真实名称（打开 `/api/categories` 核对）
 3. 工单列表项的 HTML 片段（用于精确定位工单 ID）
+
+---
+
+## 🛡️ 第九轮（2026/9/28）：手动离线被改成在线 + 手机端 UI 重做
+
+### 现象（客服原话）
+
+> "我自己在网页上手动设置的离线，它自己变成在线了 —— 这是不允许的。"
+
+### 根因（三条叠加，缺一条都不会出现这个现象）
+
+| # | 根因 | 证据 |
+|---|------|------|
+| 1 | **中继重启把状态顶回默认值**：`state["im_status"]` 只在内存里，进程一重启就是 `1`（在线），而探针**只在状态变化时**才上报 —— 状态没变就永远不纠正 | 本次调试期间反复重启 `bridge_server.py`，重启后手机端立刻变🟢在线 |
+| 2 | **探针重连会彻底放弃**：`scheduleReconnect()` 重试 10 次后 `return`，此后即使中继恢复也永不再连 → 手机端一直停在旧状态 | 旧代码 `if (reconnectAttempts >= maxReconnectAttempts) { …; return; }` |
+| 3 | **网页自己会跳回在线**：IM 工作台在窗口重新获得焦点时会自动上线（客服在页面间切来切去），探针如实上报"在线"，看起来就像"我设的离线被改了" | 探针 `findIMStatusText()` 也可能读到**隐藏的**下拉选项（旧版只做文本匹配，不看可见性） |
+
+### 修复
+
+| # | 修复 | 位置 |
+|---|------|------|
+| 1 | **状态记忆落盘**：`im_state.json` 记录 `{status, manual, ts}`，启动即恢复；新增 `im_status_known` 标记"本进程是否已从网页核实" | `bridge_server.py` `load/save/apply_im_status()` |
+| 2 | **唯一写入口** `apply_im_status()`：IM_STATUS / ABNORMAL_OFFLINE / ALARM_RECOVERED / SET_IM_STATUS 全部改走它（内存 + 落盘 + 清警报） | `bridge_server.py` |
+| 3 | **状态不凭空显示**：`known=false` 时手机端顶部显示 `⏳ 正在获取…`；探针掉线时 `known=false` → 显示 `⚫ 电脑未连接` | H5 `renderIMStatus()` |
+| 4 | **强制复核**：新增 `REQUEST_IM_STATUS`（手机端一连上、回前台、点开页面自动发）→ 服务端转发给探针 → 探针**无论状态是否变化**都重新读 DOM 并上报 | `probe.js` / `bridge_server.py` |
+| 5 | **连上即复核**：探针 `onopen` 100ms 后强制上报一次真实状态（中继重启也不会残留旧值）；`POLICY` 命令下发守护开关 | `probe.js` |
+| 6 | **手动离线守护**：手动挂离线后，网页自己跳回在线/忙碌 → 探针点回「IM离线」并上报 `guarded:true`；上限 3 次/10 秒（超过则如实上报，不与网页无限对抗）；自己点在线/忙碌有 1.5s 免打扰且人的点击永远优先 | `probe.js` `restoreManualOffline()` |
+| 7 | **状态读取只看可见节点**：隐藏的下拉选项不再被当"当前状态"，状态显示区优先、菜单项仅兜底 | `probe.js` `findIMStatusText()` |
+| 8 | **重连永不放弃**：10 次后不再停止，改为每 30 秒持续重连（胶囊提示"持续重连中"） | `probe.js` `scheduleReconnect()` |
+| 9 | **诊断可查**：`/api/diag` 新增 `im.{status,status_text,known,manual,state_file}`，`/diag` 自检页新增「IM 状态」卡片（含状态记忆时间与守护开关） | `bridge_server.py` |
+
+### 手机端 UI 重做（按要求"精美一点、简约一点"）
+
+| 项 | 之前 | 现在 |
+|----|------|------|
+| 顶部控件 | 状态按钮 + 弹出菜单；AFK 按钮 | **两个原生 `<select>` 下拉框**（IM 状态 / 托管模式），iOS 点一下就是系统选择器，不会点不动 |
+| 状态可信度 | 直接显示服务端默认值（可能凭空🟢在线） | 先 `⏳ 正在获取…` → 问到真实值再显示；探针掉线显示 `⚫ 电脑未连接` |
+| 顶部信息 | 无 | 状态条：`中继 已连接` · `电脑探针 v7.3` · `N 个会话` |
+| 视觉 | 纯色卡片、无层次 | 深色玻璃拟态顶栏、圆角卡片/头像、渐变发送键、气泡尾巴、安全区内边距、去 transform（iOS 文字不发虚） |
+| 会话页 | 单行列表 | 头像 + 昵称 + 未读红点 + 最后一条消息 + 时间（微信式），另有进行中数量提示 |
+| 聊天页 | 标题 + 操作栏 | 标题带工单号、操作按钮胶囊化（AI 回复并关单 / AI 起草 / 挂起 / 关单）、输入区悬浮圆角 |
+
+### 验证
+
+```
+node probe_smoke_test.js          -> 57 通过 / 0 失败（新增：强制复核、离线守护、重连永不放弃、__probe.config）
+node h5_security_test.js          -> 49 通过 / 0 失败（新增：两个下拉框、未核实不显示在线、掉线显示未连接）
+python diag_test.py               -> 30 通过 / 0 失败（新增：im 区块）
+python mobile_feature_test.py     -> 23 通过 / 0 失败（新增：REQUEST_IM_STATUS 复核链路）
+```
+
+**重启不失忆实测**（本次真实跑过）：
+
+```
+# 1) 手机端手动设为离线（写盘 im_state.json -> {"status":3,"manual":true}）
+# 2) 强杀 bridge_server.py 并重启
+python _verify_restart.py after
+after -> {"status": 3, "status_text": "离线", "known": false, "manual": true,
+          "state_file": "im_state.json", ...}
+# 结论：重启后状态仍是「离线」且标记为"未核实"，手机端显示 ⏳ 正在获取… → 探针 100ms 内复核为 🔴 离线，
+#       全程没有任何一刻显示🟢在线
+```
+
+### 新增/更新文件
+
+| 文件 | 说明 |
+|------|------|
+| `probe.js` | **v7.3**：离线守护 + 连上即复核 + `REQUEST_IM_STATUS`/`POLICY` + 只认可见状态节点 + 重连永不放弃 + `__probe.config`/`refreshStatus` |
+| `bridge_server.py` | **v7.3**：IM 状态落盘与恢复、`apply_im_status()`、`im_status_known`、`REQUEST_IM_STATUS` 转发、`POLICY` 下发、`/api/diag.im`、`/diag` IM 状态卡、手机端 H5 全量重做 |
+| `config.json` | 新增 `keep_manual_offline`（默认 `true`，离线守护开关） |
+| `h5_security_test.js` | 34 → **49** 项（含假 `<select>` 语义） |
+| `probe_smoke_test.js` | 45 → **57** 项；默认读取 `probe.js`（不再需要 `probe_new.js`） |
+| `diag_test.py` | 29 → **30** 项（`im` 区块） |
+| `mobile_feature_test.py` | 20 → **23** 项（状态复核链路） |
+| `README.md`（使用手册） | 6.4/6.5/6.6 改为下拉框说明、12.1/12.10 新增"离线被改回""状态不对"排查、接口表补 `REQUEST_IM_STATUS`/`POLICY`/`im.*` |
+
+---
+
+## 🔊 第十轮（2026/9/28）：F9 免框选 + 动作回执 + 提示音收敛
+
+### 客服反馈（三条）
+
+1. 「F9 智能回复好像没了」
+2. 「手机端挂起/恢复没反应」
+3. 「关单估计也有问题，问题类型的下拉选项我感觉 AI/程序搞不定」
+4. 「电脑上点进以前的对话，或者把一个挂起的对话点了恢复，能不能不要冒出声音，这种不叫新消息」
+
+### 根因与修复
+
+| # | 现象 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | F9 完全没反应（连报错音都没有） | **F9 热键由悬浮窗 `semi_runner.pyw` 注册**，而悬浮窗当时没在运行 → 按键无人接收 | 已重启悬浮窗；`launcher.bat` 会同时拉起中继 + 悬浮窗（关掉黑框窗口 = 关掉手机端服务） |
+| 2 | F9 按了没反应/提示"未选中文本"，与手册写的"免框选"不符 | `on_f9()` 第一行就是 `safe_capture_selection()`，**没选字直接 return**（静默）；而且靠 `Ctrl+V` 粘贴，**回复框没聚焦就白填** | ① 没选字时**回退用当前工单聊天记录**（真免框选）；② 新增 `POST /api/fill_draft`，**探针直接把文案写进网页回复框**（不依赖焦点），失败才退回剪贴板；F10 同样处理 |
+| 3 | 手机点「挂起」没反应 | 探针只在 `.im-action-btn` 里找**文本完全相等**的按钮，找不到就静默什么都不做；**根本没有"恢复"这个动作** | ① 关键字匹配（完全相等优先→包含），优先按钮类元素、再退 span/div，且只点短标签（不误点容器）；② 新增 `ACTION_RESUME`（恢复/接入/接单/继续）；③ 新增 `ACTION_RESULT` 回执 → 手机 toast + 中继日志 `[动作] ❌ 挂起：未找到「挂起」按钮，页面上的按钮：…` |
+| 4 | 担心分类选错 | `selectCategoryByKeyword()` 匹配不上时 `target = list[0]`（**盲选第一项**）→ 分类被选错且无人知道 | 改为**宁可不选**并回报候选（`分类候选里没有匹配「X」的项；本层可选：…`）；同时支持扁平 `el-select` 分类；AI 的兜底分类由 `close_category_default` 显式提供，不再靠"第一项" |
+| 5 | 点开旧会话/恢复挂起就"叮咚" | 响铃条件写的是 `最后一条是玩家发的` 或 `内容变长` → 打开历史、切会话、自己回复全都会响 | 改成：**同一会话 + 历史消息前缀完全一致 + 末尾真的多出玩家消息**才响；切会话/重排历史/自己回复一律不响 |
+
+### 验证（全绿）
+
+```
+node probe_smoke_test.js   -> 69 通过 / 0 失败（新增：5 个响铃场景 + 挂起/恢复/关单回执 + 不盲选分类）
+node h5_security_test.js   -> 56 通过 / 0 失败（新增：恢复按钮、ACTION_RESUME/ACTION_HANGUP 下发、失败原因 toast）
+python hud_layout_test.py  -> 34 通过 / 0 失败（新增：F9 免框选/直填网页 源码级回归）
+python diag_test.py        -> 30 通过 / 0 失败
+python mobile_feature_test.py -> 27 通过 / 0 失败（新增：/api/fill_draft 直填回复框 + 空内容拒绝）
+agent_core 16 / rules_sync 18 全通过
+```
+
+### 新增/更新文件
+
+> 版本号说明：本轮 `probe.js` 与 `bridge_server.py` 内容都变了，版本号一起升到 **v7.4**
+> （油猴里必须换成 v7.4，页面左下角胶囊显示 `🟢 探针 v7.4` 才算装好）。
+
+| 文件 | 说明 |
+|------|------|
+| `probe.js` | 响铃判定改为"纯追加的玩家新消息"；`safeClickActionBtn` 关键字匹配 + `listActionButtons()`；新增 `ACTION_RESUME`/`LIST_ACTIONS`；所有动作回报 `ACTION_RESULT`；分类不再盲选 |
+| `bridge_server.py` | 新增 `ACTION_RESULT` 转发（手机 toast + 控制台 `[动作]`）；`ACTION_REPLY_CLOSE` 带 `defaultCategory`；新增 `POST /api/fill_draft`；H5 操作栏新增「▶ 恢复」+ 挂起/恢复即时提示 |
+| `semi_runner.pyw` | F9 免框选回退（`fetch_ticket_history`）、`fill_into_page()` 直填网页回复框、`safe_capture_selection(quiet=)`；F10 同步 |
+| `probe_smoke_test.js` | 57 → **69** 项 |
+| `h5_security_test.js` | 49 → **56** 项 |
+| `hud_layout_test.py` | 31 → **34** 项 |
+| `mobile_feature_test.py` | 23 → **27** 项 |
+| `README.md`（使用手册） | 5.1/5.2/5.4 热键与提示音、6.3 挂起恢复、11.x 协议、12.1/12.12 排查、13.3 测试清单 |
+
+---
+
+## 📱 第十一轮（2026/9/28）：手机端界面修形 + 重复卡片 + 回复模式可关
+
+### 客服反馈（附截图）
+
+1. 「手机端左上角 UI 越界，信息不全」
+2. 「玩家信息是什么？而且有重复的卡片」
+3. 「电脑网页的"问题选择"下拉菜单老是自己跑下来」
+4. 「手机端 IM 状态和回复模式的下拉菜单太丑了，还有框框和卡顿」
+5. 「AI 自动起草和 AI 润色两个快捷功能也点不了，默认是打开状态关不掉」
+
+### 根因与修复
+
+| # | 现象 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | 左上角品牌名被胶囊压住、越界 | `.brand-name` 只有 `white-space:nowrap`，**没有 overflow/text-overflow**，flex 子项也不收缩 | 品牌区改 `flex:1 1 92px; min-width:0; overflow:hidden` + 标题 `text-overflow:ellipsis`；顶栏 `flex-wrap` 允许换行 |
+| 2 | 所有卡片都叫「玩家信息」 | 右侧面板第一行是**栏目名**「玩家信息」，旧代码直接拿第一行当玩家名 | 新增 `parsePlayerIdentity()`：优先「昵称/角色名: XXX」，其次逐段挑（排除栏目名、`UID:` 这类 key:value），最后用 `玩家+UID后4位` 兜底 |
+| 3 | 同一玩家出现**两张重复卡片** | 工单指纹含「首条玩家消息」；列表虚拟滚动/重渲染让首条消息变化 → 同一工单算出两个 gid | 指纹只用**玩家身份**（uid+name，绝不含聊天内容）；另加"沿用上次 gid"连续性（工单号时有时无也不分裂） |
+| 4 | 聊天页"信息不全" | 面板字段没展示 | 聊天页新增**玩家信息卡**（默认 2 行，点一下展开全部）；卡片列表第二行显示 `UID …` |
+| 5 | 电脑网页分类下拉**自己弹出来** | 探针每次连接都被要求 `REQUEST_CATEGORIES`，且 `peekCategoryOptions()` 会**点开**分类下拉去读选项 | 探针内置分类缓存（用户自己点开时顺手采集）；缓存命中/面板已开就不再点；读完**再点一下收起**；中继改为**只在没拿到过分类时**才请求 |
+| 6 | 顶部下拉"丑、有框框、卡顿" | 上一版改成原生 `<select>`，iOS 上会带系统边框与原生弹层 | 改为**自绘胶囊按钮 + 底部选择面板**（真按钮 + 真按钮列表，无原生控件）；面板项带说明与 ✓ 当前档 |
+| 7 | 「AI 自动起草关不掉」 | 半自动模式下每条玩家消息都会触发 `handle_ai_automation()` 自动起草，**没有开关** | 新增三档 `reply_mode`：`manual`（只提醒，**不起草**）/ `semi`（默认）/ `afk`；手机端下拉里可随时切 |
+
+### 验证（全绿）
+
+```
+node probe_smoke_test.js   -> 79 通过 / 0 失败（新增：玩家名解析 / 标识稳定（重复卡片）/ 分类缓存）
+node h5_security_test.js   -> 73 通过 / 0 失败（新增：自绘下拉+面板 / 三档模式 / 卡片 UID / 玩家信息卡）
+python hud_layout_test.py  -> 34 通过 / 0 失败
+python diag_test.py        -> 30 通过 / 0 失败
+python mobile_feature_test.py -> 28 通过 / 0 失败（新增：已有分类缓存时不再请求分类）
+agent_core 16 / rules_sync 18 全通过
+```
+
+### 新增/更新文件
+
+| 文件 | 说明 |
+|------|------|
+| `probe.js` | `parsePlayerIdentity()` 玩家名/UID 解析；工单指纹去消息化（修重复卡片）；分类缓存 `categoryCache` + 不主动点开 + 读完收起 |
+| `bridge_server.py` | H5 顶栏自绘下拉 + 底部面板；`convInfo`/玩家信息卡；三档 `reply_mode` + `SET_MODE`；`handle_ai_automation` 手动模式不起草；分类只在首次请求；H5 内嵌脚本**不使用任何反斜杠转义**（避免 Python 与测试语义不一致） |
+| `h5_security_test.js` | 56 → **73** 项 |
+| `probe_smoke_test.js` | 69 → **79** 项 |
+| `mobile_feature_test.py` | 27 → **28** 项 |
+| `README.md`（使用手册） | 6.2/6.3/6.5 界面与三档模式、12.1/12.13/12.14 排查、11.4 协议、13.3 测试清单 |
+
+---
+
+## ⏳ 第十二轮（2026/9/28）：自动回复节奏（不秒回）+ 表格无答案转人工
+
+### 客服原话
+
+> "F9 是不是读取当前会话玩家发送的内容，一键发给 ai？……**AI 不要回复那么快，设置 1-3 分钟的随机延迟**，
+> 不然系统可能判定我使用脚本，玩家也要投诉没有人工客服。……**玩家发来消息后延迟 1-3 分钟，不发了再响应**，
+> 确保他说完想说的话。玩家第一次发消息来时，需要**发送对应的开头语，严格使用表格的**，发送出去之后等待玩家发信息
+> （有信息也等 1 分钟），没有新消息就回复。大部分回复内容需要和表格内对应，**首先要分析玩家问题能否在表格中找到**
+> 对应的，找不到就发一个『亲爱的玩家，您的问题我已经收到啦，正在为您查询相关信息，请稍等片刻哦~』这样的，
+> 然后**给我长报警（区分来消息的提示音，掉线也是长报警，也和这个区分）并把该会话置顶，玩家信息和问题总结一并复制给我**。"
+> 程序需要自行判断是否把客服说的话加在玩家消息中间发给 ai。
+
+### 交付内容
+
+| # | 需求 | 实现 |
+|---|------|------|
+| 1 | 不要秒回，**1~3 分钟随机延迟**，玩家继续说话就重新计时 | `schedule_auto_reply()` + `_auto_reply_after()`：每条玩家消息都 `cancel + 重新排队`；延迟 = `random.uniform(min,max)`（`state.auto_delay_min/max`，来自 `config.json` 两个参数，可用 `SET_AUTO_DELAY` 动态改） |
+| 2 | 只有"玩家说完"才回（不抢话、不重复回） | `should_auto_reply()`：最后一条必须是**玩家**发言，且该条 `ts > conv.last_reply_ts`（回过的就不再回；客服最后发言时绝不插话） |
+| 3 | 首次发言**立刻发开场语，严格取自表格** | 会话首次收到玩家消息时 `pick_greeting()` → 从 `core.tpl_no_desc`（话术库「没有描述问题 / 直接转人工」那一类）随机取一条 → `SEND_REPLY` 真发出去；表格缺失才用兜底句。实测发的是表格里的 `亲爱的玩家，很高兴为您服务~` |
+| 4 | 表格里找不到答案 → 安抚 + **长报警** + **置顶** + **复制信息** | `send_hold_and_alert()`：① 发 `HOLD_TEXT`（客户指定原话）② Bark + 手机 `HUMAN_ALERT`（专属三声）③ `conv.pinned=True` ④ 入队 `state.human_alerts`，桌面 HUD 轮询 `/api/diag.alerts` → **三短一长长报警** + `pyperclip.copy(玩家信息+问题总结+处理建议)` |
+| 5 | 三种提示音必须能区分 | ① 新消息"叮咚"（两个正弦音）② 掉线连续警笛（锯齿波循环 + 手机全屏红层）③ **需要人工：三短一长**（手机三声方波 880Hz；电脑 700Hz×3 + 500Hz 长音） |
+| 6 | 程序自行判断是否把客服的话带进 AI 上下文 | `build_chat_history_str(..., for_ai=True)`：最后一条是客服 → 返回空（不回）；**丢掉"玩家开口之前"的客服发言**；玩家之后的客服发言只留最近 2 条（省 token） |
+| 7 | （顺带）AI 自动起草能关掉 | 三档回复模式 `manual/semi/afk`（第十一轮已加，本轮延续） |
+
+### 验证（全绿）
+
+```
+python auto_reply_test.py   -> 21 通过 / 0 失败（新增：延迟区间随机、不抢话/不重复回、开场语来自表格、上下文裁剪、安抚话术）
+python mobile_feature_test.py -> 36 通过 / 0 失败（新增：首条消息立刻发开场语、排队 1~3 分钟、继续发言重新计时、定时器到期出队、/api/alerts）
+node probe_smoke_test.js    -> 79 通过 / 0 失败
+node h5_security_test.js    -> 84 通过 / 0 失败（新增：需人工横幅/专属音/置顶排序/ACK_ALERT）
+python diag_test.py 30 / hud_layout 34 / agent_core 16 / rules_sync 18 全通过
+```
+
+### 新增/更新文件
+
+| 文件 | 说明 |
+|------|------|
+| `bridge_server.py` | 延迟调度（`_PENDING` 任务表）、`pick_greeting/pick_reply_delay/should_auto_reply`、`send_hold_and_alert`、`build_chat_history_str(for_ai)`、`SET_AUTO_DELAY`/`ACK_ALERT` 动作、`/api/alerts` + `/api/alerts/ack`、`/api/diag.auto_reply/alerts`、手机端"需人工"横幅与专属提示音、置顶排序 |
+| `semi_runner.pyw` | `long_human_alarm()`（三短一长）+ `_handle_human_alerts()`（长报警 + 自动复制玩家信息&问题总结 + 自动 ack） |
+| `auto_reply_test.py` | **新增**：自动回复节奏/开场语/上下文裁剪 21 项 |
+| `config.json` | 新增 `auto_reply_delay_min_sec=60`、`auto_reply_delay_max_sec=180`、`auto_send_greeting=true` |
+| `mobile_feature_test.py` | 28 → **36** 项 |
+| `h5_security_test.js` | 73 → **84** 项 |
+| `README.md`（使用手册） | 新增 6.6 自动回复节奏 / 6.7 三种提示音 / 12.15 排查；配置表、协议表、诊断字段、测试清单同步 |
+
+---
+
+## 🔘 第十三轮（2026/9/28）：电脑小窗加自动化开关（冲突时以手机端为准）
+
+### 客服原话
+
+> "给电脑端小窗也加个自动化开关，但是有冲突的时候以手机端为准，默认情况都是半自动，放在输入框不发送。"
+
+### 交付内容
+
+| 需求 | 实现 |
+|------|------|
+| 电脑小窗（HUD）加自动化开关 | 悬浮窗标题栏新增按钮 `🤖半自动 / 🚀AFK / ✋手动`，**点一下循环切换**（`cycle_mode()`）；切换结果显示在状态行 |
+| **默认半自动**，只把草稿填进输入框**不发送** | 模式初值 `semi`（`auto_draft=True` + `afk_mode=False`）→ AI 只 `FILL_DRAFT` 到网页回复框；**AFK** 才 `SEND_REPLY` 真发 |
+| **冲突时以手机端为准** | 中继是唯一权威：`apply_reply_mode(mode, source)` 记录 `mode_owner`（mobile/desktop/default）与 `mode_ts`。**手机端刚设过（默认 600 秒 = `mobile_mode_priority_sec`）时，小窗的切换被拒绝**并回执提示「手机端已设为…，以手机端为准（约 N 秒后可再切）」；窗口过后小窗可自由切 |
+| 小窗不与手机打架 | 小窗**不保存自己的模式副本**，每 5 秒从 `/api/diag.auto_reply` 同步显示（`_sync_mode_ui`），带 `·手机` 后缀标识归属 |
+| 重启不丢 | 模式落盘 `mode_state.json`（含 owner/ts），中继重启后恢复，**不会被"小窗启动"顶回默认值** |
+
+### 验证（全绿）
+
+```
+python auto_reply_test.py   -> 33 通过 / 0 失败（新增：默认半自动/不发送、手机端优先拒绝小窗、窗口过期后小窗可切、非法模式拒绝）
+python mobile_feature_test.py -> 40 通过 / 0 失败（新增：手机端切 AFK 归属 mobile、小窗切换被拒、手机端切回半自动）
+python hud_layout_test.py        -> 39 通过 / 0 失败（新增：开关按钮/循环顺序/走 /api/mode/每 5 秒同步/被拒提示）
+node probe_smoke_test.js 79 / h5_security 84 / diag 30 / agent_core 16 / rules_sync 18 全通过
+```
+
+### 新增/更新文件
+
+| 文件 | 说明 |
+|------|------|
+| `semi_runner.pyw` | `btn_mode` 自动化开关按钮 + `cycle_mode()` + `_push_mode()`（POST /api/mode）+ `_sync_mode_ui()`（跟随中继显示，带"·手机"标识） |
+| `bridge_server.py` | `apply_reply_mode()`（手机端优先规则）、`load/save_mode_state()`（落盘 `mode_state.json`）、`POST /api/mode`、`/api/diag.auto_reply.mode/mode_owner/mode_label/mobile_priority_sec`；`SET_MODE`/`TOGGLE_AFK` 统一走 `apply_reply_mode` |
+| `auto_reply_test.py` | 21 → **33** 项 |
+| `mobile_feature_test.py` | 36 → **40** 项 |
+| `hud_layout_test.py` | 34 → **39** 项 |
+| `config.json` | 新增 `mobile_mode_priority_sec=600` |
+| `.gitignore` | 忽略运行期文件 `mode_state.json` |
+| `README.md`（使用手册） | 5.3 悬浮窗加"自动化开关"说明与示意图、6.5 冲突规则、配置表、接口表、12.1 排查、13.3 测试清单 |
 
 ---
 

@@ -194,6 +194,21 @@ def main():
           all(k in src for k in ("'f6'", "'f7'", "'f8'", "'f9'", "'f10'")))
     check("保留 update_ui 兼容接口（F9/F10 依赖）",
           "def update_ui(self, status=None, status_color=None, last=None, last_color=None)" in src)
+    # V7.3：F9 免框选 + 直接写网页回复框（手册一直写"免框选"，旧代码其实要求先选中文字）
+    check("F9 有免框选回退（没选中就用当前工单聊天记录）",
+          "fetch_ticket_history" in src and "text = fetch_ticket_history()" in src)
+    check("F9/F10 优先把文案直接写进网页回复框（不依赖光标焦点）",
+          "def fill_into_page" in src and "/api/fill_draft" in src)
+    # V7.4：电脑小窗的自动化开关（默认半自动=只填输入框不发送；冲突时以手机端为准）
+    check("小窗有自动化开关按钮（🤖半自动/🚀AFK/✋手动）",
+          "self.btn_mode" in src and "cycle_mode" in src, "")
+    check("开关点击循环 semi→afk→manual", 'order = ["semi", "afk", "manual"]' in src)
+    check("开关通过 /api/mode 交给中继裁决（不在本地记状态）",
+          "/api/mode" in src and '"source": "desktop"' in src)
+    check("每 5 秒从中继同步模式显示（手机端改了会跟着变）", "_sync_mode_ui" in src)
+    check("被拒绝时如实提示（以手机端为准）", "以手机端为准" in src or "切换被拒绝" in src)
+    check("取选区支持静默模式（免框选回退时不再误报「未选中文本」）",
+          "def safe_capture_selection(min_len=2, quiet=False)" in src)
 
     print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
     return 0 if failed == 0 else 1

@@ -3,8 +3,9 @@
 覆盖：
   1) SET_IM_STATUS       远程切换 IM 在线/忙碌/离线 + 切到在线自动解除警报
   2) REQUEST_SNAPSHOT    唤醒补拉（iOS 锁屏恢复后主动要快照）
-  3) CATEGORY_OPTIONS    + /api/categories 问题分类回报与查询
-  4) AI_CLOSE            手机端「AI 回复并关单」→ 探针收到回复并关单指令 → 会话从列表消失
+  3) REQUEST_IM_STATUS   手机端一打开就向电脑网页取"真实 IM 状态"（不凭空显示在线）
+  4) CATEGORY_OPTIONS    + /api/categories 问题分类回报与查询
+  5) AI_CLOSE            手机端「AI 回复并关单」→ 探针收到回复并关单指令 → 会话从列表消失
 """
 import asyncio
 import sys
@@ -105,6 +106,51 @@ async def main():
         check("主动请求后立即收到 FULL_SYNC 快照",
               snap3 is not None and any(m.get("type") == "FULL_SYNC" for m in m_msgs3))
 
+        # ---------- 2.5 手机端启动就从电脑网页取真实状态（V7.3） ----------
+        print("\n[2.5] 状态复核（REQUEST_IM_STATUS：不凭空显示在线）")
+        await mobile.send_json({"action": "REQUEST_IM_STATUS"})
+        await asyncio.sleep(0.4)
+        _, ext_msgs_req = await drain(ext, 0.35)
+        check("手机端请求复核 -> 转发 REQUEST_IM_STATUS 给电脑端探针",
+              any(m.get("command") == "REQUEST_IM_STATUS" for m in ext_msgs_req),
+              str(ext_msgs_req[:2]))
+        snap_req, m_msgs_req = await drain(mobile, 0.35)
+        check("复核请求会让手机端立刻拿到 FULL_SYNC（含 im_status_known）",
+              any(m.get("type") == "FULL_SYNC" for m in m_msgs_req)
+              and "im_status_known" in (snap_req or {}),
+              str({k: (snap_req or {}).get(k) for k in ("im_status", "im_status_known", "im_status_manual")}))
+        # 探针如实回报"手动离线" -> 服务端必须记住 manual，供离线守护与手机端提示使用
+        await ext.send_json({"event": "IM_STATUS", "data": {"status": 3, "manual": True, "forced": True}})
+        await asyncio.sleep(0.4)
+        snap_man, _ = await drain(mobile, 0.35)
+        check("探针回报手动离线 -> im_status_known=true 且标记 manual",
+              (snap_man or {}).get("im_status_known") is True
+              and (snap_man or {}).get("im_status_manual") is True,
+              str({k: (snap_man or {}).get(k) for k in ("im_status", "im_status_known", "im_status_manual")}))
+
+        # 状态记忆落盘：重启中继后不该"自己变回在线"
+        try:
+            async with s.get(BASE + "/api/diag") as r:
+                diag_now = await r.json() if r.status == 200 else {}
+        except Exception:
+            diag_now = {}
+        im_block = (diag_now or {}).get("im") or {}
+        check("/api/diag 暴露 IM 状态与是否已核实",
+              im_block.get("status") == 3 and im_block.get("known") is True and im_block.get("manual") is True,
+              str(im_block))
+
+        # ---------- 2.6 F9/F10 免框选：把文案直接写进网页回复框（不经剪贴板/Ctrl+V） ----------
+        print("\n[2.6] /api/fill_draft（F9 免框选直填网页回复框）")
+        async with s.post(BASE + "/api/fill_draft", json={"content": "亲爱的玩家您好，已为您处理。"}) as r:
+            body = await r.json() if r.status == 200 else {}
+            check("接口返回 ok", r.status == 200 and body.get("ok") is True, f"status={r.status} {body}")
+        _, ext_fill = await drain(ext, 0.35, tries=3)
+        fills = [m for m in ext_fill if m.get("command") == "FILL_DRAFT"]
+        check("探针收到 FILL_DRAFT（直接写回复框）",
+              bool(fills) and fills[-1].get("content", "").startswith("亲爱的玩家"), str(fills[:1]))
+        async with s.post(BASE + "/api/fill_draft", json={"content": "   "}) as r:
+            check("空内容被拒绝（不会把回复框清空）", r.status == 400, f"status={r.status}")
+
         # ---------- 3. 问题分类回报与查询 ----------
         print("\n[3] 问题分类回报 + /api/categories")
         await ext.send_json({"event": "CATEGORY_OPTIONS",
@@ -116,6 +162,14 @@ async def main():
         check("分类已透传到 /api/categories",
               body.get("options") == ["登录问题", "充值退款", "游戏BUG"], str(body.get("options")))
         check("接口同时回传分类路径配置", "close_category_path" in body)
+
+        # 已拿到分类后，新连上来的探针不应再被要求"去点开网页上的分类下拉"
+        ext2 = await s.ws_connect(BASE + "/ws/extension")
+        _, ext2_msgs = await drain(ext2, 0.5, tries=4)
+        check("已有分类缓存 -> 新探针连接不再请求分类（下拉不会自己弹）",
+              not any(m.get("command") == "REQUEST_CATEGORIES" for m in ext2_msgs),
+              str(ext2_msgs[:3]))
+        await ext2.close()
 
         # ---------- 4. AI 回复并关单 ----------
         print("\n[4] AI 回复并关单")
@@ -217,6 +271,99 @@ async def main():
             check("探针断开后 extension_online=false",
                   (snapD or {}).get("extension_online") is False,
                   str((snapD or {}).get("extension_online")))
+
+        # ---------- 6. 自动回复节奏：首条消息发开场语 + 延迟排队（V7.4） ----------
+        print("\n[6] 自动回复节奏（开场语 / 1~3 分钟延迟排队）")
+
+        async def auto_info():
+            async with s.get(BASE + "/api/diag") as r:
+                return ((await r.json()) or {}).get("auto_reply") or {}
+
+        ext3 = await s.ws_connect(BASE + "/ws/extension")
+        await drain(ext3, 0.4, tries=3)
+        gid2 = "AUTO-" + RUN
+        await ext3.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gid2, "name": "节奏测试", "playerInfo": "节奏测试 | UID:7777",
+            "messages": [{"sender": "player", "text": "客服"}]}})
+        await asyncio.sleep(0.6)
+        _, ext3_msgs = await drain(ext3, 0.5, tries=4)
+        greets = [m for m in ext3_msgs if m.get("command") == "SEND_REPLY"]
+        check("玩家第一条消息 -> 立刻发开场语（来自表格）",
+              bool(greets) and "玩家" in str(greets[-1].get("content")), str(greets[:1]))
+        info1 = await auto_info()
+        check("这条会话已排队延迟回复（不是秒回）",
+              gid2 in (info1.get("pending_gids") or []), str(info1.get("pending_gids")))
+        check("默认延迟是 60~180 秒（1~3 分钟）",
+              int(info1.get("delay_min_sec") or 0) == 60 and int(info1.get("delay_max_sec") or 0) == 180,
+              f"{info1.get('delay_min_sec')}~{info1.get('delay_max_sec')}")
+
+        # 玩家继续发言 -> 重新计时（同一会话仍然只有 1 个排队任务，不会堆积）
+        await ext3.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gid2, "name": "节奏测试", "playerInfo": "节奏测试 | UID:7777",
+            "messages": [{"sender": "player", "text": "客服"}, {"sender": "player", "text": "在吗"}]}})
+        await asyncio.sleep(0.6)
+        await drain(ext3, 0.4, tries=3)
+        info2 = await auto_info()
+        check("玩家继续发言 -> 重新计时（同一会话仍只有 1 条排队）",
+              (info2.get("pending_gids") or []).count(gid2) == 1, str(info2.get("pending_gids")))
+
+        # 把延迟调到 0 秒后，新会话的回复应当立刻到期（验证定时器真的会触发）
+        await mobile.send_json({"action": "SET_AUTO_DELAY", "min": 0, "max": 0})
+        await asyncio.sleep(0.5)
+        await drain(mobile, 0.4, tries=3)
+        info3 = await auto_info()
+        check("可调整延迟（手机端/调试，0~0 = 立即回）",
+              int(info3.get("delay_min_sec") or 0) == 0 and int(info3.get("delay_max_sec") or 0) == 0,
+              f"{info3.get('delay_min_sec')}~{info3.get('delay_max_sec')}")
+
+        gid3 = "AUTO2-" + RUN
+        await ext3.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gid3, "name": "节奏测试2", "playerInfo": "节奏测试2 | UID:7778",
+            "messages": [{"sender": "player", "text": "客服"}]}})
+        await asyncio.sleep(1.8)
+        info4 = await auto_info()
+        check("延迟到期后任务已出队（定时器真的会触发）",
+              gid3 not in (info4.get("pending_gids") or []), str(info4.get("pending_gids")))
+
+        # 告警接口可用（表格没答案时桌面 HUD 靠它播长报警）
+        async with s.get(BASE + "/api/alerts") as r:
+            alerts_body = await r.json() if r.status == 200 else {}
+        check("/api/alerts 可用", r.status == 200 and "alerts" in alerts_body, str(alerts_body)[:80])
+        async with s.post(BASE + "/api/alerts/ack", json={"ids": []}) as r:
+            check("/api/alerts/ack 可确认（清空队列）", r.status == 200, f"status={r.status}")
+
+        # ---------- 7. 电脑小窗的自动化开关（冲突时以手机端为准） ----------
+        print("\n[7] 自动化开关（电脑小窗 /api/mode）")
+        # 先让手机端设成 AFK（手机端优先）
+        await mobile.send_json({"action": "SET_MODE", "mode": "afk"})
+        await asyncio.sleep(0.5)
+        await drain(mobile, 0.4, tries=3)
+        async with s.get(BASE + "/api/diag") as r:
+            m1 = ((await r.json()) or {}).get("auto_reply") or {}
+        check("手机端切 AFK 生效且归属 mobile",
+              m1.get("mode") == "afk" and m1.get("mode_owner") == "mobile", str(m1))
+
+        async with s.post(BASE + "/api/mode", json={"mode": "semi", "source": "desktop"}) as r:
+            d1 = await r.json() if r.status == 200 else {}
+        check("手机端刚设过 -> 电脑小窗切换被拒绝（以手机端为准）",
+              d1.get("ok") is False and "手机端" in str(d1.get("note")), str(d1))
+        async with s.get(BASE + "/api/diag") as r:
+            m2 = ((await r.json()) or {}).get("auto_reply") or {}
+        check("被拒绝后仍是手机端的 AFK", m2.get("mode") == "afk", str(m2))
+
+        # 手机端切回半自动（默认；只起草不发送）
+        await mobile.send_json({"action": "SET_MODE", "mode": "semi"})
+        await asyncio.sleep(0.5)
+        await drain(mobile, 0.4, tries=3)
+        async with s.get(BASE + "/api/diag") as r:
+            m3 = ((await r.json()) or {}).get("auto_reply") or {}
+        check("手机端切回半自动（默认：起草到输入框不发送）",
+              m3.get("mode") == "semi" and m3.get("mode_owner") == "mobile", str(m3))
+
+        await mobile.send_json({"action": "SET_AUTO_DELAY", "min": 60, "max": 180})
+        await asyncio.sleep(0.3)
+        await drain(mobile, 0.3, tries=2)
+        await ext3.close()
 
         if not mobile.closed:
             await mobile.close()

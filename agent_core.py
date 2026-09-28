@@ -23,7 +23,10 @@ def load_config():
         return {}
 
 _config = load_config()
-DEEPSEEK_API_KEY = _config.get("deepseek_api_key", "YOUR_DEEPSEEK_API_KEY")  # fallback 到旧值
+# ★ 安全：**绝不把真实密钥写进代码**（仓库会推到 GitHub 上）。
+#   取值顺序：config.json -> 环境变量 DEEPSEEK_API_KEY；都没有就给空串，
+#   调用时由 _call_deepseek 给出"未配置"的明确提示，不会静默失败。
+DEEPSEEK_API_KEY = (_config.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
 # ==================== 疑难单统一标记（前后端唯一约定） ====================
@@ -334,6 +337,10 @@ class CustomerServiceCore:
         return "\n".join(parts)
 
     def _call_deepseek(self, system_prompt: str, user_prompt: str) -> str:
+        if not self.api_key:
+            print("[agent_core] 未配置 DeepSeek 密钥：请在 config.json 填 deepseek_api_key"
+                  "（或设置环境变量 DEEPSEEK_API_KEY）", file=sys.stderr)
+            return ""
         payload = {
             "model": "deepseek-chat",
             "messages": [

@@ -2,8 +2,9 @@
 const fs = require('fs');
 const vm = require('vm');
 
-const TARGET = process.argv[2] || 'probe_new.js';
+const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
+const EXPECT_VER = '7.4';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -34,15 +35,19 @@ FakeWebSocket.CLOSED = 3;
 FakeWebSocket.instances = [];
 
 // ---------- Fake Audio ----------
+let oscCount = 0;                            // 统计振荡器数量 = 响铃次数（叮咚一次建 2 个）
 function FakeAudioContext() {
     this.state = 'running';
     this.currentTime = 0;
     this.destination = {};
     this.resume = () => {};
-    this.createOscillator = () => ({
-        type: '', frequency: { setValueAtTime() {}, linearRampToValueAtTime() {} },
-        connect() {}, start() {}, stop() {}
-    });
+    this.createOscillator = () => {
+        oscCount++;
+        return {
+            type: '', frequency: { setValueAtTime() {}, linearRampToValueAtTime() {} },
+            connect() {}, start() {}, stop() {}
+        };
+    };
     this.createGain = () => ({
         gain: { setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {} },
         connect() {}
@@ -50,6 +55,8 @@ function FakeAudioContext() {
 }
 
 // ---------- Fake DOM ----------
+let actionButtons = [];                      // 模拟页面上的操作按钮（挂起/恢复/关单）
+let clickedLabels = [];
 function makeEl(text, classes) {
     return {
         innerText: text,
@@ -57,7 +64,7 @@ function makeEl(text, classes) {
         querySelector: () => null,
         matches: () => false,
         getAttribute: () => null,
-        click() {}
+        click() { clickedLabels.push(text); }
     };
 }
 
@@ -98,6 +105,7 @@ const documentStub = {
     },
     querySelectorAll: sel => {
         if (sel.indexOf('.el-dropdown-menu__item') === 0) return [makeEl(statusText)];
+        if (sel.indexOf('.im-action-btn') === 0) return actionButtons;
         if (sel === '.chat-bubble-row') return bubbles;
         return [];
     }
@@ -335,21 +343,234 @@ function check(name, ok, extra) {
 
     // 8d. WS 重连后必须重新同步一次当前状态（否则服务端会一直用旧值）
     const wsLast = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    sent.length = 0;
     wsLast.close();
     const rt = timeouts.filter(t => t.ms > 0).pop();
     if (rt) rt.fn();
     await new Promise(r => setTimeout(r, 30));
-    sent.length = 0;
-    intervals[0]();                      // 状态没变化，但 onopen 重置了记忆 -> 应重新上报
+    intervals[0]();                      // 兜底：即使 onopen 没发，这里也必须补发
     check('重连后会重新同步当前 IM 状态',
         sent.some(s => s.event === 'IM_STATUS'), JSON.stringify(sent));
 
-    console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
+    // 8e. 服务端/手机端主动来要状态 -> 必须立刻复核并上报（哪怕状态没变化）
+    console.log('\n[8.5] 强制复核（V7.3：手机端一打开就从电脑网页取真实状态）');
+    const wsNow = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    if (wsNow.readyState !== FakeWebSocket.OPEN) wsNow.readyState = FakeWebSocket.OPEN;
+    statusText = 'IM离线';
+    sent.length = 0;
+    wsNow.onmessage({ data: JSON.stringify({ command: 'REQUEST_IM_STATUS' }) });
+    const forced = sent.filter(s => s.event === 'IM_STATUS' && s.data.forced === true);
+    check('收到 REQUEST_IM_STATUS 立刻复核并上报', forced.length === 1, JSON.stringify(sent));
+    check('复核上报的是页面真实状态（离线=3）',
+        forced.length === 1 && forced[0].data.status === 3, JSON.stringify(forced));
 
+    // 8f. 连上中继就自动复核一次（服务端重启后不会残留旧状态）
+    const t100 = timeouts.filter(t => t.ms === 100);
+    check('onopen 注册 100ms 即时状态复核', t100.length >= 1, '数量=' + t100.length);
+    sent.length = 0;
+    t100.forEach(t => t.fn());
+    check('即时复核会上报 IM_STATUS(forced)',
+        sent.some(s => s.event === 'IM_STATUS' && s.data.forced === true), JSON.stringify(sent));
+
+    // 8g. 手动离线守护：客服手动挂"离线"后，网页自己跳回"在线"必须被改回离线
+    console.log('\n[8.6] 手动离线守护（V7.3：手动离线不允许被网页改回在线）');
+    sandbox.window.__probe.config.manualGraceMs = 0;      // 测试里不留免打扰时间
+    statusText = 'IM在线';
+    intervals[0]();                                        // 先让探针记住"在线"
+    if (docListeners.click) docListeners.click({ target: { innerText: 'IM离线' } });
+    statusText = 'IM离线';                                 // 客服手动点离线
+    sent.length = 0;
+    intervals[0]();
+    const st8g = sent.filter(s => s.event === 'IM_STATUS');
+    check('手动离线先如实上报 status=3',
+        st8g.some(s => s.data.status === 3 && s.data.manual === true), JSON.stringify(sent));
+
+    await new Promise(r => setTimeout(r, 5));              // 越过免打扰窗口
+    statusText = 'IM在线';                                 // 网页自己跳回在线（非人工点击）
+    sent.length = 0;
+    intervals[0]();
+    const guarded = sent.filter(s => s.event === 'IM_STATUS' && s.data.guarded === true);
+    check('网页把状态跳回在线 -> 探针按手动离线改回', guarded.length === 1, JSON.stringify(sent));
+    check('守护后会向服务端回报离线（status=3）',
+        guarded.length === 1 && guarded[0].data.status === 3, JSON.stringify(guarded));
+    check('守护时不误触发 ALARM_RECOVERED（不报警）',
+        sent.filter(s => s.event === 'ALARM_RECOVERED').length === 0, JSON.stringify(sent));
+
+    // 8h. 关闭守护后必须"如实上报"（不再硬顶）
+    sandbox.window.__probe.config.keepManualOffline = false;
+    statusText = 'IM离线';
+    sent.length = 0;
+    intervals[0]();                                        // 如实上报离线
+    statusText = 'IM在线';
+    sent.length = 0;
+    intervals[0]();                                        // 守护已关 -> 如实上报在线
+    check('关闭离线守护后如实上报在线',
+        sent.some(s => s.event === 'IM_STATUS' && s.data.status === 1), JSON.stringify(sent));
+    sandbox.window.__probe.config.keepManualOffline = true;
+
+    // 8i. 断线不再"重连 10 次就放弃"（放弃后手机端会一直停在旧状态）
+    console.log('\n[8.7] 重连永不放弃（V7.3）');
+    const rtCount = timeouts.length;
+    for (let i = 0; i < 12; i++) {
+        const w = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+        if (w.readyState !== FakeWebSocket.OPEN) {
+            w.readyState = FakeWebSocket.OPEN;
+            if (w.onopen) w.onopen();                      // 模拟连上再断，才走重连分支
+        }
+        w.close();
+        const t = timeouts.filter(t => t.ms > 0).pop();
+        if (t) t.fn();                                     // 触发重连（会新建连接）
+    }
+    check('连续 12 次断线后仍在调度重连', timeouts.length - rtCount >= 12,
+        '新增定时器 ' + (timeouts.length - rtCount) + ' 个');
+    // 收尾：把最后一次重连真正连上，恢复「已连接」胶囊（[9] 用例依赖）
+    const tLast = timeouts.filter(t => t.ms > 0).pop();
+    if (tLast) tLast.fn();
+    await new Promise(r => setTimeout(r, 20));
+
+    console.log('\n[8.8] 新消息提示音只在"真有新玩家消息"时响（V7.3）');
+    documentStub.body.innerText = 'IM工作台';        // 前面的用例把它改成了"其他页面"，这里恢复
+    // 场景1：首次打开会话（历史最后一条是玩家发的）-> 不应该响
+    pageUrl = 'https://ticket.example.com/workbench';
+    ticketIdAttr = '';
+    playerInfoText = '玩家甲\nUID:1001';
+    sandbox.window._lastChatHash = undefined;
+    sandbox.window._lastChatState = undefined;
+    bubbles = [makeEl('我的号登不上去了', ['from-player'])];
+    oscCount = 0;
+    intervals[1]();
+    check('首次打开旧会话不响铃（旧版在这里就"叮咚"了）', oscCount === 0, '振荡器=' + oscCount);
+
+    // 场景2：切到另一个会话（最后一条也是玩家发的）-> 不应该响
+    playerInfoText = '玩家乙\nUID:2002';
+    bubbles = [makeEl('钻石没到账', ['from-player']), makeEl('麻烦尽快处理', ['from-player'])];
+    oscCount = 0;
+    intervals[1]();
+    check('切换到别的会话不响铃', oscCount === 0, '振荡器=' + oscCount);
+
+    // 场景3：当前会话里玩家真的追加了一条消息 -> 必须响
+    bubbles.push(makeEl('怎么还没人理我', ['from-player']));
+    oscCount = 0;
+    intervals[1]();
+    check('当前会话玩家真发新消息 -> 响铃', oscCount >= 2, '振荡器=' + oscCount);
+
+    // 场景4：自己（客服）回了一条 -> 不应该响
+    bubbles.push(makeEl('亲爱的玩家您好', ['from-agent']));
+    oscCount = 0;
+    intervals[1]();
+    check('客服自己回复不响铃', oscCount === 0, '振荡器=' + oscCount);
+
+    // 场景5：恢复/重新打开同一会话（内容整体重渲染，前缀对不上）-> 不应该响
+    bubbles = [makeEl('钻石没到账', ['from-player']), makeEl('麻烦尽快处理', ['from-player']),
+               makeEl('怎么还没人理我', ['from-player']), makeEl('【系统】会话已恢复', ['from-agent'])];
+    oscCount = 0;
+    intervals[1]();
+    check('恢复挂起会话（历史被重排）不响铃', oscCount === 0, '振荡器=' + oscCount);
+
+    console.log('\n[8.9] 手机端操作结果回报（V7.3：不再"点了没反应"）');
+    const wsAct = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    if (wsAct.readyState !== FakeWebSocket.OPEN) wsAct.readyState = FakeWebSocket.OPEN;
+
+    // 页面上没有按钮时：必须回报"失败 + 页面按钮清单"，而不是静默
+    actionButtons = [];
+    clickedLabels = [];
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'ACTION_HANGUP' }) });
+    let actRes = sent.filter(s => s.event === 'ACTION_RESULT');
+    check('挂起失败会回报 ACTION_RESULT(ok=false)', actRes.length === 1 && actRes[0].data.ok === false,
+        JSON.stringify(actRes));
+    check('失败回报里带"未找到按钮"说明',
+        actRes.length === 1 && String(actRes[0].data.detail).indexOf('未找到') !== -1,
+        actRes.length ? actRes[0].data.detail : 'none');
+
+    // 页面上有「挂起」按钮时：必须点到它并回报成功
+    actionButtons = [makeEl('转交他人', ['im-action-btn']), makeEl('挂起', ['im-action-btn']),
+                     makeEl('回复并关单', ['im-action-btn'])];
+    clickedLabels = [];
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'ACTION_HANGUP' }) });
+    actRes = sent.filter(s => s.event === 'ACTION_RESULT');
+    check('挂起成功：真的点了「挂起」按钮', clickedLabels.indexOf('挂起') !== -1, JSON.stringify(clickedLabels));
+    check('挂起成功会回报 ACTION_RESULT(ok=true)', actRes.length === 1 && actRes[0].data.ok === true,
+        JSON.stringify(actRes));
+
+    // 恢复：页面上是「恢复」按钮
+    actionButtons = [makeEl('挂起', ['im-action-btn']), makeEl('恢复', ['im-action-btn'])];
+    clickedLabels = [];
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'ACTION_RESUME' }) });
+    actRes = sent.filter(s => s.event === 'ACTION_RESULT');
+    check('恢复：点到「恢复」按钮并回报成功',
+        clickedLabels.indexOf('恢复') !== -1 && actRes.length === 1 && actRes[0].data.ok === true,
+        JSON.stringify(clickedLabels) + ' ' + JSON.stringify(actRes));
+
+    // 关单：优先点「回复并关单」
+    actionButtons = [makeEl('挂起', ['im-action-btn']), makeEl('回复并关单', ['im-action-btn'])];
+    clickedLabels = [];
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'ACTION_REPLY_CLOSE', category: '' }) });
+    await new Promise(r => setTimeout(r, 5));
+    timeouts.filter(t => t.ms === 800).forEach(t => t.fn());
+    check('关单：点到「回复并关单」并回报成功',
+        clickedLabels.indexOf('回复并关单') !== -1 && sent.some(s => s.event === 'ACTION_RESULT' && s.data.ok === true),
+        JSON.stringify(clickedLabels));
+
+    // 分类不盲选：源码里不允许再有"取第一项兜底"
+    check('分类选不中时不再盲选第一项（改回报候选）',
+        code.indexOf('兜底：取第一项') === -1 && code.indexOf('宁可不选') !== -1);
+
+    console.log('\n[8.10] 玩家名与工单标识（V7.4：不再全叫"玩家信息"、不再重复卡片）');
+    documentStub.body.innerText = 'IM工作台';
+    pageUrl = 'https://ticket.example.com/workbench';
+    ticketIdAttr = '';
+    // 面板第一行是栏目名"玩家信息"，真正的昵称在第 2 行
+    playerInfoText = '玩家信息\n昵称：张三\nUID:10001\n区服：S12';
+    bubbles = [makeEl('抽卡没到账', ['from-player'])];
+    let r1 = resetAndReport();
+    check('玩家名取的是昵称，不是栏目名「玩家信息」', !!r1 && r1.name === '张三', r1 && r1.name);
+    const gidName = r1 && r1.groupID;
+    check('工单标识仍以 P 开头（无工单号时）', !!gidName && gidName.charAt(0) === 'P', gidName);
+
+    // 追加消息 -> 标识必须不变（旧版把"首条玩家消息"混进指纹，会分裂成两个会话=重复卡片）
+    bubbles = [makeEl('抽卡没到账', ['from-player']), makeEl('还没处理好吗', ['from-player'])];
+    let r2 = resetAndReport();
+    check('同一玩家追加消息 -> 工单标识不变（不再产生重复卡片）',
+        !!r2 && r2.groupID === gidName, (r2 && r2.groupID) + ' vs ' + gidName);
+
+    // 模拟"列表虚拟滚动/重渲染"导致首条消息变了 —— 标识依然不能变
+    bubbles = [makeEl('还没处理好吗', ['from-player']), makeEl('真的很急', ['from-player'])];
+    let r3 = resetAndReport();
+    check('首条消息变化（滚动/重渲染）也不换标识',
+        !!r3 && r3.groupID === gidName, (r3 && r3.groupID) + ' vs ' + gidName);
+
+    // 没有昵称时用 UID 后 4 位兜底，至少能区分不同玩家
+    playerInfoText = '玩家信息\nUID:98765';
+    bubbles = [makeEl('帮我看看充值', ['from-player'])];
+    let r4 = resetAndReport();
+    check('没有昵称时用 UID 兜底命名', !!r4 && r4.name === '玩家8765', r4 && r4.name);
+    check('不同玩家 -> 不同标识', !!r4 && r4.groupID !== gidName, (r4 && r4.groupID) + ' vs ' + gidName);
+
+    // 恢复默认环境
+    playerInfoText = '玩家A\nUID:12345';
+
+    console.log('\n[8.11] 问题分类下拉不再"自己跑下来"（V7.4）');
+    check('探针内置分类缓存（用户自己点开时顺手采集）',
+        code.indexOf('CATEGORY_CACHE_MS') !== -1 && code.indexOf('cacheCategoryOptions') !== -1);
+    check('缓存命中时不再点开网页上的分类下拉',
+        code.indexOf('categoryCache.options.length') !== -1 && code.indexOf('面板本来就开着') !== -1);
+    check('读完会把下拉收起，不留一个自己弹开的菜单', code.indexOf('再点一下收起') !== -1);
+    // 中继侧：只有"还没拿到过分类"时才请求（避免每次连接都去点开）
+    let serverSrc = '';
+    try { serverSrc = fs.readFileSync('bridge_server.py', 'utf8'); } catch (e) {}
+    check('中继只在没拿到分类时才请求（避免反复点开）',
+        serverSrc.indexOf('if not state.get("category_options")') !== -1,
+        serverSrc ? '' : 'bridge_server.py 不可读');
+
+    console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
     const chip = (documentStub.body._children || []).find(n => n.tagName === 'DIV');
     const chipTextOf = n => (n && n._text && n._text.textContent) || '';
     check('已挂载页面内状态胶囊（不再只能靠控制台判断）', !!chip);
-    check('胶囊文字带版本号 v7.2', chipTextOf(chip).indexOf('v7.2') !== -1, chipTextOf(chip));
+    check('胶囊文字带版本号 v' + EXPECT_VER, chipTextOf(chip).indexOf('v' + EXPECT_VER) !== -1, chipTextOf(chip));
     check('连接正常时胶囊显示「已连接」', chipTextOf(chip).indexOf('已连接') !== -1, chipTextOf(chip));
 
     const curWs2 = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
@@ -366,7 +587,7 @@ function check(name, ok, extra) {
 
     const hello = sent.filter(s => s.event === 'PROBE_HELLO');
     check('连上即发 PROBE_HELLO 握手（后端 /api/diag 可查版本）',
-        hello.length >= 1 && hello[0].data.version === '7.2',
+        hello.length >= 1 && hello[0].data.version === EXPECT_VER,
         JSON.stringify(hello[0] ? hello[0].data : null));
     check('PROBE_HELLO 携带页面地址', !!hello.length && String(hello[0].data.page).indexOf('ticket-web') !== -1,
         hello.length ? hello[0].data.page : 'none');
@@ -375,12 +596,18 @@ function check(name, ok, extra) {
     intervals[2]();
     const hb = sent.filter(s => s.event === 'PROBE_HEARTBEAT');
     check('心跳定时器上报 PROBE_HEARTBEAT',
-        hb.length === 1 && hb[0].data.version === '7.2', JSON.stringify(hb[0] ? hb[0].data : null));
+        hb.length === 1 && hb[0].data.version === EXPECT_VER, JSON.stringify(hb[0] ? hb[0].data : null));
 
     const probeApi = sandbox.window.__probe || {};
     check('__probe 调试入口可用（version/status/reconnect）',
         typeof probeApi.version === 'function' && typeof probeApi.status === 'function' &&
         typeof probeApi.reconnect === 'function');
+    check('__probe.config 可调（离线守护等参数）',
+        probeApi.config && typeof probeApi.config.keepManualOffline === 'boolean' &&
+        typeof probeApi.config.manualGraceMs === 'number',
+        JSON.stringify(probeApi.config));
+    check('__probe.refreshStatus 可手动复核状态',
+        typeof probeApi.refreshStatus === 'function');
 
     console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
     process.exit(fail === 0 ? 0 : 1);
