@@ -125,4 +125,54 @@
 4. **WebSocket 端口**: 默认 8765，若冲突请修改 config.json
 
 ---
+
+## 🔴 追加修复（2026/9/28）：probe.js 结构性损坏
+
+### BUG-021 ~ BUG-026: probe.js 语法错误，油猴脚本完全无法运行
+
+- **文件**: `probe.js`
+- **发现方式**: `node --check probe.js` → `SyntaxError: Missing catch or finally after try`（第 201 行）
+
+**问题清单**：
+
+| 编号 | 位置 | 问题 |
+|------|------|------|
+| BUG-021 | 第 138 行 | `try {` 缺少 `catch`/`finally` → 整个 IIFE 语法错误，脚本根本无法加载 |
+| BUG-022 | 第 130 行 | `function connectBrain()` 缺少闭合 `}`（被上一行的 `try` 吞掉） |
+| BUG-023 | 第 206 / 222 行 | 两个 `setInterval` 嵌套、外层未闭合 → 结构错乱 |
+| BUG-024 | 第 209 / 213 / 216 行 | 状态文本写成 `'IM 离线'`（带空格），与点击监听（第 65 行）及下拉菜单的 `'IM离线'`（无空格）不一致 → 掉线检测失效 |
+| BUG-025 | 第 140 行 | `reconnectAttempts = 0` 在每次连接尝试时重置 → 最大重连上限形同虚设，退化为无限 3 秒重试 |
+| BUG-026 | 第 218 / 234 行 | `ALARM_RECOVERED` 每 2 秒无偿重复上报 → 消息洪水 |
+
+**修复方式**: 重写整个文件（保持 `@name` 不变以便 Tampermonkey 原地升级，版本号 7.0 → 7.1）
+
+- 补齐 `try/catch`，闭合所有函数与 `setInterval`
+- 新增 `normText()` 归一化文本，同时兼容 `IM离线` 与 `IM 离线`
+- 新增 `findIMStatusText()` 统一状态探测入口
+- 新增 `sendToBrain()` 安全发送（连接不可用时静默跳过，不抛异常）
+- 新增 `scheduleReconnect()` 指数退避重连；重连计数改在 `onopen` 才重置
+- 新增 `lastIMStatus` 状态变化判断，`ABNORMAL_OFFLINE` / `ALARM_RECOVERED` 仅在状态切换时上报
+- 下行消息 JSON 解析加 `try/catch`，非法数据不再中断脚本
+- 移除冗余的 `row.matches(...)` 调用（BUG-015）
+
+**验证结果**:
+
+```
+node --check probe.js                  → 退出码 0（语法 OK）
+node probe_smoke_test.js probe.js      → 18 通过 / 0 失败
+文件编码                               → UTF-8 无 BOM、CRLF、无非法字节
+```
+
+**新增回归测试**: `probe_smoke_test.js`
+用 Node + `vm` 模块模拟浏览器环境（DOM / WebSocket / AudioContext / 定时器），无需打开浏览器即可验证油猴脚本：
+
+```bash
+node --check probe.js                  # 语法检查
+node probe_smoke_test.js probe.js      # 功能冒烟测试（18 项）
+```
+
+覆盖项：脚本加载、WebSocket 建连、定时器注册、掉线警报、防重复上报、恢复上报、
+消息抓取与字段结构、内容去重、页面判断、下行指令容错、断线重连、HEADERS_SYNC 延迟发送。
+
+---
 *此文档由 AI Bug 排查 Agent 自动生成*

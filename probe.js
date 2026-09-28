@@ -1,21 +1,38 @@
 // ==UserScript==
 // @name         客服助手 - 智能工单探针 (V7 靶点精调与数组覆盖版)
 // @namespace    http://tampermonkey.net/
-// @version      7.0
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎
+// @version      7.1
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连
 // @match        *://ticket.example.com/*
 // @grant        none
 // ==/UserScript==
 
 (function() {
     'use strict';
-    console.log("🚀 [客服助手探针 V7] 真实靶点定位系统与防暴雷机制已就绪！");
+    console.log("🚀 [客服助手探针 V7.1] 真实靶点定位系统与防暴雷机制已就绪！");
 
     let audioCtx = null;
     let sirenInterval = null;
-    let isManualOffline = false; 
+    let isManualOffline = false;
     window.__im_auth_headers = {};
 
+    // ==================== 工具函数 ====================
+    // 归一化文本：去掉所有空白字符，兼容 "IM离线" 与 "IM 离线" 两种写法
+    function normText(s) {
+        return (s || "").replace(/\s+/g, "");
+    }
+
+    // 查找当前 IM 状态文本，返回 'IM离线' / 'IM在线' / 'IM忙碌'，找不到返回 null
+    function findIMStatusText() {
+        const nodes = document.querySelectorAll('.el-dropdown-menu__item, span, div, button');
+        for (let i = 0; i < nodes.length; i++) {
+            const t = normText(nodes[i].innerText);
+            if (t === 'IM离线' || t === 'IM在线' || t === 'IM忙碌') return t;
+        }
+        return null;
+    }
+
+    // ==================== 音效引擎 ====================
     function initAudio() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -26,31 +43,38 @@
         try {
             const now = audioCtx.currentTime;
             const osc1 = audioCtx.createOscillator(), gain1 = audioCtx.createGain();
-            osc1.type = 'sine'; osc1.frequency.setValueAtTime(1046.5, now); 
-            gain1.gain.setValueAtTime(0, now); gain1.gain.linearRampToValueAtTime(0.8, now + 0.02); gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+            osc1.type = 'sine'; osc1.frequency.setValueAtTime(1046.5, now);
+            gain1.gain.setValueAtTime(0, now);
+            gain1.gain.linearRampToValueAtTime(0.8, now + 0.02);
+            gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
             osc1.connect(gain1); gain1.connect(audioCtx.destination);
             osc1.start(now); osc1.stop(now + 0.5);
 
             const osc2 = audioCtx.createOscillator(), gain2 = audioCtx.createGain();
-            osc2.type = 'sine'; osc2.frequency.setValueAtTime(1318.5, now + 0.1); 
-            gain2.gain.setValueAtTime(0, now + 0.1); gain2.gain.linearRampToValueAtTime(0.6, now + 0.12); gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.6);
+            osc2.type = 'sine'; osc2.frequency.setValueAtTime(1318.5, now + 0.1);
+            gain2.gain.setValueAtTime(0, now + 0.1);
+            gain2.gain.linearRampToValueAtTime(0.6, now + 0.12);
+            gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.6);
             osc2.connect(gain2); gain2.connect(audioCtx.destination);
             osc2.start(now + 0.1); osc2.stop(now + 0.7);
-        } catch(e) {}
+        } catch (e) {}
     }
 
     function playSiren() {
         initAudio();
-        if (sirenInterval) return; 
+        if (sirenInterval) return;
         sirenInterval = setInterval(() => {
             try {
                 const now = audioCtx.currentTime;
                 const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
-                osc.type = 'sawtooth'; osc.frequency.setValueAtTime(600, now); osc.frequency.linearRampToValueAtTime(800, now + 0.4); 
-                gain.gain.setValueAtTime(0.3, now); gain.gain.exponentialRampToValueAtTime(0.01, now + 0.8);
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(600, now);
+                osc.frequency.linearRampToValueAtTime(800, now + 0.4);
+                gain.gain.setValueAtTime(0.3, now);
+                gain.gain.exponentialRampToValueAtTime(0.01, now + 0.8);
                 osc.connect(gain); gain.connect(audioCtx.destination);
                 osc.start(now); osc.stop(now + 0.8);
-            } catch(e) {}
+            } catch (e) {}
         }, 1000);
     }
 
@@ -58,37 +82,51 @@
         if (sirenInterval) { clearInterval(sirenInterval); sirenInterval = null; }
     }
 
+    // ==================== 手动状态切换监听 ====================
     document.addEventListener('click', (e) => {
-        initAudio(); 
+        initAudio();
         if (e.target && e.target.innerText) {
-            const text = e.target.innerText.trim();
-            if (text === 'IM离线') isManualOffline = true;
-            else if (text === 'IM在线' || text === 'IM忙碌') { isManualOffline = false; stopSiren(); }
+            const text = normText(e.target.innerText);
+            if (text === 'IM离线') {
+                isManualOffline = true;
+            } else if (text === 'IM在线' || text === 'IM忙碌') {
+                isManualOffline = false;
+                stopSiren();
+            }
         }
     }, true);
 
+    // ==================== Token 拦截器 ====================
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
-        if (args[1] && args[1].headers) {
-            const h = args[1].headers instanceof Headers ? Object.fromEntries(args[1].headers.entries()) : args[1].headers;
-            for (let k in h) if (k.toLowerCase().includes('token')) window.__im_auth_headers[k] = h[k];
-        }
+        try {
+            if (args[1] && args[1].headers) {
+                const h = args[1].headers instanceof Headers
+                    ? Object.fromEntries(args[1].headers.entries())
+                    : args[1].headers;
+                for (let k in h) {
+                    if (k.toLowerCase().includes('token')) window.__im_auth_headers[k] = h[k];
+                }
+            }
+        } catch (e) {}
         return originalFetch.apply(this, args);
     };
 
+    // ==================== DOM 操作器 ====================
     const Operator = {
         fillReplyBox: function(text) {
             const composer = document.querySelector('.editor-composer');
             if (!composer) return;
-            const inputBox = composer.querySelector('textarea') || composer.querySelector('input') || (composer.getAttribute('contenteditable') ? composer : null);
-            if (inputBox) {
-                if (inputBox.tagName === 'TEXTAREA' || inputBox.tagName === 'INPUT') {
-                    inputBox.value = text;
-                    inputBox.dispatchEvent(new Event('input', { bubbles: true }));
-                } else {
-                    inputBox.innerText = text;
-                    inputBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
-                }
+            const inputBox = composer.querySelector('textarea')
+                || composer.querySelector('input')
+                || (composer.getAttribute('contenteditable') ? composer : null);
+            if (!inputBox) return;
+            if (inputBox.tagName === 'TEXTAREA' || inputBox.tagName === 'INPUT') {
+                inputBox.value = text;
+                inputBox.dispatchEvent(new Event('input', { bubbles: true }));
+            } else {
+                inputBox.innerText = text;
+                inputBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
             }
         },
         selectCategory: function(l1, l2, l3) {
@@ -96,12 +134,16 @@
             if (catTrigger) catTrigger.click();
             setTimeout(() => {
                 const clickOpt = (txt) => {
+                    if (!txt) return;
                     const opts = Array.from(document.querySelectorAll('.el-cascader-node'));
                     const target = opts.find(opt => opt.innerText.includes(txt));
                     if (target) target.click();
                 };
                 clickOpt(l1);
-                setTimeout(() => { clickOpt(l2); setTimeout(() => { clickOpt(l3); }, 250); }, 250);
+                setTimeout(() => {
+                    clickOpt(l2);
+                    setTimeout(() => { clickOpt(l3); }, 250);
+                }, 250);
             }, 300);
         },
         safeClickActionBtn: function(btnName) {
@@ -110,167 +152,201 @@
             if (targetBtn) targetBtn.click();
         },
         switchIMStatus: function(targetStatus) {
-            const statusTrigger = Array.from(document.querySelectorAll('div, span, button')).find(el => 
-                el.innerText && (el.innerText.includes('IM在线') || el.innerText.includes('IM离线') || el.innerText.includes('IM忙碌'))
-            );
+            if (!targetStatus) return;
+            const statusTrigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
+                const t = normText(el.innerText);
+                return t.includes('IM在线') || t.includes('IM离线') || t.includes('IM忙碌');
+            });
             if (statusTrigger) statusTrigger.click();
 
             setTimeout(() => {
                 const items = Array.from(document.querySelectorAll('.el-dropdown-menu__item'));
-                const target = items.find(item => item.innerText.trim().includes(targetStatus));
+                const target = items.find(item => normText(item.innerText).includes(targetStatus));
                 if (target) target.click();
             }, 200);
         }
     };
+
+    // ==================== WebSocket 中继连接 ====================
     let ws = null;
     let reconnectAttempts = 0;
-    let maxReconnectAttempts = 10;
+    const maxReconnectAttempts = 10;
     let wsReconnectTimer = null;
-    
+
+    // 安全发送：仅在连接可用时发送，避免抛异常
+    function sendToBrain(payload) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+                ws.send(JSON.stringify(payload));
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // 断线重连调度（指数退避，最多 maxReconnectAttempts 次）
+    function scheduleReconnect() {
+        if (reconnectAttempts >= maxReconnectAttempts) {
+            console.error("❌ [探针] 重连已达上限，请确认中继服务 (bridge_server.py) 是否已启动");
+            return;
+        }
+        reconnectAttempts++;
+        const delay = Math.min(3000 * reconnectAttempts, 30000);
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = setTimeout(connectBrain, delay);
+        console.warn("⚠️ [探针] " + (delay / 1000) + " 秒后进行第 " + reconnectAttempts + " 次重连...");
+    }
+
     function connectBrain() {
-        // 清理旧连接（修复 BUG-004：内存泄漏）
+        // 清理旧连接，防止内存泄漏
         if (ws) {
-            ws.onclose = null; // 阻止触发重连
-            if (ws.readyState === WebSocket.OPEN) ws.close();
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.onmessage = null;
+            try {
+                if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+            } catch (e) {}
             ws = null;
         }
-        
+
         try {
             ws = new WebSocket('ws://127.0.0.1:8765/ws/extension');
-            reconnectAttempts = 0;
-            
-            ws.onopen = () => {
-                console.log("✅ [探针] WebSocket 连接成功");
-                // 延迟发送 HEADERS_SYNC，确保 fetch 拦截器已捕获 Token
-                setTimeout(() => {
-                    if (Object.keys(window.__im_auth_headers).length > 0) {
-                        ws.send(JSON.stringify({ event: "HEADERS_SYNC", data: window.__im_auth_headers }));
-                    } else {
-                        console.warn("⚠️ [探针] 尚未捕获到 Token，等待下一次重连时重试");
-                    }
-                }, 500);
-            };
-            
-            ws.onclose = (e) => {
-                console.warn(`⚠️ [探针] WebSocket 断开 (code=${e.code}), ${reconnectAttempts < maxReconnectAttempts ? '尝试重连...' : '已达最大重连次数'}`);
-                if (reconnectAttempts < maxReconnectAttempts) {
-                    reconnectAttempts++;
-                    const delay = Math.min(3000 * reconnectAttempts, 30000); // 指数退避，最大 30 秒
-                    wsReconnectTimer = setTimeout(connectBrain, delay);
-                } else {
-                    console.error("❌ [探针] WebSocket 重连失败，已达最大尝试次数");
-                }
-            };
-            
-            ws.onerror = (e) => {
-                console.error("❌ [探针] WebSocket 错误:", e);
-            };
+        } catch (err) {
+            console.error("❌ [探针] WebSocket 创建失败:", err);
+            scheduleReconnect();
+            return;
+        }
 
-            ws.onmessage = (event) => {
-            const cmd = JSON.parse(event.data);
-            // 新增：处理警报确认回执（修复 BUG-002）
+        ws.onopen = () => {
+            console.log("✅ [探针] WebSocket 连接成功");
+            reconnectAttempts = 0;   // 连接成功后才重置重连计数
+            // 延迟发送 HEADERS_SYNC，确保 fetch 拦截器已捕获 Token
+            setTimeout(() => {
+                if (window.__im_auth_headers && Object.keys(window.__im_auth_headers).length > 0) {
+                    sendToBrain({ event: "HEADERS_SYNC", data: window.__im_auth_headers });
+                } else {
+                    console.warn("⚠️ [探针] 尚未捕获到 Token，等待下一次重连时重试");
+                }
+            }, 500);
+        };
+
+        ws.onclose = (e) => {
+            console.warn("⚠️ [探针] WebSocket 断开 (code=" + e.code + ")");
+            scheduleReconnect();
+        };
+
+        ws.onerror = () => {
+            console.error("❌ [探针] WebSocket 错误（中继服务可能未启动）");
+        };
+
+        ws.onmessage = (event) => {
+            let cmd;
+            try {
+                cmd = JSON.parse(event.data);
+            } catch (err) {
+                return;
+            }
+            if (!cmd || !cmd.command) return;
+
+            // 警报确认回执
             if (cmd.command === "ALARM_CONFIRMED") {
-                console.log("✅ [探针] 掉线警报已确认，停止重复上报");
+                console.log("✅ [探针] 掉线警报已被中继确认");
                 return;
             }
-            if (cmd.command === "RECOVERY_CONFIRMED") {
-                console.log("✅ [探针] 恢复确认已收到");
-                return;
-            }
-            // 原有命令处理
+            if (cmd.command === "RECOVERY_CONFIRMED") return;
+
             if (cmd.command === "FILL_DRAFT") {
                 if (cmd.content) Operator.fillReplyBox(cmd.content);
                 if (cmd.category) Operator.selectCategory("一级分类", "二级分类", cmd.category);
-            } 
+            }
             else if (cmd.command === "ACTION_REPLY_CLOSE") {
                 if (cmd.content) Operator.fillReplyBox(cmd.content);
                 if (cmd.category) Operator.selectCategory("一级分类", "二级分类", cmd.category);
-                setTimeout(() => Operator.safeClickActionBtn('回复并关单'), 1000); 
-            } 
-            else if (cmd.command === "ACTION_HANGUP") { Operator.safeClickActionBtn('挂起'); }
+                setTimeout(() => Operator.safeClickActionBtn('回复并关单'), 1000);
+            }
+            else if (cmd.command === "ACTION_HANGUP") {
+                Operator.safeClickActionBtn('挂起');
+            }
             else if (cmd.command === "SEND_REPLY") {
-                Operator.fillReplyBox(cmd.content); 
-                setTimeout(() => Operator.safeClickActionBtn('回复'), 500); 
+                Operator.fillReplyBox(cmd.content);
+                setTimeout(() => Operator.safeClickActionBtn('回复'), 500);
             }
             else if (cmd.command === "CHANGE_STATUS") {
-                const map = {1: 'IM在线', 2: 'IM忙碌', 3: 'IM离线'};
+                const map = { 1: 'IM在线', 2: 'IM忙碌', 3: 'IM离线' };
                 Operator.switchIMStatus(map[cmd.status]);
             }
-            else if (cmd.command === "SILENCE_ALARM") { stopSiren(); }
+            else if (cmd.command === "SILENCE_ALARM") {
+                stopSiren();
+            }
         };
     }
-    // 修复 BUG-010：页面加载缓慢时误判掉线
+
+    // ==================== 页面加载完成标记（防止误判掉线） ====================
     let pageLoadComplete = false;
-    setTimeout(() => { pageLoadComplete = true; }, 3000); // 3 秒后认为页面加载完成
-    
-    setInterval(() => {
-        // 监控 VPN 掉线火警
-        const statusEl = Array.from(document.querySelectorAll('.el-dropdown-menu__item, span, div')).find(el => 
-            el.innerText === 'IM 离线' || el.innerText === 'IM 在线' || el.innerText === 'IM 忙碌'
-        );
-        if (statusEl && pageLoadComplete) {  // 仅当页面加载完成后才检测
-            const currentStatus = statusEl.innerText.trim();
-            if (currentStatus === 'IM 离线' && !isManualOffline) {
-                playSiren();
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "ABNORMAL_OFFLINE" }));
-            } else if (currentStatus === 'IM 在线') {
-                isManualOffline = false; stopSiren();
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "ALARM_RECOVERED" }));
-            }
-        }
+    setTimeout(() => { pageLoadComplete = true; }, 3000);
 
+    // ==================== 定时任务 1：VPN 掉线火警监控 ====================
+    let lastIMStatus = null;
     setInterval(() => {
-        // 监控 VPN 掉线火警
-        const statusEl = Array.from(document.querySelectorAll('.el-dropdown-menu__item, span, div')).find(el => 
-            el.innerText === 'IM离线' || el.innerText === 'IM在线' || el.innerText === 'IM忙碌'
-        );
-        if (statusEl) {
-            const currentStatus = statusEl.innerText.trim();
-            if (currentStatus === 'IM离线' && !isManualOffline) {
-                playSiren();
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "ABNORMAL_OFFLINE" }));
-            } else if (currentStatus === 'IM在线') {
-                isManualOffline = false; stopSiren();
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "ALARM_RECOVERED" }));
-            }
-        }
+        if (!pageLoadComplete) return;
 
-        const isIMWorkspace = document.body.innerText.includes('IM工作台');
-        if (!isIMWorkspace) return;
+        const currentStatus = findIMStatusText();
+        if (currentStatus === lastIMStatus) return;   // 状态未变化，不重复上报
+
+        if (currentStatus === 'IM离线' && !isManualOffline) {
+            playSiren();
+            sendToBrain({ event: "ABNORMAL_OFFLINE" });
+        } else if (currentStatus === 'IM在线') {
+            isManualOffline = false;
+            stopSiren();
+            sendToBrain({ event: "ALARM_RECOVERED" });
+        }
+        lastIMStatus = currentStatus;
+    }, 2000);
+
+    // ==================== 定时任务 2：工单消息抓取与上报 ====================
+    setInterval(() => {
+        // 仅在 IM 工作台页面抓取
+        if (!document.body || !document.body.innerText.includes('IM工作台')) return;
 
         // 提取右侧面板玩家信息
         let playerInfo = "";
         const rightPanel = document.querySelector('.ws-right-panel');
         if (rightPanel) playerInfo = rightPanel.innerText.replace(/\n+/g, ' | ').trim();
 
-        // 提取中间真实聊天气泡，不再拼接成长字符串，而是构造数组彻底隔绝雪球
-        let messages = [];
-        const bubbles = document.querySelectorAll('.chat-bubble-row');
-        bubbles.forEach(row => {
-            const isPlayer = row.matches('.from-player') || row.classList.contains('from-player');
-            const isAgent = row.matches('.from-agent') || row.classList.contains('from-agent');
-            if (!isPlayer && !isAgent) return; 
+        // 提取中间真实聊天气泡，构造数组彻底隔绝雪球
+        const messages = [];
+        document.querySelectorAll('.chat-bubble-row').forEach(row => {
+            const isPlayer = row.classList.contains('from-player');
+            const isAgent = row.classList.contains('from-agent');
+            if (!isPlayer && !isAgent) return;
 
             const textNode = row.querySelector('.msg-rich-text') || row;
-            const content = textNode ? textNode.innerText.trim() : "";
+            const content = (textNode.innerText || "").trim();
             if (content) messages.push({ sender: isPlayer ? 'player' : 'agent', text: content });
         });
 
+        if (messages.length === 0) return;
+
         const currentHash = messages.map(m => m.text).join('').replace(/\s+/g, '');
-        if (messages.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
-            if (window._lastChatHash !== currentHash) {
-                if (messages[messages.length - 1].sender === 'player' || (window._lastChatHash && currentHash.length > window._lastChatHash.length)) { 
-                    playDingDong(); 
-                }
-                window._lastChatHash = currentHash;
-                ws.send(JSON.stringify({
-                    event: "PLAYER_MESSAGE",
-                    data: { groupID: "当前工单", messages: messages, playerInfo: playerInfo }
-                }));
-            }
+        if (window._lastChatHash === currentHash) return;   // 内容未变化，不上报
+
+        const lastSender = messages[messages.length - 1].sender;
+        if (lastSender === 'player' ||
+            (window._lastChatHash && currentHash.length > window._lastChatHash.length)) {
+            playDingDong();
         }
+        window._lastChatHash = currentHash;
+
+        sendToBrain({
+            event: "PLAYER_MESSAGE",
+            data: { groupID: "当前工单", messages: messages, playerInfo: playerInfo }
+        });
     }, 2000);
 
+    // ==================== 启动 ====================
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', connectBrain);
     else connectBrain();
 })();

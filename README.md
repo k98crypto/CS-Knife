@@ -153,12 +153,20 @@ cp config.json config.json.template
 ### 本地测试
 
 ```bash
-# 语法检查
+# Python 语法检查
 python -m py_compile bridge_server.py
 python -m py_compile agent_core.py
+python -m py_compile semi_runner.pyw
+python -m py_compile launcher.py
 
-# 导入测试
-python -c "from agent_core import CustomerServiceCore; print('✅ 加载成功')"
+# Python 导入测试
+python -c "from agent_core import CustomerServiceCore; print('OK')"
+
+# 油猴脚本 probe.js 语法检查（需 Node.js）
+node --check probe.js
+
+# 油猴脚本功能冒烟测试（18 项，模拟浏览器环境，无需打开浏览器）
+node probe_smoke_test.js probe.js
 ```
 
 ### 打包为 EXE
