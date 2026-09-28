@@ -360,6 +360,47 @@ async def safe_send(client, payload):
             _group.discard(client)
 
 
+# ==================== ★ 出站安全闸（所有"可能发给玩家"的文本的唯一出口） ====================
+# 客户铁律：发给玩家的话里**绝不能出现** 内部群 / 群聊 / 上报 / 补偿 / 赔偿 / 承诺 / 保证 /
+# 漏洞 / 程序错误 / BUG / 内部快捷键(F6~F10) / 修复时间承诺。
+# 这里统一清洗（能改的改写成中性话术，内部提示整块删掉），并复核"零禁词"。
+def safe_outbound(text, where=""):
+    """清洗即将发给玩家的文本；返回 (清洗后文本, 仍命中的禁词列表)。"""
+    raw = "" if text is None else str(text)
+    try:
+        clean = core.sanitize_outbound(raw)
+    except Exception as e:
+        print(f"[安全闸] 清洗异常（{where}）：{e}")
+        clean = raw
+    try:
+        left = core.find_forbidden(clean)
+    except Exception:
+        left = []
+    if clean != raw:
+        print(f"[安全闸] 已清洗发送内容（{where}）：{len(raw)} -> {len(clean)} 字")
+    if left:
+        print(f"[安全闸] ⚠️ 清洗后仍命中禁词（{where}）：{left}")
+    return clean, left
+
+
+async def send_to_player(payload, where=""):
+    """把指令发给电脑端探针去执行前，先把"玩家可见文本"过一遍安全闸。
+
+    payload 形如 {"command": "SEND_REPLY"|"FILL_DRAFT"|"ACTION_REPLY_CLOSE", "content": "..."}
+    返回 True=已发出；False=清洗后为空（调用方需兜底，比如改发安抚话术）。
+    """
+    pkt = dict(payload or {})
+    if pkt.get("content"):
+        clean, left = safe_outbound(pkt["content"], where or str(pkt.get("command") or ""))
+        if not clean:
+            print(f"[安全闸] 内容清洗后为空，已拦截（{where}）")
+            return False
+        pkt["content"] = clean
+    for ext in list(active_clients["extension"]):
+        await safe_send(ext, pkt)
+    return True
+
+
 def push_bark(title, body, group_id=""):
     """推送 Bark 通知。
 
@@ -439,9 +480,11 @@ async def send_hold_and_alert(group_id: str, conv: dict, history_str: str, reply
        ③ 该会话置顶 + 把玩家信息和问题总结复制给客服（复制由桌面 HUD 完成）
     """
     # ① 先安抚玩家（有电脑端在就连网页一起发，保证玩家真的收到）
-    for ext in list(active_clients["extension"]):
-        await safe_send(ext, {"command": "SEND_REPLY", "content": HOLD_TEXT, "groupID": group_id})
-    _say_as_agent(group_id, HOLD_TEXT)
+    #    ★ 安全闸：这句是"要进玩家对话框"的，必须零禁词（内部群/补偿/承诺…）
+    hold_text = safe_outbound(HOLD_TEXT, "安抚话术")[0] or HOLD_TEXT
+    await send_to_player({"command": "SEND_REPLY", "content": hold_text,
+                          "groupID": group_id}, "安抚话术")
+    _say_as_agent(group_id, hold_text)
 
     # ② 问题总结（给客服看的，不是给玩家的）
     try:
@@ -517,26 +560,38 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
         return
 
     if reply:
+        # ★ 安全闸：无论 AFK 直接发送、还是半自动只填草稿，都要先清洗
+        #   （草稿也是"可能被客服顺手发出去"的文本，必须同样零禁词）
+        body = safe_outbound(reply, "AI 回复")[0]
+        if not body:
+            print("[安全闸] AI 回复清洗后为空（可能只剩内部提示）-> 转人工：发安抚话术 + 长报警")
+            await send_hold_and_alert(group_id, conv, history_str, reply)
+            return
         now_str = datetime.now().strftime("%H:%M:%S")
         if state["afk_mode"]:
             conv = state["companies"]["main"]["conversations"].setdefault(
                 group_id, {"name": group_id, "msgs": []})
             if not isinstance(conv.get("msgs"), list):
                 conv["msgs"] = []
-            conv["msgs"].append({"sender": "agent", "text": reply, "time": now_str,
+            conv["msgs"].append({"sender": "agent", "text": body, "time": now_str,
                                  "ts": int(time.time() * 1000)})
             conv["updatedAt"] = int(time.time() * 1000)
+            conv["last_reply_ts"] = last_player_ts(conv)
             _LAST_ACTIVE["gid"] = group_id
             for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
 
             if "TIMEOUT_CLOSE" in tag:
-                for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "ACTION_REPLY_CLOSE", "category": "其他", "categoryPath": (config.get("close_category_path") or ["一级分类", "二级分类"]), "defaultCategory": config.get("close_category_default", "其他"), "content": reply, "groupID": group_id})
+                await send_to_player({"command": "ACTION_REPLY_CLOSE", "category": "其他",
+                                      "categoryPath": (config.get("close_category_path") or ["一级分类", "二级分类"]),
+                                      "defaultCategory": config.get("close_category_default", "其他"),
+                                      "content": body, "groupID": group_id}, "超时关单")
             else:
-                for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "SEND_REPLY", "content": reply, "groupID": group_id})
+                await send_to_player({"command": "SEND_REPLY", "content": body,
+                                      "groupID": group_id}, "AFK 自动回复")
         else:
-            # 半自动模式：草稿推到网页与手机输入框
-            for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "FILL_DRAFT", "content": reply, "category": "其他"})
-            for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": reply})
+            # 半自动模式：草稿推到网页与手机输入框（同样已过安全闸）
+            await send_to_player({"command": "FILL_DRAFT", "content": body, "category": "其他"}, "半自动草稿")
+            for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": body})
 
 
 # ================= 手机端 H5 界面 =================
@@ -1461,11 +1516,15 @@ async def api_fill_draft(request):
     content = str(body.get("content") or "")
     if not content.strip():
         return web.json_response({"ok": False, "error": "content 为空"}, status=400)
+    # ★ 安全闸：F9/F10 的文案是"可能被直接发出去"的，同样必须零禁词
+    content, left = safe_outbound(content, "F9/F10 直填")
+    if not content.strip():
+        return web.json_response({"ok": False, "error": "内容清洗后为空（只含内部提示），已拦截"}, status=400)
     if not active_clients["extension"]:
         return web.json_response({"ok": False, "error": "电脑端探针未连接（网页没开 / 脚本没跑）"}, status=503)
-    for ext in list(active_clients["extension"]):
-        await safe_send(ext, {"command": "FILL_DRAFT", "content": content})
-    return web.json_response({"ok": True, "clients": len(active_clients["extension"])})
+    await send_to_player({"command": "FILL_DRAFT", "content": content}, "F9/F10 直填")
+    return web.json_response({"ok": True, "clients": len(active_clients["extension"]),
+                              "filtered": left})
 
 def _kb_stats():
     """知识库概况（诊断页用）。任何异常都不能影响诊断接口本身。"""
@@ -1850,11 +1909,13 @@ async def ws_ext_handler(request):
                         c["greeted"] = True
                         if config.get("auto_send_greeting", True) and (
                                 state.get("afk_mode") or state.get("auto_draft", True)):
-                            greet = pick_greeting()
-                            for ext in list(active_clients["extension"]):
-                                await safe_send(ext, {"command": "SEND_REPLY", "content": greet, "groupID": gid})
-                            _say_as_agent(gid, greet)
-                            print(f"[开场] 已按表格发送开场语给 {name}：{greet[:40]}")
+                            # 开场语来自表格，同样要过安全闸（表格里万一写了禁词也不会漏给玩家）
+                            greet = safe_outbound(pick_greeting(), "开场语")[0]
+                            if greet:
+                                await send_to_player({"command": "SEND_REPLY", "content": greet,
+                                                      "groupID": gid}, "开场语")
+                                _say_as_agent(gid, greet)
+                                print(f"[开场] 已按表格发送开场语给 {name}：{greet[:40]}")
                     schedule_auto_reply(gid)
 
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
@@ -1914,6 +1975,10 @@ async def handle_ai_close(group_id: str):
 
     if not content:
         return False, "AI 未生成结束语，已取消关单"
+    # ★ 安全闸：结束语会直接进玩家对话框
+    content, left = safe_outbound(content, "关单结束语")
+    if not content.strip():
+        return False, "结束语清洗后为空（只含内部提示），已取消关单"
     if not active_clients["extension"]:
         return False, "电脑端探针未连接，无法关单"
 
@@ -1927,8 +1992,7 @@ async def handle_ai_close(group_id: str):
         "defaultCategory": config.get("close_category_default", "其他"),
         "groupID": group_id,
     }
-    for ext in list(active_clients["extension"]):
-        await safe_send(ext, payload)
+    await send_to_player(payload, "关单结束语")
 
     # 关单后从列表移除（对应需求：关单之后消息从列表消失）
     name = conv.get("name") or group_id
@@ -2069,11 +2133,30 @@ async def ws_mobile_handler(request):
                 elif act == "TRIGGER_F9":
                     asyncio.create_task(handle_ai_automation(pkt.get("groupID"), source="phone", force=True))
                 elif act == "EXT_COMMAND":
-                    for ext in list(active_clients["extension"]): await safe_send(ext, pkt)
+                    # ★ 安全闸：挂起/恢复等动作可能带 content（如手机端"关单"会把输入框内容一起发），
+                    #   凡是"要进玩家对话框"的文本都必须清洗
+                    fwd = dict(pkt)
+                    if fwd.get("content"):
+                        clean, left = safe_outbound(fwd["content"], "手机端指令")
+                        if clean.strip():
+                            fwd["content"] = clean
+                        else:
+                            fwd.pop("content", None)
+                            await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                                                 "message": "内容清洗后为空（只含内部提示），已拦截"})
+                            continue
+                    for ext in list(active_clients["extension"]):
+                        await safe_send(ext, fwd)
                 elif act == "SEND_REPLY":
                     gid = pkt.get("groupID")
                     text = pkt.get("content")
                     if not gid or not text:
+                        continue
+                    # ★ 安全闸：手机端代发的内容也会进玩家对话框（可能是从草稿复制来的）
+                    text, left = safe_outbound(text, "手机端代发")
+                    if not text.strip():
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                                             "message": "内容清洗后为空（只含内部提示），未发送"})
                         continue
                     conv = state["companies"]["main"]["conversations"].setdefault(gid, {"name": gid, "msgs": []})
                     if not isinstance(conv.get("msgs"), list):
@@ -2085,12 +2168,8 @@ async def ws_mobile_handler(request):
                     _LAST_ACTIVE["gid"] = gid
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 修复 BUG-011：过滤 action 字段，仅转发必要字段
-                    for ext in list(active_clients["extension"]): 
-                        await safe_send(ext, {
-                            "command": act,
-                            "groupID": gid,
-                            "content": text
-                        })
+                    await send_to_player({"command": "SEND_REPLY", "groupID": gid,
+                                          "content": text}, "手机端代发")
     finally:
         active_clients["mobile"].discard(ws)
     return ws

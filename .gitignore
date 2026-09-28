@@ -134,3 +134,7 @@ mode_state.json
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# 临时/提交信息文件（不要入库）
+_cm.txt
+_push_log.txt

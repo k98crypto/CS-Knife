@@ -152,5 +152,25 @@ B.state["afk_mode"] = False
 B.state["auto_draft"] = True
 B.save_mode_state()          # 测试后把状态复位（避免影响真实使用）
 
+print("\n[7] 出站安全闸：发给玩家的话绝不能出现内部群/补偿/承诺")
+NASTY = ("【规章库未收录，请上报内部群核实】\n亲爱的玩家，这个 bug 我们会补偿您 100 钻石，"
+         "并承诺 48 小时内修复，请进群联系群内客服处理，也可以按 F9 一键上报。")
+clean, left = B.safe_outbound(NASTY, "测试")
+forbidden = B.core.find_forbidden(clean)
+check("清洗后零禁词（内部群/补偿/承诺/群聊/上报/BUG…）", forbidden == [], str(forbidden))
+check("内部提示【规章库未收录…】整块被删除", "规章库未收录" not in clean and "内部群" not in clean, clean[:60])
+check("补偿/承诺/时间承诺被改写成中性话术",
+      "补偿" not in clean and "承诺" not in clean and "48 小时" not in clean, clean[:80])
+check("BUG 改成异常情况", "bug" not in clean.lower() and "异常情况" in clean, clean[:80])
+check("内部快捷键 F9 不再出现", "F9" not in clean, clean[:80])
+check("清洗后仍是完整可发的话术（没被清空）", len(clean) > 10, clean)
+check("补偿金额也一并抹掉（不留『…100 钻石』这类暗示）",
+      "钻石" not in clean and "100" not in clean, clean[:100])
+check("安抚话术本身零禁词", B.core.find_forbidden(B.HOLD_TEXT) == [], B.HOLD_TEXT)
+check("开场语（表格话术）零禁词", B.core.find_forbidden(B.pick_greeting()) == [], B.pick_greeting())
+check("find_forbidden 能抓到禁词（自检有效）", B.core.find_forbidden(NASTY) != [], str(B.core.find_forbidden(NASTY)))
+check("纯内部提示会被清空 -> 调用方据此拦截", B.safe_outbound("【规章库未收录，请上报内部群核实】", "测试")[0] == "",
+      repr(B.safe_outbound("【规章库未收录，请上报内部群核实】", "测试")[0]))
+
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

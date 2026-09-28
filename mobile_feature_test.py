@@ -365,6 +365,34 @@ async def main():
         await drain(mobile, 0.3, tries=2)
         await ext3.close()
 
+        # ---------- 8. 出站安全闸（发给玩家的话零禁词） ----------
+        print("\n[8] 出站安全闸（内部群/补偿/承诺 绝不进玩家对话框）")
+        ext4 = await s.ws_connect(BASE + "/ws/extension")
+        await drain(ext4, 0.4, tries=3)
+        nasty = "【规章库未收录，请上报内部群核实】我们会补偿您 100 钻石并承诺 48 小时内修复这个 bug，请进群找群内客服。"
+        async with s.post(BASE + "/api/fill_draft", json={"content": nasty}) as r:
+            body = await r.json() if r.status == 200 else {}
+        _, ext4_msgs = await drain(ext4, 0.5, tries=4)
+        fills = [m for m in ext4_msgs if m.get("command") == "FILL_DRAFT"]
+        got = str(fills[-1].get("content") if fills else "")
+        check("直填内容已过安全闸（探针收到的不是原文）", bool(fills) and "内部群" not in got, got[:80])
+        check("探针收到的内容零禁词（内部群/补偿/承诺/群聊/上报/bug）",
+              all(w not in got for w in ("内部群", "补偿", "承诺", "群聊", "上报", "bug", "BUG")) and "钻石" not in got,
+              got[:100])
+        # 只有内部提示的内容 -> 直接拦截
+        async with s.post(BASE + "/api/fill_draft", json={"content": "【规章库未收录，请上报内部群核实】"}) as r:
+            check("纯内部提示的文案被拦截（400）", r.status == 400, f"status={r.status}")
+        # 手机端代发同样过闸
+        await mobile.send_json({"action": "SEND_REPLY", "groupID": GID,
+                                "content": "我们会赔偿您 888 元，请进群找群内客服"})
+        await asyncio.sleep(0.5)
+        _, ext4_after = await drain(ext4, 0.5, tries=4)
+        sent_reply = [m for m in ext4_after if m.get("command") == "SEND_REPLY"]
+        payload = str(sent_reply[-1].get("content") if sent_reply else "")
+        check("手机端代发也过安全闸（赔偿/群内客服 被改写）",
+              "赔偿" not in payload and "群内客服" not in payload and bool(payload), payload[:80])
+        await ext4.close()
+
         if not mobile.closed:
             await mobile.close()
 
