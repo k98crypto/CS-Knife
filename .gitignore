@@ -1,0 +1,134 @@
+# ==================== 敏感配置文件（必须忽略） ====================
+# API Key 与认证信息
+config.json
+*.key
+*.secret
+*.env
+.env.local
+.env.production
+
+# Bark 推送密钥
+bark_config.json
+
+# ==================== Python 编译缓存 ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==================== PyInstaller ====================
+# 打包输出目录
+build/
+dist/
+*.spec.bak
+
+# ==================== IDE 与编辑器 ====================
+# VS Code
+.vscode/
+*.code-workspace
+.history/
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.pydevproject
+.settings/
+
+# VS
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ==================== 操作系统文件 ====================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+
+# ==================== 日志与临时文件 ====================
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+*.bak
+
+# ==================== 测试与覆盖率 ====================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ==================== 虚拟环境 ====================
+venv/
+ENV/
+env/
+.venv/
+
+# ==================== 打包与构建 ====================
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# ==================== 媒体资源（可选） ====================
+# 如果媒体文件较大，建议忽略
+# *.jpg
+# *.png
+# *.ico
+# Ironman.ico
+# Ironman.jpg
+
+# ==================== 文档（可选） ====================
+# 如果文档频繁变更或较大，可选择性忽略
+# BUGFIX_SUMMARY.md
+# *.pdf
+# *.docx
+
+# ==================== 数据库与数据文件 ====================
+*.db
+*.sqlite
+*.sqlite3
+*.xls
+*.xlsx
+!rules.xlsx
+
+# ==================== Jupyter Notebook ====================
+.ipynb_checkpoints
+
+# ==================== mypy ====================
+.mypy_cache/
+.dmypy.json
+dmypy.json

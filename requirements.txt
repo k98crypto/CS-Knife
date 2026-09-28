@@ -1,0 +1,12 @@
+# Python
+aiohttp>=3.8.0
+pandas>=1.5.0
+openpyxl>=3.0.0
+requests>=2.28.0
+
+# Windows 热键与剪贴板
+keyboard>=0.13.5
+pyperclip>=1.8.0
+
+# 打包工具
+pyinstaller>=5.0.0
