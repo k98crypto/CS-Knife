@@ -2,12 +2,26 @@
   "port": 8765,
   "bark_key": "YOUR_BARK_KEY",
   "deepseek_api_key": "sk-YOUR_DEEPSEEK_API_KEY",
-  
+
   "rules_sync_url": "",
   "rules_app_token": "YOUR_APP_TOKEN",
   "rules_sheet_id": "YOUR_SHEET_ID",
   "rules_access_token": "YOUR_RULES_ACCESS_TOKEN",
-  
+
   "use_local_excel": true,
-  "local_excel_path": "rules.xlsx"
+  "local_excel_path": "rules.xlsx",
+
+  "rules_auto_sync": true,
+  "rules_sync_interval_minutes": 30,
+  "rules_watch_dir": "",
+
+  "kb_retrieval_enabled": true,
+  "kb_retrieval_top_k": 25,
+  "kb_static_max_chars": 12000,
+  "kb_entry_max_chars": 400,
+
+  "close_category_path": ["一级分类", "二级分类"],
+  "close_category_default": "其他",
+
+  "im_proxy_enabled": true
 }

@@ -63,6 +63,43 @@
 > `data-ticket-id` 等属性 ③ 左侧会话列表的选中项 ④ 最后用「玩家信息 + 首条玩家消息」
 > 生成稳定摘要。若你的工单页有固定字段，可在 `probe.js` 的 `pickTicketId()` 里加上对应选择器。
 
+### 规章库自动同步（知识库永不过期）
+
+表格表格只有只读权限、也无法添加机器人，因此提供三条**无需 API 权限**的同步路径：
+
+| 方式 | 配置项 | 说明 |
+|------|--------|------|
+| **监听目录**（推荐） | `rules_watch_dir` | 把导出的 xlsx 放进该目录（如表格/网盘同步目录），服务检测到更新即自动覆盖 |
+| **直链拉取** | `rules_sync_url` | 配一个能直接返回 xlsx 的地址；服务定时下载 → 校验 → 备份 → 替换 |
+| **手动覆盖** | — | 直接把新 xlsx 放项目根目录，**无需重启**，下次处理工单时按 mtime 自动热重载 |
+
+- 覆盖前自动备份为 `rules.xlsx.bak`；非法/损坏文件会被**拒绝**，不会污染知识库
+- 同步成功后自动发 Bark 通知
+- 也可独立运行：`python rules_sync.py --once`（可挂 Windows 任务计划）或 `--watch`
+
+### 知识库检索式注入（13 张表全穿透）
+
+- 自动识别 **6 种**表结构：话术库 / 问答库 / 已知BUG / 关单优先级 / 长文本公告 / 通用表
+- 小表**常驻** prompt；大表（如 631 条 FAQ）按工单内容**检索命中**后再注入
+- 实测解析能力：**37 条（1 张表）→ 843 条（13 张表）**，提升 23 倍
+- token 可控：`kb_static_max_chars` / `kb_retrieval_top_k` / `kb_entry_max_chars`
+
+### 手机端远程操作
+
+- **IM 状态切换**：顶部点状态按钮 → 在线/忙碌/离线；切到「在线」会**自动解除异常掉线警报**
+- **AI 回复并关单**：一键让 AI 选问题分类 + 生成结束语 → 回复并关单 → 该会话**从列表消失**
+- **唤醒补拉**：iOS 锁屏/切后台再回来时自动重连并**主动拉一次最新快照**，避免界面停留在几分钟前
+
+查看探针抓到的真实分类（用于配置 `close_category_options`）：
+```
+http://[你的电脑IP]:8765/api/categories
+```
+
+### 桌面 HUD 结果核验
+
+F7/F8 提炼完成后，一句话总结会**直接显示在悬浮窗的「最近提炼」行**；
+F9 解答、F10 润色同样会把结果摘要上屏，出货前可肉眼核验无误。
+
 ## 🔧 快速开始
 
 ### 环境要求
@@ -185,11 +222,22 @@ node h5_security_test.js
 # 业务核心回归测试（16 项：疑难单标记归一化 / AI 报错不外发 / 前后端契约）
 python agent_core_test.py
 
+# 规章库自动同步测试（18 项：监听目录 / 直链下载 / 坏文件拒绝 / mtime 热重载）
+python rules_sync_test.py
+
 # Token 泄露回归测试（需先启动 bridge_server；会占用 8765 端口）
 python token_leak_test.py
 
 # 多工单隔离端到端测试（需先启动 bridge_server；验证多玩家互不覆盖）
 python multi_conv_test.py
+
+# 手机端新功能端到端测试（需先启动 bridge_server；状态切换 / 补拉 / AI 关单）
+python mobile_feature_test.py
+
+# 规章库同步运维命令
+python rules_sync.py --info -v     # 查看当前知识库状态与各表条目数
+python rules_sync.py --once        # 手动执行一次同步
+python rules_sync.py --watch       # 常驻定时同步（可挂 Windows 任务计划）
 ```
 
 ### 打包为 EXE

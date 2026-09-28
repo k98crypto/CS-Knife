@@ -46,7 +46,13 @@ class CustomerServiceCore:
         self.tpl_closing_normal = []
         self.tpl_closing_data = []
 
+        self.sheet_stats = {}      # 各工作表条目数（供日志与诊断）
+        self.kb_static = ""        # 常驻小表（始终进 prompt）
+        self.kb_entries = []       # 大表条目（按工单内容检索后注入）
+        self._kb_grams = []        # 检索索引，惰性构建
+        self._kb_mtime = None      # 规章库文件修改时间，用于热重载判断
         self.kb_context = self.load_rules()
+        self._kb_mtime = self.rules_mtime()
 
     def get_patch_rules(self) -> str:
         if os.path.exists(PATCH_FILE_PATH):
@@ -59,53 +65,273 @@ class CustomerServiceCore:
                 pass
         return "---【公关铁律】---\n严禁承认BUG，严禁承诺补偿与修复时间。玩家统一尊称为【亲爱的玩家】。\n"
 
+    # ==================== 规章库解析（多工作表自适应） ====================
+    _QA_KEYS = ("答案", "纯文本答案")
+
+    def _cell_str(self, v) -> str:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.lower() in ("nan", "none", "nat"):
+            return ""
+        return s
+
+    def _clip(self, s: str, n: int) -> str:
+        s = self._cell_str(s)
+        return s if len(s) <= n else s[:n] + "…"
+
+    def _detect_sheet_mode(self, sheet: str, headers, ncols: int) -> str:
+        """按表头关键字 + 有效列数判断这张表该怎么读。"""
+        h = " ".join(headers)
+        if "处理方式" in h:
+            return "priority"
+        if "话术" in h:
+            return "script"
+        if "进度" in h or "已知" in sheet or "bug" in sheet.lower():
+            return "bug"
+        if any(k in h for k in self._QA_KEYS):
+            return "qa"
+        if ncols == 1:
+            return "block"
+        if ncols == 2:
+            return "qa"
+        return "generic"
+
     def load_rules(self) -> str:
+        """解析规章库 Excel 的**全部工作表**，自适应多种表结构，生成 AI 上下文。
+
+        自动识别的排版：
+          1) 话术库  「分类 | 情形 | 话术」          -> 开场/引导/关单类进模板池，其余进上下文
+          2) 问答库  「问题 | 答案 / 纯文本答案」    -> Q => A
+          3) 已知BUG 「问题 | 进度 / 说明」           -> 【已知问题】
+          4) 优先级  「重要级别 | 问题类型 | 处理方式」-> 【优先级 T0】
+          5) 长文本  「单列 / 仅首列有内容」          -> 整块说明（公告、SOP、长 FAQ）
+          6) 其它                                    -> 带列名的通用拼接
+
+        体积保护：
+          · 总字数 <= kb_max_chars（默认 30000）
+          · 每张表按份数均分预算（kb_sheet_budget_chars，0=自动），避免后面的表被长表挤掉
+          · 单条内容 <= kb_entry_max_chars（默认 400）
+        """
+        self.tpl_no_desc, self.tpl_has_desc, self.tpl_bug_known = [], [], []
+        self.tpl_guide_info, self.tpl_closing_normal, self.tpl_closing_data = [], [], []
+        self.sheet_stats = {}
+
         if not os.path.exists(RULES_FILE_PATH):
+            self._fill_default_templates()
             return "（暂无外部规章库）"
 
         try:
-            excel_file = pd.ExcelFile(RULES_FILE_PATH)
-            target_sheet = "常规" if "常规" in excel_file.sheet_names else excel_file.sheet_names[0]
-            df = pd.read_excel(RULES_FILE_PATH, sheet_name=target_sheet)
-            df.iloc[:, 0] = df.iloc[:, 0].ffill()
-            df = df.fillna("")
+            # 一次读入全部工作表（比逐表 read_excel 快很多）
+            all_sheets = pd.read_excel(RULES_FILE_PATH, sheet_name=None)
+            entry_max = int(_config.get("kb_entry_max_chars", 400))
 
-            rules_list = []
-            for index, row in df.iterrows():
-                col_a = str(row.iloc[0]).strip()
-                col_b = str(row.iloc[1]).strip()
-                col_c = str(row.iloc[2]).strip() if len(row) > 2 else ""
-
-                if not col_c:
+            sheet_entries = {}      # {sheet: [(question, answer), ...]}
+            for sheet, raw_df in all_sheets.items():
+                if raw_df is None or raw_df.empty:
+                    self.sheet_stats[sheet] = 0
                     continue
 
-                if "没有描述问题" in col_b or "直接转人工" in col_b:
-                    self.tpl_no_desc.append(col_c)
-                elif "已经描述问题" in col_b:
-                    self.tpl_has_desc.append(col_c)
-                elif "反馈已知bug" in col_b or "已知bug" in col_c:
-                    self.tpl_bug_known.append(col_c)
-                elif "引导提供信息" in col_a or "提供一下录屏" in col_c:
-                    self.tpl_guide_info.append(col_c)
-                elif "索要玩家资料玩家未回复" in col_b:
-                    self.tpl_closing_data.append(col_c)
-                elif "长时间未回复" in col_b:
-                    self.tpl_closing_normal.append(col_c)
-                else:
-                    rules_list.append(f"- 条目: {col_a} | {col_b} => 回复: {col_c}")
+                df = raw_df.dropna(how="all").dropna(axis=1, how="all").fillna("")
+                if df.shape[1] == 0:
+                    self.sheet_stats[sheet] = 0
+                    continue
 
-            if not self.tpl_no_desc:
-                self.tpl_no_desc = ["亲爱的玩家，欢迎来到本游戏~ 请问有什么可以帮您？"]
-            if not self.tpl_guide_info:
-                self.tpl_guide_info = ["辛苦您提供一下录屏/截图，这边帮您进一步确认！"]
-            if not self.tpl_closing_normal:
-                self.tpl_closing_normal = ["一直没收到您的回复，这边就先不打扰您了，若后续有任何问题欢迎再次联系我们。祝您游戏愉快~"]
-            if not self.tpl_closing_data:
-                self.tpl_closing_data = ["一直没收到您的回复，这边就先不打扰您了，您可以把问题截图/视频在下次咨询中提供给我们。祝您游戏愉快~"]
+                headers = [str(c).strip() for c in df.columns]
+                mode = self._detect_sheet_mode(sheet, headers, df.shape[1])
 
-            return "\n".join(rules_list)
+                # 长文本表：整块作为一个检索单元（公告 / SOP / 长 FAQ）
+                if mode == "block":
+                    texts = [self._cell_str(v) for v in df.iloc[:, 0].tolist()]
+                    joined = "\n".join(t for t in texts if t)
+                    sheet_entries[sheet] = [(f"【{sheet}】说明文档", joined)] if joined else []
+                    self.sheet_stats[sheet] = 1 if joined else 0
+                    continue
+
+                if mode in ("script", "priority"):
+                    df.iloc[:, 0] = df.iloc[:, 0].ffill()   # 分类 / 优先级 常是合并单元格
+
+                entries = []
+                for row in df.itertuples(index=False):
+                    cells = [self._cell_str(v) for v in row]
+                    if not any(cells):
+                        continue
+
+                    if mode == "script":
+                        col_a = cells[0]
+                        col_b = cells[1] if len(cells) > 1 else ""
+                        col_c = cells[2] if len(cells) > 2 else ""
+                        if not col_c:
+                            continue
+                        if self._classify_template(col_a, col_b, col_c):
+                            continue
+                        entries.append((f"{col_a} {col_b}".strip(), col_c))
+                    elif mode == "qa":
+                        q = cells[0]
+                        a = cells[1] if len(cells) > 1 else ""
+                        if not q or not a:
+                            continue
+                        entries.append((q, a))
+                    elif mode == "bug":
+                        q = cells[0]
+                        st = cells[1] if len(cells) > 1 else ""
+                        if not q:
+                            continue
+                        entries.append((f"[已知问题] {q}", st or "已记录"))
+                    elif mode == "priority":
+                        if not (cells[0] or (len(cells) > 1 and cells[1])):
+                            continue
+                        q = f"[优先级 {cells[0]}] {cells[1] if len(cells) > 1 else ''}".strip()
+                        entries.append((q, cells[2] if len(cells) > 2 else ""))
+                    else:  # generic：带列名拼接，避免错标
+                        parts = [f"{headers[i]}: {c}" for i, c in enumerate(cells) if c]
+                        if not parts:
+                            continue
+                        entries.append((parts[0], " | ".join(parts[1:]) or parts[0]))
+
+                sheet_entries[sheet] = entries
+                self.sheet_stats[sheet] = len(entries)
+
+            # ---------- 分区：小表常驻静态上下文，大表进检索池 ----------
+            static_lines, retrieval = [], []
+            static_cap = int(_config.get("kb_static_max_chars", 12000))
+            static_used = 0
+            by_size = sorted(sheet_entries.items(),
+                             key=lambda kv: sum(len(q) + len(a) + 8 for q, a in kv[1]))
+            for sheet, ents in by_size:
+                if not ents:
+                    continue
+                size = sum(len(q) + len(a) + 8 for q, a in ents)
+                as_static = (static_used + size) <= static_cap
+                for q, a in ents:
+                    text = f"[{sheet}] {self._clip(q, entry_max)} => {self._clip(a, entry_max)}"
+                    if as_static:
+                        static_lines.append("- " + text)
+                    else:
+                        retrieval.append({"sheet": sheet, "text": text})
+                if as_static:
+                    static_used += size
+
+            self.kb_entries = retrieval          # 供按需检索（大表）
+            self._kb_grams = []                  # 检索索引，首次检索时惰性构建
+            self._fill_default_templates()
+            self.kb_static = "\n".join(static_lines)
+            return self.kb_static
         except Exception as e:
+            self._fill_default_templates()
+            self.kb_static = ""
+            self.kb_entries = []
+            self._kb_grams = []
+            print(f"[规章库] 解析失败：{e}", file=sys.stderr)
             return f"（规章库解析异常: {e}）"
+
+    def _fill_default_templates(self):
+        """模板池保底：Excel 缺失/解析失败时仍能正常开场与关单。"""
+        if not self.tpl_no_desc:
+            self.tpl_no_desc = ["亲爱的玩家，欢迎来到本游戏~ 请问有什么可以帮您？"]
+        if not self.tpl_guide_info:
+            self.tpl_guide_info = ["辛苦您提供一下录屏/截图，这边帮您进一步确认！"]
+        if not self.tpl_closing_normal:
+            self.tpl_closing_normal = ["一直没收到您的回复，这边就先不打扰您了，若后续有任何问题欢迎再次联系我们。祝您游戏愉快~"]
+        if not self.tpl_closing_data:
+            self.tpl_closing_data = ["一直没收到您的回复，这边就先不打扰您了，您可以把问题截图/视频在下次咨询中提供给我们。祝您游戏愉快~"]
+
+    def _classify_template(self, col_a: str, col_b: str, col_c: str) -> bool:
+        """把「开场 / 引导 / 关单」类固定话术归入模板池（自动去重）。
+
+        返回 True 表示已归类（该条不必再进 AI 上下文，省 token）。
+        """
+        target = None
+        if "没有描述问题" in col_b or "直接转人工" in col_b:
+            target = self.tpl_no_desc
+        elif "已经描述问题" in col_b:
+            target = self.tpl_has_desc
+        elif "反馈已知bug" in col_b or "已知bug" in col_c:
+            target = self.tpl_bug_known
+        elif "引导提供信息" in col_a or "提供一下录屏" in col_c:
+            target = self.tpl_guide_info
+        elif "索要玩家资料玩家未回复" in col_b:
+            target = self.tpl_closing_data
+        elif "长时间未回复" in col_b:
+            target = self.tpl_closing_normal
+        if target is None:
+            return False
+        if col_c not in target:
+            target.append(col_c)
+        return True
+
+    # ==================== 规章库热重载（配合定时同步） ====================
+    def rules_mtime(self) -> float:
+        try:
+            return os.path.getmtime(RULES_FILE_PATH)
+        except Exception:
+            return 0.0
+
+    def reload_rules(self, force: bool = False) -> bool:
+        """重载规章库；force=False 时只在文件 mtime 变化后真正重载。
+
+        一次 stat 调用开销极低，因此可在每次处理工单前无脑调用，
+        实现「改完 Excel 立即生效，无需重启服务」。
+        """
+        cur = self.rules_mtime()
+        if not force and cur == self._kb_mtime:
+            return False
+        self.kb_context = self.load_rules()
+        self._kb_mtime = self.rules_mtime()
+        total = sum((self.sheet_stats or {}).values())
+        print(f"[规章库] 已重载：常驻 {len(self.kb_static)} 字符 / 检索池 {len(self.kb_entries)} 条 "
+              f"/ 共 {total} 条 / {len(self.sheet_stats)} 张表", file=sys.stderr)
+        return True
+
+    # ==================== 按需检索（RAG 简化版，零外部依赖） ====================
+    @staticmethod
+    def _grams(text: str) -> set:
+        """中文字符 2/3-gram 集合，用于轻量关键词匹配。"""
+        s = re.sub(r'[\s\-_/|,，。；;：:（）()【】\[\]"]+', '', str(text or ""))
+        g = set()
+        for k in (2, 3):
+            for i in range(len(s) - k + 1):
+                g.add(s[i:i + k])
+        return g
+
+    def search_kb(self, query: str, top_k: int = 25) -> list:
+        """按与本工单的字符重合度，从检索池挑出最相关的若干条规则。"""
+        if not self.kb_entries or not query:
+            return []
+        qg = self._grams(query)
+        if not qg:
+            return []
+        if len(self._kb_grams) != len(self.kb_entries):
+            self._kb_grams = [self._grams(e.get("text", "")) for e in self.kb_entries]
+
+        scored = []
+        for entry, grams in zip(self.kb_entries, self._kb_grams):
+            if not grams:
+                continue
+            inter = len(qg & grams)
+            if inter:
+                scored.append((inter / (len(grams) ** 0.5), entry.get("text", "")))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [t for _, t in scored[:max(0, int(top_k))]]
+
+    def build_kb_context(self, query: str = "") -> str:
+        """组装本次请求的规章上下文：常驻小表 + 按工单内容检索命中的相关条目。
+
+        这样既能覆盖全部 13 张表 / 数千条规则，又不会把 token 撑爆。
+        """
+        parts = []
+        if self.kb_static:
+            parts.append("---【常驻规则】---\n" + self.kb_static)
+
+        top_k = int(_config.get("kb_retrieval_top_k", 25))
+        if query and top_k > 0 and _config.get("kb_retrieval_enabled", True):
+            hits = self.search_kb(query, top_k)
+            if hits:
+                parts.append("---【与本工单最相关的规章】---\n" + "\n".join("- " + h for h in hits))
+
+        if not parts:
+            return self.kb_static or "（暂无外部规章库）"
+        return "\n".join(parts)
 
     def _call_deepseek(self, system_prompt: str, user_prompt: str) -> str:
         payload = {
@@ -216,6 +442,7 @@ class CustomerServiceCore:
 
     # ==================== F9 全能中枢 ====================
     def process_ticket_f9(self, chat_history: str) -> tuple[str, str]:
+        self.reload_rules()          # 规章库热重载：mtime 变化才真的读盘，开销极低
         # 先经本地预检
         local_tag, local_reply = self.try_local_prefilter(chat_history)
         if local_tag != "NEED_AI":
@@ -245,7 +472,7 @@ class CustomerServiceCore:
             "4. 仅当最底下一条是【客服】发送，且距当前未满 2 小时：输出 [TAG:WAITING]\n"
             "5. 最底下一条是【玩家】发送的具体问题：输出 [TAG:NORMAL]，对照规章库正规解答。\n\n"
             f"{patch}\n"
-            f"---【表格官方规章库】---\n{self.kb_context}\n"
+            f"---【表格官方规章库】---\n{self.build_kb_context(chat_history)}\n"
         )
 
         raw = self._call_deepseek(system_prompt, f"工单记录：\n{chat_history}")
@@ -270,6 +497,69 @@ class CustomerServiceCore:
         else:
             body = clean.replace("[TAG:NORMAL]", "").strip()
             return "NORMAL", body
+
+    # ==================== 手机端「AI 回复并关单」 ====================
+    def generate_closing(self, chat_history: str, category_options=None) -> tuple:
+        """生成「回复并关单」所需的 (问题分类, 结束语)。
+
+        一次 AI 调用同时产出分类与话术；任何失败都会退回本地关单模板，
+        保证手机端一键关单永远有内容可用。
+        """
+        self.reload_rules()
+        options = category_options or _config.get("close_category_options") or []
+        options = [str(x) for x in options]
+        default_cat = str(_config.get("close_category_default", "其他"))
+        fallback_msg = random.choice(self.tpl_closing_normal)
+
+        if options:
+            cat_hint = "必须从以下分类中【原样选择一个】作为 category：" + "、".join(options)
+        else:
+            cat_hint = f'若无法判断分类，category 直接输出 "{default_cat}"。'
+
+        patch = self.get_patch_rules()
+        system_prompt = (
+            "你是游戏《本游戏》官方客服。玩家统一尊称为【亲爱的玩家】。\n"
+            "现在需要为这通工单**收尾关单**。请严格只输出一行 JSON，"
+            "不要任何额外说明、不要 Markdown 代码块围栏：\n"
+            '{"category": "问题分类", "content": "给玩家的结束语"}\n'
+            "要求：\n"
+            "1. 结束语礼貌收尾：说明问题已受理/已记录，欢迎再次联系；1~3 句，不要分点。\n"
+            "2. 严禁出现 BUG、漏洞、程序错误等字样；严禁承诺补偿金额与修复时间。\n"
+            "3. 严禁提及'群内客服''内部群'，一律表述为'专人/工作人员为您跟进核实'。\n"
+            f"4. {cat_hint}\n"
+            f"{patch}"
+            f"---【表格官方规章库】---\n{self.build_kb_context(chat_history)}\n"
+        )
+
+        raw = self._call_deepseek(system_prompt, f"工单记录：\n{chat_history}")
+        if not raw:
+            return default_cat, fallback_msg
+
+        category, content = default_cat, ""
+        m = re.search(r'\{[\s\S]*\}', raw)          # 宽松解析：容忍围栏与前后废话
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                if isinstance(obj, dict):
+                    if obj.get("category"):
+                        category = str(obj["category"]).strip()
+                    if obj.get("content"):
+                        content = str(obj["content"]).strip()
+            except Exception:
+                pass
+        if not content:
+            content = re.sub(r'```[a-zA-Z]*|```', '', raw)
+            content = re.sub(r'\{[\s\S]*\}', '', content).strip()
+        if not content:
+            content = fallback_msg
+
+        content = self._normalize_hard_case(self.sanitize_reply(content))
+
+        # 分类白名单校验：避免 AI 编出页面上点不到的分类
+        if options and category not in options:
+            matched = next((o for o in options if o in category or category in o), None)
+            category = matched or default_cat
+        return category, content
 
     def polish_draft_or_instruction(self, chat_context: str, raw_draft: str) -> str:
         patch = self.get_patch_rules()

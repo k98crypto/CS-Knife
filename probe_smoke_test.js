@@ -109,7 +109,7 @@ const sandbox = {
     clearInterval: () => {},
     setTimeout: (fn, ms) => { timeouts.push({ fn, ms }); return timeouts.length; },
     clearTimeout: () => {},
-    JSON, Object, Math, Array, String, Number, Error, Boolean
+    JSON, Object, Math, Array, String, Number, Error, Boolean, Promise, Date
 };
 sandbox.globalThis = sandbox;
 

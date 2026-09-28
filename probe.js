@@ -32,6 +32,14 @@
         return null;
     }
 
+    // 取级联选择器"最后一层面板"里的可见选项（Element UI 级联为逐层懒加载）
+    function lastPaneNodes() {
+        const panes = Array.from(document.querySelectorAll('.el-cascader-menu'));
+        if (!panes.length) return [];
+        const last = panes[panes.length - 1];
+        return Array.from(last.querySelectorAll('.el-cascader-node')).filter(n => n.offsetParent !== null);
+    }
+
     // ==================== 工单身份识别（区分不同玩家，手机端才能分别显示） ====================
     // 注意：旧版本把所有工单都硬编码成 "当前工单"，导致手机端永远只有一个会话、
     //       新玩家上来就把旧玩家的记录覆盖掉。这里改为生成稳定且互不相同的工单标识。
@@ -186,21 +194,52 @@
             }
         },
         selectCategory: function(l1, l2, l3) {
-            const catTrigger = document.querySelector('.el-cascader input, input[placeholder="请选择问题分类"]');
-            if (catTrigger) catTrigger.click();
-            setTimeout(() => {
-                const clickOpt = (txt) => {
-                    if (!txt) return;
-                    const opts = Array.from(document.querySelectorAll('.el-cascader-node'));
-                    const target = opts.find(opt => opt.innerText.includes(txt));
-                    if (target) target.click();
-                };
-                clickOpt(l1);
+            Operator.selectCategoryByKeyword(l3 || "", [l1, l2]);
+        },
+        // 逐级下钻选择问题分类：优先按关键字匹配，其次按提示路径，最后落回第一项。
+        // 叶子节点"点击即选中并关闭"，因此全程只对末级做一次选择点击，不会误改分类。
+        selectCategoryByKeyword: function(keyword, pathHint) {
+            const trigger = document.querySelector('.el-cascader input, input[placeholder="请选择问题分类"]');
+            if (!trigger) { console.warn("⚠️ [探针] 未找到问题分类选择器，跳过分类选择"); return; }
+            const kw = normText(keyword || "");
+            const hints = (pathHint || []).map(normText);
+            trigger.click();
+
+            let depth = 0;
+            const step = () => {
+                if (depth > 4) { try { document.body.click(); } catch (e) {} return; }
+                const list = lastPaneNodes();
+                if (!list.length) return;                 // 面板消失 => 已完成选择
+                let target = null;
+                if (kw) target = list.find(n => normText(n.innerText).includes(kw));
+                if (!target && hints[depth]) target = list.find(n => normText(n.innerText).includes(hints[depth]));
+                if (!target) target = list[0];            // 兜底：取第一项，保证关单不卡住
+                const before = document.querySelectorAll(".el-cascader-menu").length;
+                try { target.click(); } catch (e) {}
+                depth++;
                 setTimeout(() => {
-                    clickOpt(l2);
-                    setTimeout(() => { clickOpt(l3); }, 250);
-                }, 250);
-            }, 300);
+                    const after = document.querySelectorAll(".el-cascader-menu").length;
+                    if (after <= before) {                // 点的是叶子：已选中并关闭
+                        console.log("✅ [探针] 已选择问题分类：", normText(target.innerText || ""));
+                        return;
+                    }
+                    step();
+                }, 230);
+            };
+            setTimeout(step, 300);
+        },
+        // 只读预览一级分类（不做任何选择，仅用于回报给后端/AI 参考）
+        peekCategoryOptions: function() {
+            return new Promise((resolve) => {
+                const trigger = document.querySelector('.el-cascader input, input[placeholder="请选择问题分类"]');
+                if (!trigger) { resolve([]); return; }
+                trigger.click();
+                setTimeout(() => {
+                    const opts = lastPaneNodes().map(n => normText(n.innerText)).filter(Boolean).slice(0, 100);
+                    try { document.body.click(); } catch (e) {}   // 点空白处关闭，不触发选择
+                    resolve(opts);
+                }, 350);
+            });
         },
         safeClickActionBtn: function(btnName) {
             const btns = Array.from(document.querySelectorAll('.im-action-btn'));
@@ -319,8 +358,24 @@
             }
             else if (cmd.command === "ACTION_REPLY_CLOSE") {
                 if (cmd.content) Operator.fillReplyBox(cmd.content);
-                if (cmd.category) Operator.selectCategory("一级分类", "二级分类", cmd.category);
-                setTimeout(() => Operator.safeClickActionBtn('回复并关单'), 1000);
+                const path = cmd.categoryPath || ["一级分类", "二级分类"];
+                if (cmd.category) {
+                    Operator.selectCategory(path[0], path[1], cmd.category);
+                    // 留足级联下钻时间，避免分类还没选完就点了"回复并关单"
+                    setTimeout(() => Operator.safeClickActionBtn('回复并关单'), 2200);
+                } else {
+                    setTimeout(() => Operator.safeClickActionBtn('回复并关单'), 800);
+                }
+            }
+            else if (cmd.command === "REQUEST_CATEGORIES") {
+                Operator.peekCategoryOptions().then(opts => {
+                    if (opts && opts.length) {
+                        sendToBrain({ event: "CATEGORY_OPTIONS", data: { options: opts } });
+                        console.log("📋 [探针] 已回报问题分类：", opts);
+                    } else {
+                        console.warn("⚠️ [探针] 未读到问题分类（选择器可能未渲染）");
+                    }
+                });
             }
             else if (cmd.command === "ACTION_HANGUP") {
                 Operator.safeClickActionBtn('挂起');

@@ -75,6 +75,8 @@ FakeWebSocket.instances = [];
 
 const windowStub = {
     location: { protocol: 'http:', host: '127.0.0.1:8765' },
+    addEventListener: () => {},
+    removeEventListener: () => {},
     AudioContext: function () {
         this.state = 'running'; this.currentTime = 0; this.destination = {};
         this.resume = () => {};
@@ -87,9 +89,11 @@ const sandbox = {
     window: windowStub, document: documentStub, console,
     WebSocket: FakeWebSocket,
     alert: msg => alerts.push(msg),
+    confirm: () => true,
     setInterval: () => 0, clearInterval: () => {},
     setTimeout: (fn, ms) => { timeouts.push({ fn, ms }); return timeouts.length; },
-    JSON, Math, Array, String, Object, Number, Error, Boolean
+    clearTimeout: () => {},
+    JSON, Math, Array, String, Object, Number, Error, Boolean, Promise, Date
 };
 sandbox.globalThis = sandbox;
 

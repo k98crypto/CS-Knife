@@ -429,4 +429,130 @@ python multi_conv_test.py            -> 通过（连跑 3 轮均通过）
 | `multi_conv_test.py` | 端到端验证多工单隔离（会话共存 / 消息互不覆盖 / 时间戳 / 脏数据容错） |
 
 ---
+
+## 🚀 第六轮（2026/9/28）：待推进功能闭环
+
+### 1. 表格规章库定时自动同步（高优先级）✅
+
+**新增 `rules_sync.py`**（同时支持 CLI 与作为模块被 bridge 调用）：
+
+| 路径 | 机制 |
+|------|------|
+| 监听目录 | `rules_watch_dir` 内出现更新的 xlsx 即复制覆盖（只复制不动源文件） |
+| 直链拉取 | `rules_sync_url` 下载 → 内存校验 → 备份 `.bak` → 原子替换 |
+| 手动覆盖 | 直接放根目录，`agent_core.reload_rules()` 按 mtime **热重载**，无需重启 |
+
+- 新增 `CustomerServiceCore.reload_rules()`：一次 `os.stat` 判断，开销极低，
+  已挂到 `process_ticket_f9` / `generate_closing` 入口 → **改完 Excel 立即生效**
+- bridge 启动时拉起 `rules_sync_loop()`，按 `rules_sync_interval_minutes`（默认 30）轮询，
+  有变更时打日志 + 推 Bark
+- CLI：`python rules_sync.py --once/--watch/--info -v`
+- **修掉一个真实 bug**：`pd.ExcelFile` 会占住文件句柄，Windows 下导致 `os.replace`
+  报 `WinError 32`；改为**内存校验 + 显式 close**，新增 `_validate_bytes()`
+
+### 2a. HEADERS_SYNC 底层 API 通道 ⚠️ 部分落地
+
+- 认证头已独立存放（`IM_AUTH_HEADERS`），并做**指纹去重**
+- 心跳保活：两个 WS handler 都启用 `heartbeat=30`，及时探活 iOS 退后台造成的死连接
+- **未能完成的部分**：真正的"用 Token 直连官方 HTTP 接口拉工单/直发消息"需要
+  **你们 IM 工作台的真实接口路径与字段**（浏览器 F12 → Network 抓给我），
+  否则只能靠猜。当前 DOM 通道已足够稳定，建议先按现状使用
+
+### 2b. CHANGE_STATUS 手机端开关 ✅
+
+- H5 顶部新增 **IM 状态按钮**（点击弹出 在线/忙碌/离线 菜单）
+- 新增手机端动作 `SET_IM_STATUS`：更新 `state.im_status` → 下发 `CHANGE_STATUS` 给探针
+- 切到「在线」时**自动清除 `alarm_status`** 并下发 `SILENCE_ALARM` 停掉警报音
+- 探针侧 `switchIMStatus` 原本就有，无需改动
+
+### 3. iOS 锁屏唤醒断流补拉 ✅
+
+- H5 监听 `visibilitychange` / `pageshow` / `online` / `focus`：
+  可见时若连接已断 → **跳过退避立即重连**；连接正常 → 发 `REQUEST_SNAPSHOT`
+- 新增后端动作 `REQUEST_SNAPSHOT`：立即回一帧 `FULL_SYNC`
+- WS 心跳 30s，让"假连接"尽快暴露
+
+### 4. F8 提炼结果即时上屏 ✅
+
+- HUD 新增常驻行「**最近提炼 / 框选预览**」（窗口高度 240 → 276）
+- F7 提炼完成 → 显示 `[提炼] 一句话总结`
+- F9 解答 → `[F9·标签] 回复摘要`；F10 润色 → `[F10·润色] 结果摘要`
+- **补上缺失的 F8 热键**（历史文档一直提到 F8，但从未注册过；现作为 F7 别名）
+
+### 5. 规章库多工作表串联 ✅（附带重大发现）
+
+- **旧实现只读「常规」一张表（37 行）**，而实际文件有 **13 张表**
+- 新实现自动识别 **6 种排版**并全部穿透：
+
+| 模式 | 识别依据 | 输出格式 |
+|------|---------|---------|
+| 话术库 | 表头含「话术」 | `分类 \| 情形 => 话术`（开场/引导/关单进模板池） |
+| 问答库 | 表头含「答案/纯文本答案」 | `Q => A` |
+| 已知BUG | 表头含「进度」或表名含「已知/bug」 | `[已知问题] 问题 => 进度` |
+| 关单优先级 | 表头含「处理方式」 | `[优先级 T0] 问题类型 => 处理方式` |
+| 长文本 | 单列 / 仅首列有内容 | `【表名】说明文档：全文` |
+| 通用 | 其它 | 带列名拼接，避免错标 |
+
+- **实测：解析条目 37 → 843 条（23 倍），13 张表全覆盖**
+- 因为总量约 25 万字远超单次 prompt，改为**检索式注入**：
+  - `kb_static_max_chars`（默认 12000）以内的小表**常驻** prompt
+  - 其余（如 631 条 FAQ）建索引，按工单文本的 **2/3-gram 重合度**检索 top-K 注入
+  - 零外部依赖（纯 Python 集合运算）
+- 检索效果实测：
+  - 「游戏一直连不上服务器提示网络错误」→ 精确命中 FAQ 里的同名条目
+  - 「我充值了648元但钻石没到账」→ 命中「购买的礼包未到账怎么办」等
+
+### 6. 手机端「AI 回复并关单」✅（新增需求）
+
+- 聊天页新增按钮 **🤖 AI回复并关单**
+- 后端 `handle_ai_close()`：AI 选问题分类 + 生成结束语 → 下发 `ACTION_REPLY_CLOSE`
+  （带 `content` / `category` / `categoryPath`）→ **会话从列表移除** → 推 Bark 留痕
+- **分类来源**（避免 AI 编造点不到的分类）：
+  1. 探针连上后自动回报网页级联选择器的一级分类（`CATEGORY_OPTIONS`，只读不点击，安全）
+  2. 后端缓存在 `state.category_options`，可经 `GET /api/categories` 查看
+  3. AI 从中选一个；另有 `close_category_options` 可手工指定
+- **探针侧分类选择重写**：`selectCategoryByKeyword()` 逐级下钻，
+  优先按 AI 给的关键字匹配、其次按 `close_category_path` 提示、最后落回第一项；
+  只有**叶子节点被点击一次**（即真正的选择），不会误改分类
+- **安全失败保证**：AI 无返回 / 探针未连接 → 明确报错且**不删会话**
+
+### 验证
+
+```
+python -m py_compile 6 个文件        -> 全 [OK]
+node probe_smoke_test.js probe.js    -> 26 通过 / 0 失败
+node h5_security_test.js             -> 34 通过 / 0 失败
+python agent_core_test.py            -> 16 通过 / 0 失败
+python rules_sync_test.py            -> 18 通过 / 0 失败
+python token_leak_test.py            -> 无泄露
+python multi_conv_test.py            -> 通过
+python mobile_feature_test.py        -> 15 通过 / 0 失败
+总体失败项: 0
+
+AI 关单实测链路（真实 DeepSeek 调用）:
+  [关单] 测试玩家 -> 分类「游戏BUG」
+  探针收到: ACTION_REPLY_CLOSE
+    content      = 亲爱的玩家，您反馈的问题我们已为您记录并转交专人跟进核实…
+    category     = 游戏BUG
+    categoryPath = ['一级分类', '二级分类']
+  关单后会话已从列表移除
+```
+
+### 新增文件
+
+| 文件 | 用途 |
+|------|------|
+| `rules_sync.py` | 规章库自动同步（监听目录 / 直链 / CLI） |
+| `rules_sync_test.py` | 同步回归测试（18 项） |
+| `mobile_feature_test.py` | 手机端新功能端到端测试（15 项） |
+
+### 仍需你确认/补充
+
+1. **IM 官方 HTTP 接口**（F2a 的完整实现）：需要 F12 Network 抓到的真实请求
+2. **问题分类三级名称**：访问 `http://[电脑IP]:8765/api/categories` 看抓到的一级分类；
+   若企业分类项与预期不符，把三级分类名填进 `config.json` 的 `close_category_options`
+3. **工单 ID 精确化**：目前用「URL → data-* → 选中项 → 玩家信息摘要」兜底；
+   有固定字段的话把 DOM 片段发我，可精确到字段级
+
+---
 *此文档由 AI Bug 排查 Agent 自动生成*

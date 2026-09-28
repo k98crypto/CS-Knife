@@ -67,7 +67,7 @@ class HUDOverlay:
                     init_pos = f"+{pos_data.get('x', 25)}+{pos_data.get('y', 25)}"
             except Exception: pass
 
-        self.root.geometry(f"460x240{init_pos}")
+        self.root.geometry(f"460x276{init_pos}")
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.92)
         self.root.overrideredirect(True)
@@ -84,7 +84,7 @@ class HUDOverlay:
 
         cheat_sheet = (
             "【操作指南】F9: 智能解答(免操作) | F10: 润色选中草稿\n"
-            "• F7: 一键后台提取当前工单并提炼出货 (免框选)\n"
+            "• F7/F8: 一键后台提取当前工单并提炼 (免框选)\n"
             "• F6: 将选中的图片/视频链接直接下载到桌面\n"
         )
         lbl_guide = tk.Label(top_frame, text=cheat_sheet, font=("Microsoft YaHei UI", 8),
@@ -96,8 +96,12 @@ class HUDOverlay:
         btn_close = tk.Button(top_frame, text=" ✕ ", font=("Microsoft YaHei UI", 9, "bold"), fg="#CCCCCC", bg="#252526", activebackground="#E81123", activeforeground="white", bd=0, relief="flat", cursor="hand2", command=self.close_app)
         btn_close.pack(side="right", anchor="ne", padx=4, pady=4)
 
-        self.lbl_profile = tk.Label(self.root, text="🚀 全面升级：支持后台免框选无感提取", font=("Microsoft YaHei UI", 9), fg="#CCCCCC", bg="#1E1E1E", anchor="w")
-        self.lbl_profile.pack(fill="x", padx=10, pady=(6, 1))
+        self.lbl_profile = tk.Label(self.root, text="最近提炼 / 框选预览：", font=("Microsoft YaHei UI", 8), fg="#808080", bg="#1E1E1E", anchor="w")
+        self.lbl_profile.pack(fill="x", padx=10, pady=(6, 0))
+
+        self.lbl_last = tk.Label(self.root, text="（尚无，按 F7/F8 提炼后在此核验）", font=("Microsoft YaHei UI", 9),
+                                 fg="#DCDCAA", bg="#1E1E1E", anchor="w", justify="left", wraplength=432)
+        self.lbl_last.pack(fill="x", padx=10, pady=(0, 4))
 
         self.lbl_status = tk.Label(self.root, text="⚡ 状态: 监听就绪", font=("Microsoft YaHei UI", 9, "bold"), fg="#4EC9B0", bg="#1E1E1E", anchor="w")
         self.lbl_status.pack(fill="x", padx=10, pady=(2, 6))
@@ -113,9 +117,11 @@ class HUDOverlay:
         except Exception: pass
     def close_app(self):
         self.save_position(); self.root.destroy(); os._exit(0)
-    def update_ui(self, status=None, status_color=None):
+    def update_ui(self, status=None, status_color=None, last=None, last_color=None):
         if status is not None: self.lbl_status.config(text=status)
         if status_color is not None: self.lbl_status.config(fg=status_color)
+        if last is not None: self.lbl_last.config(text=last)
+        if last_color is not None: self.lbl_last.config(fg=last_color)
 
 hud = None
 
@@ -171,7 +177,9 @@ def on_f7():
         final_report = f"{formatted_info}\n玩家问题：{summary}"
         pyperclip.copy(final_report)
         
-        if hud: hud.update_ui(status="✅ 汇报已组装至剪贴板！可直接粘贴", status_color="#4EC9B0")
+        if hud:
+            hud.update_ui(status="✅ 汇报已组装至剪贴板！可直接粘贴", status_color="#4EC9B0",
+                          last=f"[提炼] {' '.join(str(summary).split())[:120]}", last_color="#9CDCFE")
         beep_success()
     except Exception as e:
         if hud: hud.update_ui(status=f"❌ 自动提取异常: {str(e)[:20]}", status_color="#F44747")
@@ -223,6 +231,7 @@ def on_f9():
             return
 
         pyperclip.copy(reply)
+        if hud: hud.update_ui(last=f"[F9·{tag}] {' '.join(str(reply).split())[:120]}", last_color="#4EC9B0")
         time.sleep(0.1)
         keyboard.send('ctrl+v')
 
@@ -258,6 +267,7 @@ def on_f10():
             beep_error()
             return
         pyperclip.copy(final_reply)
+        if hud: hud.update_ui(last=f"[F10·润色] {' '.join(str(final_reply).split())[:120]}", last_color="#C586C0")
         time.sleep(0.1)
         keyboard.send('ctrl+v')
         if hud: hud.update_ui(status="✅ 话术已公关润色并自动替换", status_color="#4EC9B0")
@@ -268,6 +278,7 @@ def on_f10():
 def register_hotkeys():
     keyboard.add_hotkey('f6', lambda: threading.Thread(target=on_f6, daemon=True).start())
     keyboard.add_hotkey('f7', lambda: threading.Thread(target=on_f7, daemon=True).start())
+    keyboard.add_hotkey('f8', lambda: threading.Thread(target=on_f7, daemon=True).start())   # F8 = F7 别名（历史文档一直提到 F8）
     keyboard.add_hotkey('f9', lambda: threading.Thread(target=on_f9, daemon=True).start(), suppress=True)
     keyboard.add_hotkey('f10', lambda: threading.Thread(target=on_f10, daemon=True).start(), suppress=True)
     keyboard.wait()

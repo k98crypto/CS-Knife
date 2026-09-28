@@ -20,6 +20,12 @@ for _name in ("stdout", "stderr"):
             _stream.reconfigure(errors="replace")
         except Exception:
             pass
+
+try:
+    import rules_sync                     # 规章库自动同步（监听目录 / 直链拉取）
+except Exception:
+    rules_sync = None
+    print("[警告] rules_sync 模块加载失败，规章库自动同步将不可用")
 # ==================== 路径解析增强（修复打包后__file__失效问题） ====================
 def get_real_base_dir():
     """获取脚本/打包后的真实物理路径，免疫 PyInstaller 虚拟环境"""
@@ -56,6 +62,8 @@ def get_local_ip():
 state = {
     "afk_mode": False,
     "alarm_status": False,
+    "im_status": 1,                 # 1=IM在线 2=IM忙碌 3=IM离线（供手机端显示与远程切换）
+    "category_options": [],         # 从网页级联选择器抓到的真实问题分类（供 AI 选分类）
     "companies": { "main": { "name": "示例专线", "status": 1, "conversations": {} } }
 }
 active_clients = {"extension": set(), "mobile": set()}
@@ -186,6 +194,19 @@ HTML_CONTENT = """<!DOCTYPE html>
     .page-title { font-size: 19px; font-weight: 600; letter-spacing: .2px; }
     .afk-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; color: var(--text-secondary); background: #2A2B2D; padding: 6px 12px; border-radius: 999px; user-select: none; }
     .afk-toggle.active { background: rgba(168, 199, 250, 0.18); color: var(--accent); border: 1px solid var(--accent); }
+    .hdr-right { display: flex; align-items: center; gap: 6px; }
+    .status-menu { position: absolute; right: 14px; top: calc(var(--safe-top) + 46px); min-width: 136px; z-index: 200;
+                   background: var(--card-bg); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+                   display: none; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+    .status-menu.show { display: block; }
+    .status-item { padding: 11px 16px; font-size: 14px; color: var(--text-primary); border-bottom: 1px solid var(--line); }
+    .status-item:last-child { border-bottom: none; }
+    .status-item:active { background: #2A2B2D; }
+    #toast { position: fixed; left: 0; right: 0; bottom: calc(var(--safe-bottom) + 84px); margin: 0 auto;
+             width: fit-content; max-width: 86%; text-align: center; z-index: 300;
+             background: rgba(0,0,0,.86); color: #fff; font-size: 13px; padding: 9px 16px; border-radius: 999px;
+             opacity: 0; pointer-events: none; transition: opacity .2s; }
+    #toast.show { opacity: 1; }
     
     .view-container { flex: 1 1 auto; min-height: 0; position: relative; }
     .view { display: none; position: absolute; left: 0; right: 0; top: 0; bottom: 0; flex-direction: column; background: var(--bg); }
@@ -236,8 +257,17 @@ HTML_CONTENT = """<!DOCTYPE html>
   <div id="app">
   <header>
     <div class="page-title">Agent Workspace</div>
-    <div class="afk-toggle" id="afk-btn" onclick="toggleAFK()">🔒 半自动</div>
+    <div class="hdr-right">
+      <div class="afk-toggle" id="im-status-btn" onclick="toggleStatusMenu(event)">🟢 IM在线</div>
+      <div class="afk-toggle" id="afk-btn" onclick="toggleAFK()">🔒 半自动</div>
+    </div>
+    <div class="status-menu" id="status-menu">
+      <div class="status-item" onclick="setIMStatus(1)">🟢 IM 在线</div>
+      <div class="status-item" onclick="setIMStatus(2)">🟡 IM 忙碌</div>
+      <div class="status-item" onclick="setIMStatus(3)">🔴 IM 离线</div>
+    </div>
   </header>
+  <div id="toast"></div>
 
   <div class="view-container">
     <div class="view active" id="list-view"><div class="conv-list" id="conv-container"></div></div>
@@ -247,6 +277,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <div class="chat-title" id="chat-player-name" style="font-size:18px;">Player Name</div>
       </div>
       <div class="action-bar">
+        <button class="action-btn ai" onclick="execCommand('AI_CLOSE')">🤖 AI回复并关单</button>
         <button class="action-btn ai" onclick="execCommand('F9')">✨ AI起草(预览)</button>
         <button class="action-btn" onclick="execCommand('HANGUP')">⏸ 挂起</button>
         <button class="action-btn" onclick="execCommand('CLOSE')">✅ 关单</button>
@@ -311,6 +342,65 @@ HTML_CONTENT = """<!DOCTYPE html>
         document.getElementById('chat-view').classList.add('active');
     }
 
+    // ==================== 远程 IM 状态切换（在线 / 忙碌 / 离线） ====================
+    const IM_STATUS_TEXT = { 1: '🟢 IM在线', 2: '🟡 IM忙碌', 3: '🔴 IM离线' };
+
+    function renderIMStatus() {
+        const el = document.getElementById('im-status-btn');
+        if (!el) return;
+        const st = (globalState && globalState.im_status) || 1;
+        el.innerText = IM_STATUS_TEXT[st] || IM_STATUS_TEXT[1];
+        el.className = 'afk-toggle' + (st === 1 ? ' active' : '');
+    }
+
+    function toggleStatusMenu(ev) {
+        if (ev && ev.stopPropagation) ev.stopPropagation();
+        const m = document.getElementById('status-menu');
+        if (m) m.classList.toggle('show');
+    }
+
+    function setIMStatus(st) {
+        const m = document.getElementById('status-menu');
+        if (m) m.classList.remove('show');
+        if (!sendMsg({ action: 'SET_IM_STATUS', status: st })) {
+            toast('连接已断开，正在重连');
+            return;
+        }
+        toast('已切换为 ' + (IM_STATUS_TEXT[st] || ''));
+    }
+
+    document.addEventListener('click', () => {
+        const m = document.getElementById('status-menu');
+        if (m) m.classList.remove('show');
+    });
+
+    // ==================== 轻提示 ====================
+    let toastTimer = null;
+    function toast(msg) {
+        const el = document.getElementById('toast');
+        if (!el) return;
+        el.innerText = String(msg || '');
+        el.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+    }
+
+    // ==================== iOS 锁屏 / 退后台恢复后主动补拉 ====================
+    function resyncNow(reason) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            sendMsg({ action: 'REQUEST_SNAPSHOT' });   // 主动要一次最新快照，避免停留在几分钟前
+        } else {
+            wsAttempts = 0;                            // 立刻重连，不等指数退避
+            try { initWS(); } catch (e) {}
+        }
+    }
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) resyncNow('visibilitychange');
+    });
+    window.addEventListener('pageshow', () => resyncNow('pageshow'));
+    window.addEventListener('online', () => resyncNow('online'));
+    window.addEventListener('focus', () => resyncNow('focus'));
+
     function playMobileSiren() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (sirenInterval) return;
@@ -359,6 +449,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             // 若当前打开的会话已不存在（如被清理），自动退回列表
             if (activeGroupId && !getConv(activeGroupId)) { activeGroupId = null; showList(); }
             renderAll(); 
+            renderIMStatus();
             const btn = document.getElementById('afk-btn');
             if(globalState && globalState.afk_mode) { btn.className = 'afk-toggle active'; btn.innerText = '🚀 AFK 已接管'; }
             else { btn.className = 'afk-toggle'; btn.innerText = '🔒 电脑半自动'; }
@@ -367,6 +458,9 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
         else if (payload.type === 'FILL_DRAFT') {
             document.getElementById('chat-input').value = payload.content || '';
+        }
+        else if (payload.type === 'AI_STATUS') {
+            if (payload.message) toast(payload.message);   // 关单结果 / AI 状态提示
         }
       };
       ws.onerror = () => { /* 出错后浏览器会触发 onclose，由 onclose 统一调度重连 */ };
@@ -462,6 +556,15 @@ HTML_CONTENT = """<!DOCTYPE html>
           alert('连接已断开，正在重连，请稍后再试');
           return;
       }
+      if (cmd === 'AI_CLOSE') {
+          if (!confirm('AI 将自动选择问题分类并生成结束语，然后回复并关单。\n关单后该会话会从列表移除，确定继续？')) return;
+          if (!sendMsg({ action: 'AI_CLOSE', groupID: activeGroupId })) {
+              toast('连接已断开，正在重连');
+              return;
+          }
+          toast('AI 正在生成结束语…');
+          return;
+      }
       if (cmd === 'F9') {
           sendMsg({ action: 'TRIGGER_F9', groupID: activeGroupId });
       } else if (cmd === 'HANGUP') {
@@ -494,10 +597,23 @@ async def api_current_ticket(request):
 async def index_handler(request):
     return web.Response(text=HTML_CONTENT, content_type="text/html")
 
+
+async def api_categories(request):
+    """查看从网页级联选择器抓到的真实问题分类（便于配置 close_category_options）。"""
+    return web.json_response({
+        "options": state.get("category_options") or [],
+        "close_category_path": config.get("close_category_path"),
+        "close_category_default": config.get("close_category_default"),
+        "hint": "若 options 为空，请确认电脑端探针已连上，并已打开过一次工单（含问题分类选择器）",
+    })
+
 async def ws_ext_handler(request):
-    ws = web.WebSocketResponse()
+    # heartbeat=30：定期 ping，及时发现 iOS 退后台/网络抖动造成的死连接
+    ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     active_clients["extension"].add(ws)
+    # 探针一连上就请它回报网页上的真实问题分类（供手机端 AI 一键关单选分类）
+    await safe_send(ws, {"command": "REQUEST_CATEGORIES"})
     try:
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
@@ -520,10 +636,21 @@ async def ws_ext_handler(request):
                             _IM_AUTH_FP["value"] = fp
                             print(f"[OK] 探针认证头已更新：{len(headers_data)} 个字段（内容变更）")
                     continue  # 不回复探针，且绝不写入 state
-                
+
+                # 探针回报的问题分类（用于手机端 AI 自动选分类关单）
+                if ev == "CATEGORY_OPTIONS":
+                    opts = (pkt.get("data") or {}).get("options", [])
+                    if isinstance(opts, list) and opts:
+                        state["category_options"] = [str(o)[:40] for o in opts][:300]
+                        print(f"[分类] 已获取 {len(state['category_options'])} 个问题分类")
+                        for m in list(active_clients["mobile"]):
+                            await safe_send(m, {"type": "FULL_SYNC", "data": state})
+                    continue
+
                 if ev == "ABNORMAL_OFFLINE":
                     # 新增：异常掉线警报闭环
                     state["alarm_status"] = True
+                    state["im_status"] = 3
                     # 推送给手机端
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 推送 Bark 通知（P0 修复：缺失的 Bark 警报）
@@ -533,6 +660,7 @@ async def ws_ext_handler(request):
                     
                 elif ev == "ALARM_RECOVERED":
                     state["alarm_status"] = False
+                    state["im_status"] = 1
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 向探针发送确认回执
                     await ws.send_json({"command": "RECOVERY_CONFIRMED"})
@@ -588,8 +716,68 @@ async def ws_ext_handler(request):
         active_clients["extension"].discard(ws)
     return ws
 
+async def handle_ai_close(group_id: str):
+    """手机端「AI 回复并关单」。
+
+    流程：AI 选问题分类 + 生成结束语 -> 通知探针执行「回复并关单」-> 会话从列表移除。
+    任一步失败都会明确返回错误，绝不误删会话。
+    """
+    conv = state["companies"]["main"]["conversations"].get(group_id)
+    if not conv:
+        return False, "会话不存在（可能已关单）"
+
+    history_str = build_chat_history_str(group_id) or str(conv.get("playerInfo") or "") or "（无聊天记录）"
+    options = state.get("category_options") or config.get("close_category_options") or []
+
+    try:
+        category, content = await asyncio.get_event_loop().run_in_executor(
+            None, core.generate_closing, history_str, options)
+    except Exception as e:
+        return False, f"AI 生成失败: {e}"
+
+    if not content:
+        return False, "AI 未生成结束语，已取消关单"
+    if not active_clients["extension"]:
+        return False, "电脑端探针未连接，无法关单"
+
+    path = config.get("close_category_path") or ["一级分类", "二级分类"]
+    payload = {
+        "command": "ACTION_REPLY_CLOSE",
+        "content": content,
+        "category": category,
+        "categoryPath": path,
+        "groupID": group_id,
+    }
+    for ext in list(active_clients["extension"]):
+        await safe_send(ext, payload)
+
+    # 关单后从列表移除（对应需求：关单之后消息从列表消失）
+    name = conv.get("name") or group_id
+    state["companies"]["main"]["conversations"].pop(group_id, None)
+    if _LAST_ACTIVE.get("gid") == group_id:
+        _LAST_ACTIVE["gid"] = None
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "FULL_SYNC", "data": state})
+
+    push_bark("已回复并关单", f"{name}　分类：{category}　{content[:40]}", group_id)
+    print(f"[关单] {name} -> 分类「{category}」")
+    return True, category
+
+
+async def _ai_close_and_notify(gid: str):
+    try:
+        ok, info = await handle_ai_close(gid)
+    except Exception as e:
+        ok, info = False, f"关单异常: {e}"
+    msg = (f"已回复并关单 · 分类：{info}") if ok else str(info)
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "AI_STATUS", "groupID": gid,
+                            "status": "closed" if ok else "error", "message": msg})
+
+
 async def ws_mobile_handler(request):
-    ws = web.WebSocketResponse()
+    # heartbeat=30：手机退后台/锁屏时能尽快探活，配合前端重连即补拉快照
+    ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     active_clients["mobile"].add(ws)
     await ws.send_json({"type": "FULL_SYNC", "data": state})
@@ -603,7 +791,38 @@ async def ws_mobile_handler(request):
                 if not isinstance(pkt, dict):
                     continue
                 act = pkt.get("action")
-                
+
+                # 补拉快照：iOS 锁屏/退后台恢复后前端主动要一次最新状态，防止界面停留在几分钟前
+                if act == "REQUEST_SNAPSHOT":
+                    await safe_send(ws, {"type": "FULL_SYNC", "data": state})
+                    continue
+
+                # 远程切换 IM 状态：1=在线 2=忙碌 3=离线；切到在线时自动解除异常掉线警报
+                if act == "SET_IM_STATUS":
+                    try:
+                        st = int(pkt.get("status", 1))
+                    except Exception:
+                        st = 1
+                    if st not in (1, 2, 3):
+                        st = 1
+                    state["im_status"] = st
+                    if st == 1:
+                        state["alarm_status"] = False
+                    for ext in list(active_clients["extension"]):
+                        await safe_send(ext, {"command": "CHANGE_STATUS", "status": st})
+                        if st == 1:
+                            await safe_send(ext, {"command": "SILENCE_ALARM"})
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "FULL_SYNC", "data": state})
+                    continue
+
+                # AI 一键回复并关单（AI 选问题分类 + 生成结束语，关单后会话从列表消失）
+                if act == "AI_CLOSE":
+                    gid = pkt.get("groupID")
+                    if gid:
+                        asyncio.create_task(_ai_close_and_notify(gid))
+                    continue
+
                 if act == "TOGGLE_AFK":
                     state["afk_mode"] = pkt.get("status", False)
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
@@ -640,9 +859,55 @@ async def ws_mobile_handler(request):
         active_clients["mobile"].discard(ws)
     return ws
 
+# ==================== 后台任务 ====================
+async def rules_sync_loop():
+    """定时同步规章库（监听目录 / 直链拉取），并热重载知识库。
+
+    这样线上规章一变更，AI 答复就会自动跟上，不再需要手动下载或重启服务。
+    """
+    if rules_sync is None or not config.get("rules_auto_sync", True):
+        print("[规章库] 自动同步未开启（rules_auto_sync=false）")
+        return
+    interval = max(60, int(config.get("rules_sync_interval_minutes", 30)) * 60)
+    print(f"[规章库] 自动同步已开启：每 {interval // 60} 分钟检查一次")
+    while True:
+        try:
+            changed, message = await asyncio.get_event_loop().run_in_executor(
+                None, rules_sync.sync_once, core, config, False)
+            if changed:
+                print(f"[规章库] {message}")
+                push_bark("规章库已更新", message)
+        except Exception as e:
+            print(f"[规章库] 自动同步异常: {e}", file=sys.stderr)
+        await asyncio.sleep(interval)
+
+
+async def category_refresh_loop():
+    """定期让探针重新回报问题分类（运营可能调整页面分类项）。"""
+    while True:
+        await asyncio.sleep(600)
+        for ext in list(active_clients["extension"]):
+            await safe_send(ext, {"command": "REQUEST_CATEGORIES"})
+
+
+async def _on_startup(app):
+    app["rules_task"] = asyncio.create_task(rules_sync_loop())
+    app["cat_task"] = asyncio.create_task(category_refresh_loop())
+
+
+async def _on_cleanup(app):
+    for key in ("rules_task", "cat_task"):
+        task = app.get(key)
+        if task:
+            task.cancel()
+
+
 app = web.Application()
+app.on_startup.append(_on_startup)
+app.on_cleanup.append(_on_cleanup)
 app.router.add_get("/", index_handler)
 app.router.add_get("/api/ticket", api_current_ticket)
+app.router.add_get("/api/categories", api_categories)
 app.router.add_get("/ws/extension", ws_ext_handler)
 app.router.add_get("/ws/mobile", ws_mobile_handler)
 
