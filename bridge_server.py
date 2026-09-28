@@ -47,6 +47,13 @@ state = {
 }
 active_clients = {"extension": set(), "mobile": set()}
 
+# ==================== 探针认证头独立存放（安全隔离） ====================
+# 注意：绝对不能放进 state！
+# state 会被 FULL_SYNC 全量广播给手机端（共 10 处），放入 state 等于把 IM Token 泄露到手机浏览器。
+# 本变量仅供服务端内部使用，永不参与任何序列化/广播。
+IM_AUTH_HEADERS = {}
+_IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，避免重复覆盖与日志刷屏
+
 def push_bark(title, body, group_id):
     if not BARK_SERVER_URL or "YOUR_BARK_KEY" in BARK_SERVER_URL: return
     def _run():
@@ -315,14 +322,18 @@ async def ws_ext_handler(request):
             if msg.type == web.WSMsgType.TEXT:
                 pkt = json.loads(msg.data)
                 ev = pkt.get("event")
-                # 新增：处理 HEADERS_SYNC 事件（探针注入 Token）
+                # 处理 HEADERS_SYNC 事件（探针注入认证头）
                 if ev == "HEADERS_SYNC":
-                    # 存储 Token 供后续扩展使用（如直接调用 IM API）
                     headers_data = pkt.get("data", {})
-                    if headers_data:
-                        state["im_auth_headers"] = headers_data
-                        print(f"📑 收到探针 Token 注入：{len(headers_data)} 个请求头")
-                    continue  # 无需回复探针
+                    if isinstance(headers_data, dict) and headers_data:
+                        fp = json.dumps(headers_data, sort_keys=True)
+                        if fp != _IM_AUTH_FP["value"]:
+                            # 仅在内容真正变化时才更新（探针每次重连都会重发，避免重复覆盖与日志刷屏）
+                            IM_AUTH_HEADERS.clear()
+                            IM_AUTH_HEADERS.update(headers_data)
+                            _IM_AUTH_FP["value"] = fp
+                            print(f"🔑 探针认证头已更新：{len(headers_data)} 个字段（内容变更）")
+                    continue  # 不回复探针，且绝不写入 state
                 
                 if ev == "ABNORMAL_OFFLINE":
                     # 新增：异常掉线警报闭环
@@ -397,12 +408,6 @@ async def ws_mobile_handler(request):
                             "groupID": gid,
                             "content": text
                         })
-                elif act == "SEND_REPLY":
-                    gid = pkt.get("groupID")
-                    text = pkt.get("content")
-                    state["companies"]["main"]["conversations"][gid]["msgs"].append({"sender": "agent", "text": text, "time": datetime.now().strftime("%H:%M:%S")})
-                    for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
-                    for ext in list(active_clients["extension"]): await ext.send_json({"command": act, **pkt})
     finally:
         active_clients["mobile"].remove(ws)
     return ws

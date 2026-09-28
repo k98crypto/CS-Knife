@@ -175,4 +175,102 @@ node probe_smoke_test.js probe.js      # 功能冒烟测试（18 项）
 消息抓取与字段结构、内容去重、页面判断、下行指令容错、断线重连、HEADERS_SYNC 延迟发送。
 
 ---
+
+## 🔴 第三轮修复（2026/9/28）：P0 安全与业务阻塞项
+
+> 本轮采用「最小改动、风险最低」策略，仅修 P0。
+
+### P0-1: IM Token 被全量广播给手机端（安全泄露）
+
+- **文件**: `bridge_server.py`
+- **写入点**: 原第 323 行 `state["im_auth_headers"] = headers_data`
+- **泄露路径**: `state` 被 10 处 `FULL_SYNC` 整体推送给手机端（第 99/226/331/339/360/370/379/383/392/404 行）
+- **实测证据**（`token_leak_test.py`，真实启服 + 模拟探针/手机端）:
+
+```
+修复前:
+[2] 手机端收到 FULL_SYNC，长度 = 286
+    >>> ！！Token 泄露确认！！手机端拿到了探针的 IM 认证 Token
+    >>> 泄露上下文: "conversations": {}}}, "im_auth_headers": {"x-cs-token": "SECRET-TOKEN-...", "authorization": "Bearer S
+=== 结论: 存在 Token 泄露 ===
+```
+
+**放大因素**：① H5 走明文 `ws://`（可嗅探）② 每次状态变更都重推一遍（Token 雪球）③ 探针每次重连都重发 `HEADERS_SYNC` ④ 该字段全项目**只写不读**（100% 纯负债）
+
+**修复**：认证头改为独立全局 `IM_AUTH_HEADERS`，永不进入 `state`，且加指纹去重（内容未变化则不覆盖、不打日志）
+
+```
+修复后:
+[2] 手机端收到 FULL_SYNC，长度 = 157
+    >>> 未发现 Token（安全）
+    >>> 载荷是否含 'im_auth_headers' 字段: 否（正确）
+=== 结论: 无泄露 ===   (退出码 0)
+```
+
+去重验证：同内容连发 3 次 + 轮换 1 次 → 服务端仅打印 **2 行**「认证头已更新」
+
+---
+
+### P0-2: AI 接口报错被当作回复外发
+
+- **文件**: `agent_core.py:113,115`（原）
+- **问题**: `_call_deepseek` 失败时返回 `"[接口错误: xxx]"` / `"[网络异常: xxx]"`，因不含 `[TAG:xxx]`，被 `process_ticket_f9` 的 `else` 分支当作 `("NORMAL", 错误文本)` 返回
+- **后果**: `semi_runner.pyw:203-205` 会 `pyperclip.copy()` + `ctrl+v` 把报错粘进回复框；AFK 模式下 `bridge_server.py` 更是**直接发给玩家**
+
+**修复**：
+- `_call_deepseek` 失败一律返回 `""`，真实错误写入 `stderr` 供排查
+- `process_ticket_f9` 检测到空返回 → 返回专用标签 `("API_ERROR", "")`，不产出任何可发送内容
+- `semi_runner.pyw` 在 `on_f7` / `on_f9` / `on_f10` 三处加**安全闸**：空内容或 `API_ERROR` 时只提示、绝不粘贴
+
+---
+
+### P0-3: 疑难单分支永不触发（前后端协议断链）
+
+- **断裂点**:
+  - `agent_core.py:198` 指示 AI 输出 `【需走内部群核实，建议按 F8 上报群聊】`
+  - `bridge_server.py:87` / `semi_runner.pyw:218` 检查的却是 `"【规章库未收录"`
+- **次生 bug**: `sanitize_reply` 会把 `内部群` 改写成 `专人核实处理`，标记进一步变形为 `【需走专人核实处理核实，建议按 F8 上报群聊】`
+- **次生 bug**: 系统指导客服按 **F8**，但 `semi_runner.pyw:242-245` 只注册了 F6/F7/F9/F10，**F8 根本不存在**
+
+**修复**：
+- 新增统一标记常量 `HARD_CASE_MARKER = "【规章库未收录，请上报内部群核实】"`（前缀与前后端判定一致）
+- 新增 `_normalize_hard_case()`：在 `sanitize_reply` **之后**调用，用容错正则 `_HARD_CASE_RE` 把各种变体归一化为统一标记
+- 更新 prompt：要求 AI 第一行原样输出该标记，并明确禁止提及 F8 等快捷键
+- `bridge_server.py` / `semi_runner.pyw` **零改动**即恢复工作
+
+---
+
+### P0-4: 重复的 `SEND_REPLY` 分支（死代码）
+
+- **文件**: `bridge_server.py`（原第 400-405 行）
+- **问题**: 同一条件出现两个 `elif`，第二个永不执行，且未做 BUG-011 的字段过滤（仍用 `**pkt`）
+- **修复**: 删除重复分支；验证 `**pkt` 残留 = 0、`SEND_REPLY` 分支数 = 1
+
+---
+
+### 验证汇总
+
+```
+python -m py_compile bridge_server.py / agent_core.py / semi_runner.pyw / launcher.py   -> 全部 [OK]
+python agent_core_test.py        -> 16 通过 / 0 失败
+python token_leak_test.py        -> 无泄露（退出码 0）
+node --check probe.js            -> 退出码 0
+node probe_smoke_test.js probe.js -> 18 通过 / 0 失败
+```
+
+### 新增回归测试
+
+| 文件 | 用途 |
+|------|------|
+| `token_leak_test.py` | 启服 + 模拟探针/手机端，验证 Token 不进入广播载荷（含去重验证） |
+| `agent_core_test.py` | 验证疑难单标记归一化、AI 报错不外发、前后端契约一致性 |
+
+### 本轮**未**处理（P1/P2，留待后续）
+
+`HTML_CONTENT` 的 XSS（第 274 行 `innerHTML`）、H5 按钮无 `readyState` 检查、
+H5 无限重连无退避、`json.loads` 无 try、`conversations[gid]` / `m['sender']` 无 `.get()` 防御、
+emoji 在 stdout 重定向时崩溃、`push_bark` 的 `group_id` 参数未使用、
+`sanitize_reply` 的 `(?i)bug` 误伤 `debug`、DeepSeek 调用无重试等。
+
+---
 *此文档由 AI Bug 排查 Agent 自动生成*

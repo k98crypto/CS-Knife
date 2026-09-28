@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import random
 import logging
@@ -23,6 +24,14 @@ def load_config():
 _config = load_config()
 DEEPSEEK_API_KEY = _config.get("deepseek_api_key", "YOUR_DEEPSEEK_API_KEY")  # fallback 到旧值
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+
+# ==================== 疑难单统一标记（前后端唯一约定） ====================
+# 契约：只要回复文本中包含该标记，bridge_server / semi_runner 即判定为「规章库未收录」。
+# bridge_server.py 与 semi_runner.pyw 均以字符串 "【规章库未收录" 作为判定前缀，切勿改动前缀。
+HARD_CASE_MARKER = "【规章库未收录，请上报内部群核实】"
+
+# 容错：AI 历史上可能输出的各种变体（含 sanitize_reply 二次改写后的残形），统一归一化为上面的标记
+_HARD_CASE_RE = re.compile(r'【[^】]{0,40}(?:内部群|专人核实|上报群聊|F8)[^】]{0,40}】')
 
 class CustomerServiceCore:
     def __init__(self, api_key=DEEPSEEK_API_KEY):
@@ -109,10 +118,18 @@ class CustomerServiceCore:
         try:
             resp = requests.post(DEEPSEEK_API_URL, headers=self.headers, json=payload, timeout=20)
             if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip()
-            return f"[接口错误: {resp.status_code}]"
+                try:
+                    return resp.json()["choices"][0]["message"]["content"].strip()
+                except Exception as e:
+                    print(f"[agent_core] DeepSeek 响应解析失败: {e}", file=sys.stderr)
+                    return ""
+            # ★ 关键：失败时返回空字符串，绝不能把 "[接口错误: xxx]" 这类占位符当正文返回，
+            #   否则会被当成 NORMAL 回复粘贴进回复框 / 直接发给玩家。
+            print(f"[agent_core] DeepSeek 接口错误 HTTP {resp.status_code}", file=sys.stderr)
+            return ""
         except Exception as e:
-            return f"[网络异常: {e}]"
+            print(f"[agent_core] DeepSeek 网络异常: {e}", file=sys.stderr)
+            return ""
 
     def sanitize_reply(self, text: str) -> str:
         text = re.sub(r'(?i)bug', '异常情况', text)
@@ -121,6 +138,22 @@ class CustomerServiceCore:
         # 防呆隔离：严禁把“群内客服/内部群”字眼发给玩家
         text = re.sub(r'群内人工客服|群内客服|群里的人工|内部群', '专人核实处理', text)
         return text
+
+    def _normalize_hard_case(self, text: str) -> str:
+        """把 AI 输出的疑难单提示（各种变体）归一化为统一标记 HARD_CASE_MARKER。
+
+        必须在 sanitize_reply 之后调用：sanitize 会把 "内部群" 改写成 "专人核实处理"，
+        导致标记变形（如 【需走内部群核实，建议按 F8 上报群聊】 -> 【需走专人核实处理核实，...】），
+        进而使 bridge_server / semi_runner 的 "【规章库未收录" 判定永远失败。
+        """
+        if not text:
+            return text
+        # 仅当标记出现在开头附近（前 60 字）才认定为疑难单提示，避免误伤正文
+        head = text[:60]
+        m = _HARD_CASE_RE.search(head)
+        if not m:
+            return text
+        return text[:m.start()] + HARD_CASE_MARKER + text[m.end():]
 
     # ==================== 本地零 Token 预检器（修复发言人判定） ====================
     def try_local_prefilter(self, chat_history: str) -> tuple[str, str]:
@@ -195,7 +228,7 @@ class CustomerServiceCore:
             "【★ 核心铁律：内部群与玩家严格隔离】：\n"
             "群聊/内部核实是客服自己的工作群，玩家绝对无法接触内部群！\n"
             "严禁在回复中对玩家说'请联系群内人工客服'、'请进群'！\n"
-            "若遇到封禁无法登录自助注销、充值争议等特殊问题，回复给玩家的必须是：'该情况需要为您转交专人核实处理，请您提供相关账号信息，由工作人员协助您核实跟进'；若规章库未收录，在第一行给客服提示【需走内部群核实，建议按 F8 上报群聊】。\n\n"
+            "若遇到封禁无法登录自助注销、充值争议等特殊问题，回复给玩家的必须是：'该情况需要为您转交专人核实处理，请您提供相关账号信息，由工作人员协助您核实跟进'；若规章库未收录该问题，必须在回复的第一行原样输出【规章库未收录，请上报内部群核实】，第二行起才是给玩家的话术。严禁在话术中提及 F8 等快捷键或内部群字样。\n\n"
             "【分流判定规则】：\n"
             "1. 若工单刚接入/玩家未清晰描述异常（仅发了'客服？'、'在吗'）：输出 [TAG:GREETING_NO_DESC]\n"
             "2. 若玩家提了模糊问题，急需索要录屏/截图凭证：输出 [TAG:NEED_INFO]\n"
@@ -210,7 +243,10 @@ class CustomerServiceCore:
         )
 
         raw = self._call_deepseek(system_prompt, f"工单记录：\n{chat_history}")
-        clean = self.sanitize_reply(raw)
+        # ★ API 失败时 raw 为空：返回专门的标签，交给调用方提示，绝不产出可发送内容
+        if not raw:
+            return "API_ERROR", ""
+        clean = self._normalize_hard_case(self.sanitize_reply(raw))
 
         if "[TAG:GREETING_NO_DESC]" in clean:
             return "GREETING", random.choice(self.tpl_no_desc)

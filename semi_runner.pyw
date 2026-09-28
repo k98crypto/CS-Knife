@@ -151,6 +151,12 @@ def on_f7():
         msgs = data.get("msgs", [])
         chat_text = "\n".join([f"{'【玩家】' if m['sender']=='player' else '【客服】'}: {m['text']}" for m in msgs[-6:]])
         summary = core.summarize_player_issue(chat_text)
+
+        # ★ 安全闸：提炼失败时不输出半成品（避免把空内容粘给客服）
+        if not summary or not summary.strip():
+            if hud: hud.update_ui(status="❌ 提炼失败: AI 无返回", status_color="#F44747")
+            beep_error()
+            return
         
         final_report = f"{formatted_info}\n玩家问题：{summary}"
         pyperclip.copy(final_report)
@@ -200,6 +206,12 @@ def on_f9():
             beep_item()
             return
 
+        # ★ 安全闸：AI 接口异常 / 无内容时，严禁把报错占位符或空串粘贴进回复框
+        if tag == "API_ERROR" or not reply or not reply.strip():
+            if hud: hud.update_ui(status="❌ AI 未返回内容(接口异常)，已阻止粘贴", status_color="#F44747")
+            beep_error()
+            return
+
         pyperclip.copy(reply)
         time.sleep(0.1)
         keyboard.send('ctrl+v')
@@ -230,6 +242,11 @@ def on_f10():
     if hud: hud.update_ui(status="✨ 正在公关润色转译...", status_color="#DCDCAA")
     try:
         final_reply = core.polish_draft_or_instruction(current_ticket_context, text)
+        # ★ 安全闸：润色失败时不得用空内容覆盖客服的回复框
+        if not final_reply or not final_reply.strip():
+            if hud: hud.update_ui(status="❌ 润色失败: AI 无返回，已阻止粘贴", status_color="#F44747")
+            beep_error()
+            return
         pyperclip.copy(final_reply)
         time.sleep(0.1)
         keyboard.send('ctrl+v')

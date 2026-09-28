@@ -167,6 +167,12 @@ node --check probe.js
 
 # 油猴脚本功能冒烟测试（18 项，模拟浏览器环境，无需打开浏览器）
 node probe_smoke_test.js probe.js
+
+# 业务核心回归测试（疑难单标记归一化 / AI 报错不外发 / 前后端契约）
+python agent_core_test.py
+
+# Token 泄露回归测试（会临时启动 bridge_server 占用 8765 端口）
+python token_leak_test.py
 ```
 
 ### 打包为 EXE
