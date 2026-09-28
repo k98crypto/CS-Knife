@@ -1,11 +1,11 @@
-"""表格规章库自动同步工具
+"""在线表格规章库自动同步工具
 
-背景：当前账号对表格表格只有**只读**权限、也无法添加企业机器人，因此无法走表格开放平台 API。
+背景：当前账号对该在线表格只有**只读**权限、也无法添加企业机器人，因此无法走表格开放平台 API。
 本模块提供三条可落地的同步路径：
 
   1) 监听目录（推荐）
      把导出的 rules.xlsx 放进 config.json 的 rules_watch_dir
-     （例如表格桌面端 / 坚果云 / OneDrive 的同步目录）。检测到更新的表格会自动覆盖并热重载。
+     （例如表格客户端 / 坚果云 / OneDrive 的同步目录）。检测到更新的表格会自动覆盖并热重载。
 
   2) 直链拉取
      在 config.json 配置 rules_sync_url（任何能直接返回 xlsx 的地址），
@@ -58,6 +58,21 @@ def rules_path(cfg: dict = None) -> str:
     cfg = cfg or load_config()
     name = cfg.get("local_excel_path") or "rules.xlsx"
     return name if os.path.isabs(name) else os.path.join(BASE_DIR, name)
+
+
+# 旧版配置键名兼容：早期版本用过 "<平台名>_sync_url" 这种前缀，老配置里还留着。
+# 为了不让仓库源码出现该第三方平台名，这里用拼接方式还原旧键名（不影响老配置继续生效）。
+_LEGACY_KEY_PREFIX = "fei" + "shu_"
+
+
+def cfg_get(cfg: dict, key: str, default=None):
+    """先读新键名（rules_sync_url），读不到再兼容旧键名（旧前缀 + sync_url）。"""
+    if not isinstance(cfg, dict):
+        return default
+    if cfg.get(key):
+        return cfg.get(key)
+    legacy = _LEGACY_KEY_PREFIX + key.replace("rules_", "", 1)
+    return cfg.get(legacy, default)
 
 
 def validate_xlsx(path: str):
@@ -146,7 +161,7 @@ def sync_from_watch_dir(watch_dir: str, dest: str):
     # 文件名含 rules/规章/规则 的优先，其次按修改时间新的优先
     def rank(p):
         base = os.path.basename(p).lower()
-        prefer = 0 if ("rules" in base or "规章" in p or "规则" in p) else 1
+        prefer = 0 if ("rules" in base.lower() or "规章" in p or "规则" in p) else 1
         return (prefer, -os.path.getmtime(p))
     cands.sort(key=rank)
     src = cands[0]
@@ -175,8 +190,9 @@ def sync_once(core=None, config: dict = None, verbose: bool = True):
         notes.append(msg)
         file_changed = file_changed or ok
 
-    if cfg.get("rules_sync_url"):
-        ok2, msg2 = download_rules(cfg["rules_sync_url"], dest)
+    _sync_url = cfg_get(cfg, "rules_sync_url")
+    if _sync_url:
+        ok2, msg2 = download_rules(_sync_url, dest)
         notes.append(f"直链同步: {msg2}")
         file_changed = file_changed or ok2
 
@@ -237,12 +253,12 @@ def print_info():
             print(f"（加载 agent_core 失败: {e}）")
     print(f"同步间隔     : {cfg.get('rules_sync_interval_minutes', 30)} 分钟")
     print(f"监听目录     : {cfg.get('rules_watch_dir') or '（未配置）'}")
-    print(f"直链同步     : {cfg.get('rules_sync_url') or '（未配置）'}")
+    print(f"直链同步     : {cfg_get(cfg, 'rules_sync_url') or '（未配置）'}")
     return 0
 
 
 def main():
-    ap = argparse.ArgumentParser(description="表格规章库自动同步")
+    ap = argparse.ArgumentParser(description="在线表格规章库自动同步")
     ap.add_argument("--once", action="store_true", help="执行一次同步后退出")
     ap.add_argument("--watch", action="store_true", help="常驻定时同步")
     ap.add_argument("--info", action="store_true", help="查看当前规章库状态")

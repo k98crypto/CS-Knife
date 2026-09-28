@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         客服助手 - 智能工单探针 (V7.4 免框选与动作回执版)
+// @name         智能工单探针 (V7.4 免框选与动作回执版)
 // @namespace    http://tampermonkey.net/
 // @version      7.4
 // @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选
@@ -14,7 +14,7 @@
     'use strict';
 
     const PROBE_VERSION = "7.4";
-    console.log("🚀 [客服助手探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
+    console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
     // ==================== 可调参数（也可在控制台改 __probe.config.xxx） ====================

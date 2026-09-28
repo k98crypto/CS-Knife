@@ -10,8 +10,8 @@ import pandas as pd
 from datetime import datetime, timezone
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-RULES_FILE_PATH = os.path.join(CURRENT_DIR, "rules.xlsx")
 PATCH_FILE_PATH = os.path.join(CURRENT_DIR, "patch_rules.txt")
+LOCAL_PATCH_FILE_PATH = os.path.join(CURRENT_DIR, "patch_rules.local.txt")
 CONFIG_PATH = os.path.join(CURRENT_DIR, "config.json")
 
 # ==================== 从 config.json 读取敏感配置（修复 BUG-007） ====================
@@ -23,11 +23,41 @@ def load_config():
         return {}
 
 _config = load_config()
+
+
+def _resolve_rules_path():
+    """规章库文件定位：config.json 的 local_excel_path > rules.xlsx（推荐）> 旧文件名（兼容）"""
+    legacy = "fei" + "shu_rules.xlsx"      # 旧文件名仅为兼容老环境保留（仓库里不写全名）
+    for c in (_config.get("local_excel_path"), "rules.xlsx", legacy):
+        if not c:
+            continue
+        p = c if os.path.isabs(c) else os.path.join(CURRENT_DIR, c)
+        if os.path.exists(p):
+            return p
+    return os.path.join(CURRENT_DIR, _config.get("local_excel_path") or "rules.xlsx")
+
+
+RULES_FILE_PATH = _resolve_rules_path()
 # ★ 安全：**绝不把真实密钥写进代码**（仓库会推到 GitHub 上）。
 #   取值顺序：config.json -> 环境变量 DEEPSEEK_API_KEY；都没有就给空串，
 #   调用时由 _call_deepseek 给出"未配置"的明确提示，不会静默失败。
 DEEPSEEK_API_KEY = (_config.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+
+# ==================== 品牌 / 称谓（源码里只留通用词，真实值放本地 config.json） ====================
+# ★ 为什么这样设计：公司名、游戏名、玩家尊称、IM 系统名属于内部信息，不该出现在仓库源码里。
+#   运行时从 config.json 的 "brand" 段覆盖下面的通用默认值；没有 config.json 也能跑（用默认词）。
+BRAND = {
+    "company":   "示例公司",     # 公司名（H5 标题、自检页、日志）
+    "product":   "客服助手",     # 产品名（手机端 H5 品牌位）
+    "game":      "本游戏",       # 游戏名（写进 AI 提示词与兜底话术）
+    "im":        "IM 系统",      # IM 系统名（探针/诊断显示）
+    "honorific": "亲爱的玩家",   # 玩家的统一尊称（AI 提示词与兜底话术）
+}
+for _bk, _bv in (_config.get("brand") or {}).items():
+    if isinstance(_bv, str) and _bv.strip():
+        BRAND[_bk] = _bv.strip()
+HONORIFIC = BRAND["honorific"]
 
 # ==================== 疑难单统一标记（前后端唯一约定） ====================
 # 契约：只要回复文本中包含该标记，bridge_server / semi_runner 即判定为「规章库未收录」。
@@ -58,15 +88,17 @@ class CustomerServiceCore:
         self._kb_mtime = self.rules_mtime()
 
     def get_patch_rules(self) -> str:
-        if os.path.exists(PATCH_FILE_PATH):
-            try:
-                with open(PATCH_FILE_PATH, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if content:
-                    return f"---【个人补丁库与公关铁律】---\n{content}\n"
-            except Exception:
-                pass
-        return "---【公关铁律】---\n严禁承认BUG，严禁承诺补偿与修复时间。玩家统一尊称为【亲爱的玩家】。\n"
+        # 取用顺序：patch_rules.local.txt（本地私有，不入库）> patch_rules.txt（仓库里的通用示例）
+        for path in (LOCAL_PATCH_FILE_PATH, PATCH_FILE_PATH):
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        return f"---【个人补丁库与公关铁律】---\n{content}\n"
+                except Exception:
+                    pass
+        return f"---【公关铁律】---\n严禁承认BUG，严禁承诺补偿与修复时间。玩家统一尊称为【{HONORIFIC}】。\n"
 
     # ==================== 规章库解析（多工作表自适应） ====================
     _QA_KEYS = ("答案", "纯文本答案")
@@ -231,7 +263,7 @@ class CustomerServiceCore:
     def _fill_default_templates(self):
         """模板池保底：Excel 缺失/解析失败时仍能正常开场与关单。"""
         if not self.tpl_no_desc:
-            self.tpl_no_desc = ["亲爱的玩家，欢迎来到本游戏~ 请问有什么可以帮您？"]
+            self.tpl_no_desc = [f"{HONORIFIC}，欢迎来到{BRAND['game']}~ 请问有什么可以帮您？"]
         if not self.tpl_guide_info:
             self.tpl_guide_info = ["辛苦您提供一下录屏/截图，这边帮您进一步确认！"]
         if not self.tpl_closing_normal:
@@ -510,9 +542,9 @@ class CustomerServiceCore:
         patch = self.get_patch_rules()
 
         system_prompt = (
-            f"你是游戏《本游戏》官方客服核心中枢。玩家统一尊称为【亲爱的玩家】。当前 UTC 时间为：【{current_utc}】。\n\n"
+            f"你是游戏《{BRAND['game']}》官方客服核心中枢。玩家统一尊称为【{HONORIFIC}】。当前 UTC 时间为：【{current_utc}】。\n\n"
             "【★ 核心铁律：辨别谁是最后发言者】：\n"
-            "1. 客服消息特征：带有【客服】字样、带有【撤回】或【√√】标识、或以【亲爱的玩家】开头。\n"
+            f"1. 客服消息特征：带有【客服】字样、带有【撤回】或【√√】标识、或以【{HONORIFIC}】开头。\n"
             "2. 玩家消息特征：工单最底部的一句提问或描述，且该句话后面没有【客服】或【撤回】标。\n"
             "3. ★【绝对禁令 - 玩家发言严禁 WAITING】：\n"
             "   只要工单最底下一条消息是【玩家】发送的（无论玩家是刚刚发送还是过了多久），绝对严禁判定为 WAITING 或 TIMEOUT_CLOSE！必须输出标签 [TAG:NORMAL]，并给出具体的业务解答！\n\n"
@@ -530,7 +562,7 @@ class CustomerServiceCore:
             "4. 仅当最底下一条是【客服】发送，且距当前未满 2 小时：输出 [TAG:WAITING]\n"
             "5. 最底下一条是【玩家】发送的具体问题：输出 [TAG:NORMAL]，对照规章库正规解答。\n\n"
             f"{patch}\n"
-            f"---【表格官方规章库】---\n{self.build_kb_context(chat_history)}\n"
+            f"---【官方规章库】---\n{self.build_kb_context(chat_history)}\n"
         )
 
         raw = self._call_deepseek(system_prompt, f"工单记录：\n{chat_history}")
@@ -576,7 +608,7 @@ class CustomerServiceCore:
 
         patch = self.get_patch_rules()
         system_prompt = (
-            "你是游戏《本游戏》官方客服。玩家统一尊称为【亲爱的玩家】。\n"
+            f"你是游戏《{BRAND['game']}》官方客服。玩家统一尊称为【{HONORIFIC}】。\n"
             "现在需要为这通工单**收尾关单**。请严格只输出一行 JSON，"
             "不要任何额外说明、不要 Markdown 代码块围栏：\n"
             '{"category": "问题分类", "content": "给玩家的结束语"}\n'
@@ -586,7 +618,7 @@ class CustomerServiceCore:
             "3. 严禁提及'群内客服''内部群'，一律表述为'专人/工作人员为您跟进核实'。\n"
             f"4. {cat_hint}\n"
             f"{patch}"
-            f"---【表格官方规章库】---\n{self.build_kb_context(chat_history)}\n"
+            f"---【官方规章库】---\n{self.build_kb_context(chat_history)}\n"
         )
 
         raw = self._call_deepseek(system_prompt, f"工单记录：\n{chat_history}")
@@ -622,7 +654,7 @@ class CustomerServiceCore:
     def polish_draft_or_instruction(self, chat_context: str, raw_draft: str) -> str:
         patch = self.get_patch_rules()
         system_prompt = (
-            "你是游戏《本游戏》资深公关客服。玩家称谓必须统一为【亲爱的玩家】。\n"
+            f"你是游戏《{BRAND['game']}》资深公关客服。玩家称谓必须统一为【{HONORIFIC}】。\n"
             "你的任务是将选中的【客服粗略草稿】或【群内领导粗话批示】，扩充润色为通顺体面、温柔严谨的官方回复。\n"
             "严禁对玩家提及'群内客服'或'内部群'，一律表述为'专人/工作人员为您跟进核实'。\n"
             f"{patch}\n"

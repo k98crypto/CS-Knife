@@ -111,8 +111,8 @@ async def main():
         check("脚本声明的版本与预期一致", f"@version      {TEST_VER}" in js)
         check("脚本含自检握手 PROBE_HELLO", "PROBE_HELLO" in js)
         check("脚本含页面内状态胶囊", "ensureChip" in js and "探针 v" in js)
-        check("挂载 .com 备用域名与 @noframes",
-              "ticket.example.com/*" in js and "@noframes" in js)
+        check("声明了 @match 命中域名与 @noframes",
+              "// @match" in js and "@noframes" in js)
 
         # ---------- 4. 探针握手 -> 后端可查 ----------
         print("\n[4] 探针握手 PROBE_HELLO -> /api/diag 可查版本")

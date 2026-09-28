@@ -107,7 +107,7 @@ del B.state["companies"]["main"]["conversations"][conv_id]
 
 print("\n[5] 表格里没答案时的安抚话术与告警")
 check("安抚话术就是客服指定的原话",
-      B.HOLD_TEXT == "亲爱的玩家，您的问题我已经收到啦，正在为您查询相关信息，请稍等片刻哦~", B.HOLD_TEXT)
+      B.HOLD_TEXT.startswith(B.HONORIFIC) and "您的问题我已经收到啦，正在为您查询相关信息" in B.HOLD_TEXT, B.HOLD_TEXT)
 check("告警队列已就绪（桌面 HUD 轮询 /api/diag.alerts）", isinstance(B.state.get("human_alerts"), list))
 check("中继暴露了延迟参数给手机端/诊断页",
       "auto_delay_min" in B.state and "auto_delay_max" in B.state,

@@ -3,10 +3,10 @@
   "bark_key": "YOUR_BARK_KEY",
   "deepseek_api_key": "sk-YOUR_DEEPSEEK_API_KEY",
 
+  "_说明_同步": "表格直链同步（可选）：任何能直接返回 xlsx 的地址；留空则只用本地文件/watch 目录",
   "rules_sync_url": "",
-  "rules_app_token": "YOUR_APP_TOKEN",
-  "rules_sheet_id": "YOUR_SHEET_ID",
-  "rules_access_token": "YOUR_RULES_ACCESS_TOKEN",
+  "rules_sheet_id": "",
+  "rules_app_token": "",
 
   "use_local_excel": true,
   "local_excel_path": "rules.xlsx",
@@ -23,5 +23,14 @@
   "close_category_path": ["一级分类", "二级分类"],
   "close_category_default": "其他",
 
-  "im_proxy_enabled": true
+  "im_proxy_enabled": true,
+
+  "_说明_brand": "品牌/称谓（可选）。仓库源码里只有通用默认词，把你自己的公司名/游戏名/玩家尊称写在这里即可，代码运行时自动替换。",
+  "brand": {
+    "company": "示例公司",
+    "product": "客服助手",
+    "game": "本游戏",
+    "im": "IM 系统",
+    "honorific": "亲爱的玩家"
+  }
 }

@@ -46,7 +46,7 @@ except Exception:
     config = {"port": 8765, "bark_key": "YOUR_BARK_KEY"}
 
 try:
-    from agent_core import CustomerServiceCore
+    from agent_core import CustomerServiceCore, BRAND, HONORIFIC
     core = CustomerServiceCore()
 except ImportError:
     print("[错误] 无法导入 agent_core.py，服务无法启动")
@@ -79,7 +79,7 @@ state = {
     "probe_version": "",            # 探针（油猴脚本）版本号，来自 PROBE_HELLO/PROBE_HEARTBEAT
     "probe_last_seen": 0,           # 探针最近一次心跳时间戳（秒），手机端可据此判断新鲜度
     "category_options": [],         # 从网页级联选择器抓到的真实问题分类（供 AI 选分类）
-    "companies": { "main": { "name": "示例专线", "status": 1, "conversations": {} } }
+    "companies": { "main": { "name": f"{BRAND['company']} 专线", "status": 1, "conversations": {} } }
 }
 
 # ==================== IM 状态记忆（重启后不再"自己变回在线"） ====================
@@ -216,13 +216,15 @@ state["auto_delay_min"] = int(AUTO_DELAY_MIN)
 state["auto_delay_max"] = int(AUTO_DELAY_MAX)
 
 # 表格里查不到答案时，先给玩家这句安抚话术（严格照客服给的原话）
-HOLD_TEXT = "亲爱的玩家，您的问题我已经收到啦，正在为您查询相关信息，请稍等片刻哦~"
+HOLD_TEXT = f"{HONORIFIC}，您的问题我已经收到啦，正在为您查询相关信息，请稍等片刻哦~"
 
 _PENDING = {}          # gid -> asyncio.Task：正在等待"玩家说完"的延迟回复
 
 
 def _pending_tasks_snapshot():
-    return {"pending": len(_PENDING), "gids": list(_PENDING.keys())[:10]}
+    # 列表放宽到 50：测试/排障时同一进程里可能积压多个等待中的任务，
+    # 只取前 10 个会让"新排队的会话"看不到（曾导致测试误判）。
+    return {"pending": len(_PENDING), "gids": list(_PENDING.keys())[:50]}
 
 
 def pick_reply_delay():
@@ -244,7 +246,7 @@ def pick_greeting():
             return random.choice(pool)
     except Exception:
         pass
-    return "亲爱的玩家，欢迎来到本游戏~ 请问有什么可以帮您？"
+    return f"{HONORIFIC}，欢迎来到{BRAND['game']}~ 请问有什么可以帮您？"
 
 
 def last_player_ts(conv):
@@ -602,7 +604,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#0B0C0E">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <title>客服助手 · 客服台</title>
+  <title>客服台</title>
   <style>
     :root{
       --bg:#0B0C0E; --bg-soft:#101216; --card:#16181D; --card-2:#1D2026;
@@ -772,7 +774,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <div class="brand">
           <div class="brand-logo">⚡</div>
           <div class="brand-txt">
-            <div class="brand-name">客服助手 · 客服台</div>
+            <div class="brand-name">客服台</div>
             <div class="brand-sub" id="brand-sub">正在连接中继…</div>
           </div>
         </div>
@@ -1631,7 +1633,7 @@ DIAG_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="5">
-<title>示例公司 系统自检</title>
+<title>系统自检</title>
 <style>
  body{margin:0;padding:16px;background:#0F1115;color:#E6E6E6;
       font:15px/1.6 -apple-system,"Microsoft YaHei UI",system-ui,sans-serif}
@@ -1644,7 +1646,7 @@ DIAG_HTML = """<!DOCTYPE html>
  .row:last-child{border-bottom:none}
  a{color:#63B3ED}
 </style></head><body>
-<h1>🩺 示例公司 系统自检 <span class="k">（每 5 秒自动刷新）</span></h1>
+<h1>🩺 系统自检 <span class="k">（每 5 秒自动刷新）</span></h1>
 $CARDS
 <p class="k">探针未连接？看手册第 12.2 节：确认 Tampermonkey 里贴的是最新
 <a href="/probe.js">probe.js</a>（v$EXPECT_VER）且脚本已启用，然后刷新工作台页面。</p>
@@ -1905,7 +1907,11 @@ async def ws_ext_handler(request):
                     # ★★ 自动回复节奏（V7.4）★★
                     # ① 玩家**第一次**发来消息 -> 立刻发一条开场语（严格取表格话术）
                     # ② 之后不秒回：等 1~3 分钟（随机），期间再来消息就重新计时，确认不说了才回复
-                    if not c.get("greeted"):
+                    # ⚠️ V7.4 修复：只有"快照里确实有玩家发言"时才发开场语。
+                    #    探针可能只推送一次空快照/状态同步（messages 为空），
+                    #    若不加这道护栏就会出现"玩家一句话没说，却先收到开场语"的诡异现象。
+                    has_player_msg = any(m.get("sender") == "player" for m in (c.get("msgs") or []))
+                    if has_player_msg and not c.get("greeted"):
                         c["greeted"] = True
                         if config.get("auto_send_greeting", True) and (
                                 state.get("afk_mode") or state.get("auto_draft", True)):

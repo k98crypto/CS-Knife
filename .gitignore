@@ -124,8 +124,6 @@ mode_state.json
 *.sqlite3
 *.xls
 *.xlsx
-# 排除规章库（如果需要版本控制）
-!rules.xlsx
 
 # ==================== Jupyter Notebook ====================
 .ipynb_checkpoints
@@ -138,3 +136,16 @@ dmypy.json
 # 临时/提交信息文件（不要入库）
 _cm.txt
 _push_log.txt
+
+# ==================== 隐私/内部资料（必须忽略，绝不上传） ====================
+# 个人补丁库（真实公关铁律，含内部称谓）：优先于 patch_rules.txt 加载
+patch_rules.local.txt
+
+# 规章库表格（含内部话术与数据，请自行放本地）
+*.xlsx
+*.xls
+
+# 内部文档（仅本地保留）
+*_SETUP_GUIDE.md
+GIT_*.md
+LAUNCHER_*.md

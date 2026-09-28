@@ -589,7 +589,7 @@ function check(name, ok, extra) {
     check('连上即发 PROBE_HELLO 握手（后端 /api/diag 可查版本）',
         hello.length >= 1 && hello[0].data.version === EXPECT_VER,
         JSON.stringify(hello[0] ? hello[0].data : null));
-    check('PROBE_HELLO 携带页面地址', !!hello.length && String(hello[0].data.page).indexOf('ticket-web') !== -1,
+    check('PROBE_HELLO 携带页面地址', !!hello.length && String(hello[0].data.page).indexOf('ticket.example.com') !== -1,
         hello.length ? hello[0].data.page : 'none');
 
     sent.length = 0;

@@ -58,7 +58,7 @@
 一个**半自动 / 全自动的游戏客服助手**，跑在你自己电脑上：
 
 - 从客服工作台网页**实时抓取玩家工单**
-- 用 AI（DeepSeek）对照**表格规章库**生成合规回复
+- 用 AI（DeepSeek）对照**官方规章库**生成合规回复
 - 电脑上按热键即可**一键出话术**，不用手打
 - 手机上能**远程看工单、改状态、代回复、一键关单**
 
@@ -167,7 +167,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ### 3.4 准备规章库
 
-把表格表格导出为 Excel，命名为 **`rules.xlsx`**，放到项目根目录（和 `launcher.bat` 同一层）。
+把在线表格导出为 Excel，命名为 **`rules.xlsx`**，放到项目根目录（和 `launcher.bat` 同一层）。
 
 > 当前规章库含 13 个工作表、800+ 条规则，系统会自动全部解析。
 
@@ -221,7 +221,7 @@ python rules_sync.py --info -v
 4. `Ctrl + S` 保存
 5. 确认脚本已启用（状态为绿色）
 
-脚本只在 `ticket.example.com` 生效，不会影响其他网站。
+脚本只在 `你的工单域名` 生效，不会影响其他网站。
 
 > **更省事的方式（推荐）**：中继服务启动后，浏览器直接打开
 > **`http://127.0.0.1:8765/probe.js`** —— 这就是项目里最新的脚本全文，
@@ -260,8 +260,8 @@ python rules_sync.py --info -v
 探针脚本: http://127.0.0.1:8765/probe.js （核对油猴里那版是否最新 v7.4）
 ============================================================
 [规章库] 自动同步已开启：每 30 分钟检查一次
-[探针] ✅ 已连接 · 来源: https://ticket.example.com/...
-[探针] 🚀 握手成功：v7.4 · https://ticket.example.com/imChat/workstation
+[探针] ✅ 已连接 · 来源: https://你的工单域名/...
+[探针] 🚀 握手成功：v7.4 · https://你的工单域名/imChat/workstation
 ======== Running on http://0.0.0.0:8765 ========
 ```
 
@@ -496,6 +496,34 @@ F9 是最常用的功能，它会自动判断工单状态：
 > 出厂禁词表在 `agent_core.py` 的 `OUTBOUND_RULES` / `FORBIDDEN_OUTBOUND`，你可以自己加词。
 > 回归测试 `python auto_reply_test.py`（第 7 节）+ `python mobile_feature_test.py`（第 8 节）会验证"零禁词"。
 
+### 5.6 品牌与称谓可配置（仓库源码里不写内部词）
+
+仓库是公开的，所以**源码里只有通用词**（`示例公司` / `客服助手` / `本游戏` / `亲爱的玩家` / `IM 系统`）。
+你自己真实的公司名、产品名、游戏名、玩家尊称，全部写在**本地 `config.json` 的 `brand` 段**里（该文件不入库）：
+
+```json
+"brand": {
+  "company":   "你的公司名",
+  "product":   "你的产品名",
+  "game":      "你的游戏名",
+  "im":        "你的 IM 系统名",
+  "honorific": "你对玩家的统一尊称"
+}
+```
+
+生效范围：AI 提示词里的游戏名与称谓、开场语/安抚话术/兜底话术、手机端 H5 标题、自检页标题、AI 关单结束语。
+**不配也能跑**（就用上面的通用词），配了就整体替换 —— 改完**重启中继与 HUD** 生效。
+
+同理，**个人补丁库**走两条路（同名文件优先、未被 git 跟踪）：
+
+| 文件 | 用途 | 是否入库 |
+|------|------|----------|
+| `patch_rules.local.txt` | 你的真实公关铁律 / 内部话术（推荐写这里） | ❌ 不入库（.gitignore） |
+| `patch_rules.txt` | 仓库自带的**通用示例**，没写 local 文件时才用它 | ✅ 入库 |
+
+> 想确认仓库里没有内部词：`git grep -nE "内部禁用词1|内部禁用词2"`（把词换成你要查的），或直接看
+> `.gitignore` 里列出的"隐私/内部资料"清单 —— 规章库 xlsx、个人补丁库、内部搭建文档都不会上传。
+
 ### 6.1 打开
 
 用 iPhone Safari 访问启动时显示的地址（手机必须连同一个 WiFi）：
@@ -514,7 +542,7 @@ Safari 底部「分享」→ 添加到主屏幕 → 命名为「客服助手」
 
 ```
 ┌──────────────────────────────────────────────┐
-│ ⚡ 客服助手 · 客服台   ●IM 在线 ▾  ●半自动 ▾ │  ← 两个自绘下拉（点开是底部选择面板）
+│ ⚡ 客服台   ●IM 在线 ▾  ●半自动 ▾ │  ← 两个自绘下拉（点开是底部选择面板）
 │ ● 中继 已连接  ● 电脑探针 v7.4  ● 3 个会话    │  ← 连接状态条
 ├──────────────────────────────────────────────┤
 │ (乙)  玩家乙                    14:23         │
@@ -680,7 +708,7 @@ AFK 模式下：
 
 **以后每次更新只需两步**：
 
-1. 表格表格 → 导出为 Excel
+1. 在线表格 → 导出为 Excel
 2. 把文件丢进那个目录
 
 系统每 30 分钟检查一次，发现有更新会自动：
@@ -928,7 +956,8 @@ http://192.168.x.x:8765/api/categories
 | `auto_reply_delay_max_sec` | `180` | 最多等多少秒（与上一项组成 1~3 分钟随机；都设 0 = 立即回） |
 | `auto_send_greeting` | `true` | 玩家**第一条**消息时自动发开场语（取自话术库「没有描述问题」那一类） |
 | `mobile_mode_priority_sec` | `600` | **手机端优先窗口**：这段时间内电脑小窗改回复模式会被拒绝（以手机端为准），过后小窗可自由切 |
-| `rules_app_token` / `rules_sheet_id` | — | 表格表格标识（备查，当前未走 API） |
+| `rules_sheet_id` / `rules_app_token` | — | 在线表格标识（可选，仅备查） |
+| `brand` | 通用占位词 | **品牌/称谓**：公司名、产品名、游戏名、IM 系统名、玩家尊称（真实值只写本地 `config.json`，源码里是通用词）—— 见 5.6 |
 
 ---
 
@@ -1078,7 +1107,7 @@ http://192.168.x.x:8765/api/categories
 **第二步：确认脚本是否加载**（工作台页面按 `F12` 打开控制台）：
 
 ```
-🚀 [客服助手探针 V7.3] 真实靶点定位系统与防暴雷机制已就绪！
+🚀 [工单探针 V7.3] 真实靶点定位系统与防暴雷机制已就绪！
 ✅ [探针] WebSocket 连接成功
 ```
 
@@ -1325,17 +1354,22 @@ Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Select ProcessId,Co
 
 | 文件 | 重要性 | 说明 |
 |------|--------|------|
-| `config.json` | ⭐⭐⭐ | 含 API 密钥，**丢失需重配** |
-| `rules.xlsx` | ⭐⭐⭐ | 规章库（可从表格重新导出） |
-| `patch_rules.txt` | ⭐⭐ | 个人补丁库 / 公关铁律 |
+| `config.json` | ⭐⭐⭐ | 含 API 密钥与 `brand` 品牌称谓，**丢失需重配** |
+| 规章库 xlsx | ⭐⭐⭐ | 你在 `local_excel_path` 里指定的那个文件（默认 `rules.xlsx`），可从在线表格重新导出 |
+| `patch_rules.local.txt` | ⭐⭐ | 个人补丁库 / 公关铁律（**不入库**，务必自己备份） |
+| `patch_rules.txt` | ⭐ | 仓库自带的通用示例（只有没写 local 文件时才生效） |
 | 修改过的源码 | ⭐⭐ | 建议用 Git 管理（见 13.4） |
+
+> 上面标 ⭐⭐⭐/⭐⭐ 的文件都在 `.gitignore` 的"隐私/内部资料"清单里 —— **git 不会上传它们**，
+> 所以换电脑/重装时只能靠这份备份，别只依赖仓库。
 
 一键备份（PowerShell）：
 
 ```powershell
 $d = "备份\$(Get-Date -Format yyyyMMdd)"
 New-Item -ItemType Directory -Force -Path $d | Out-Null
-Copy-Item config.json, rules.xlsx, patch_rules.txt $d
+Copy-Item config.json, patch_rules.local.txt $d -ErrorAction SilentlyContinue
+Copy-Item (Get-ChildItem *.xlsx | Select-Object -First 1) $d -ErrorAction SilentlyContinue
 ```
 
 ### 13.2 日常巡检（建议每周）

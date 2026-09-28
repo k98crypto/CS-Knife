@@ -289,7 +289,7 @@ async def main():
         _, ext3_msgs = await drain(ext3, 0.5, tries=4)
         greets = [m for m in ext3_msgs if m.get("command") == "SEND_REPLY"]
         check("玩家第一条消息 -> 立刻发开场语（来自表格）",
-              bool(greets) and "玩家" in str(greets[-1].get("content")), str(greets[:1]))
+              bool(greets) and ("亲" in str(greets[-1].get("content"))), str(greets[:1]))
         info1 = await auto_info()
         check("这条会话已排队延迟回复（不是秒回）",
               gid2 in (info1.get("pending_gids") or []), str(info1.get("pending_gids")))
