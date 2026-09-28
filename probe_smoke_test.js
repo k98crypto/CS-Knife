@@ -63,6 +63,9 @@ function makeEl(text, classes) {
 
 let statusText = 'IM在线';
 let bubbles = [];
+let playerInfoText = '玩家A\nUID:12345';
+let ticketIdAttr = '';                       // 模拟页面上真实工单号（data-ticket-id）
+let pageUrl = 'https://ticket.example.com/workbench';
 
 const documentStub = {
     readyState: 'complete',
@@ -70,7 +73,12 @@ const documentStub = {
     addEventListener: () => {},
     createElement: () => ({}),
     querySelector: sel => {
-        if (sel === '.ws-right-panel') return { innerText: '玩家A\nUID:12345' };
+        if (sel === '.ws-right-panel') return { innerText: playerInfoText };
+        if (sel === '[data-ticket-id]') {
+            return ticketIdAttr
+                ? { getAttribute: () => ticketIdAttr }
+                : null;
+        }
         return null;
     },
     querySelectorAll: sel => {
@@ -86,9 +94,12 @@ const windowStub = {
     document: documentStub
 };
 
+const locationStub = { get href() { return pageUrl; } };
+
 const sandbox = {
     window: windowStub,
     document: documentStub,
+    location: locationStub,
     console,
     WebSocket: FakeWebSocket,
     Headers: class {},
@@ -165,7 +176,9 @@ function check(name, ok, extra) {
             d.messages[0].sender === 'player' && d.messages[1].sender === 'agent',
             JSON.stringify(d.messages.map(m => m.sender)));
         check('  playerInfo 已提取', d.playerInfo.indexOf('玩家A') !== -1, JSON.stringify(d.playerInfo));
-        check('  groupID 字段存在', d.groupID === '当前工单', d.groupID);
+        check('  groupID 已不再硬编码为"当前工单"', d.groupID !== '当前工单', d.groupID);
+        check('  groupID 非空', typeof d.groupID === 'string' && d.groupID.length > 0);
+        check('  name 字段已上报', !!d.name, JSON.stringify(d.name));
     }
 
     // 8) 相同内容不重复上报
@@ -177,6 +190,57 @@ function check(name, ok, extra) {
     bubbles.push(makeEl('我充值也没到账', ['from-player']));
     intervals[1]();
     check('内容变化后重新上报', sent.length === before2 + 1, '新增=' + (sent.length - before2));
+
+    // 9.5) 工单身份识别：不同玩家必须得到不同标识，否则手机端永远只有一个会话
+    console.log('\n[7] 工单身份识别（多玩家区分）');
+    function resetAndReport() {
+        sandbox.window._lastChatHash = undefined;
+        sent.length = 0;
+        intervals[1]();
+        const hits = sent.filter(s => s.event === 'PLAYER_MESSAGE');
+        return hits.length ? hits[0].data : null;
+    }
+
+    // 7a. URL 带工单号 -> 直接采用
+    pageUrl = 'https://ticket.example.com/workbench?ticketId=TKT-URL-001';
+    ticketIdAttr = '';
+    playerInfoText = '玩家甲\nUID:1001';
+    bubbles = [makeEl('我卡在登录界面了', ['from-player'])];
+    let r = resetAndReport();
+    check('URL 中的工单号被采用', !!r && r.groupID === 'TKT-URL-001', r && r.groupID);
+
+    // 7b. DOM 的 data-ticket-id -> 采用
+    pageUrl = 'https://ticket.example.com/workbench';
+    ticketIdAttr = 'TKT-DOM-777';
+    r = resetAndReport();
+    check('DOM 的 data-ticket-id 被采用', !!r && r.groupID === 'TKT-DOM-777', r && r.groupID);
+
+    // 7c. 都没有 -> 用玩家信息生成兜底标识
+    ticketIdAttr = '';
+    playerInfoText = '玩家甲\nUID:1001';
+    bubbles = [makeEl('我卡在登录界面了', ['from-player'])];
+    r = resetAndReport();
+    const gidA = r && r.groupID;
+    check('无工单号时生成兜底标识', !!gidA && gidA.charAt(0) === 'P', gidA);
+
+    // 7d. 同一玩家追加消息 -> 标识保持稳定
+    bubbles = [makeEl('我卡在登录界面了', ['from-player']), makeEl('还是不行', ['from-player'])];
+    r = resetAndReport();
+    check('同一玩家标识保持稳定', !!r && r.groupID === gidA, r && r.groupID);
+
+    // 7e. 换玩家 -> 标识必须不同（这是"不再覆盖旧会话"的关键）
+    playerInfoText = '玩家乙\nUID:2002';
+    bubbles = [makeEl('我的钻石没到账', ['from-player'])];
+    r = resetAndReport();
+    const gidB = r && r.groupID;
+    check('不同玩家得到不同标识', !!gidB && gidB !== gidA, gidA + '  vs  ' + gidB);
+
+    // 7f. 玩家名随消息上报，供手机端当会话名
+    check('玩家名已随消息上报', !!r && r.name === '玩家乙', r && JSON.stringify(r.name));
+
+    // 恢复默认环境，避免影响后续用例
+    pageUrl = 'https://ticket.example.com/workbench';
+    playerInfoText = '玩家A\nUID:12345';
 
     // 10) 非工作台页面不抓取
     documentStub.body.innerText = '其他页面';

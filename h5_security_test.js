@@ -173,5 +173,55 @@ let threw3 = null;
 try { wsInst.onmessage({ data: 'not-a-json' }); } catch (e) { threw3 = e.message; }
 check('非法 JSON 下行消息不抛异常', threw3 === null, threw3 || '');
 
+console.log('\n[7] 多会话（微信式好友列表）');
+function fullSync(convs) {
+    onmsg({ type: 'FULL_SYNC', data: { afk_mode: false, alarm_status: false,
+        companies: { main: { conversations: convs } } } });
+}
+const nowMs = Date.now();
+fullSync({
+    'T-1': { name: '玩家甲', updatedAt: nowMs - 300000, msgs: [{ sender: 'player', text: '甲的问题', ts: nowMs - 300000 }] },
+    'T-2': { name: '玩家乙', updatedAt: nowMs - 10000,  msgs: [{ sender: 'agent',  text: '乙的回复', ts: nowMs - 10000 }] },
+    'T-3': { name: '玩家丙', updatedAt: nowMs - 60000,  msgs: [{ sender: 'player', text: '丙的问题', ts: nowMs - 60000 }] }
+});
+const listHtml = els['conv-container'].innerHTML;
+const cardCount = (listHtml.match(/data-gid=/g) || []).length;
+check('主页同时显示全部 3 个会话（不再只剩一个）', cardCount === 3, '卡片数=' + cardCount);
+check('三个玩家名都出现在列表中',
+    listHtml.indexOf('玩家甲') !== -1 && listHtml.indexOf('玩家乙') !== -1 && listHtml.indexOf('玩家丙') !== -1);
+const pT2 = listHtml.indexOf('玩家乙'), pT3 = listHtml.indexOf('玩家丙'), pT1 = listHtml.indexOf('玩家甲');
+check('按最近活动倒序排列（乙 → 丙 → 甲）', pT2 < pT3 && pT3 < pT1, `乙@${pT2} 丙@${pT3} 甲@${pT1}`);
+check('玩家发来且未打开的会话显示未读点', (listHtml.match(/unread-dot/g) || []).length >= 1);
+check('旧会话的消息没有被新会话覆盖',
+    listHtml.indexOf('甲的问题') !== -1 && listHtml.indexOf('丙的问题') !== -1);
+
+// 打开其中一个，其余必须保留
+const cards3 = els['conv-container']._cards || [];
+check('解析出 3 张会话卡片', cards3.length === 3, '数量=' + cards3.length);
+if (cards3.length === 3) {
+    cards3[2]._click();                    // 倒序后第 3 张 = 玩家甲
+    check('打开某个会话后，其余会话仍在列表里',
+        ((els['conv-container'].innerHTML.match(/data-gid=/g) || []).length) === 3);
+    check('打开后切到聊天页', els['chat-view'].classList.contains('active'));
+    check('打开后列表页隐藏', !els['list-view'].classList.contains('active'));
+    check('聊天页标题为对应玩家', els['chat-player-name'].innerText === '玩家甲', els['chat-player-name'].innerText);
+    const stream2 = els['chat-stream'].innerHTML;
+    check('加载了该玩家的聊天记录', stream2.indexOf('甲的问题') !== -1);
+    check('聊天记录显示时间', stream2.indexOf('msg-time') !== -1);
+    check('打开后返回列表仍保留全部会话', (function () {
+        sandbox.popChat();
+        return ((els['conv-container'].innerHTML.match(/data-gid=/g) || []).length) === 3
+            && els['list-view'].classList.contains('active');
+    })());
+}
+
+console.log('\n[8] 布局与滚动（静态检查）');
+check('已移除 transform 滑动（iOS 文字发虚的元凶）', py.indexOf('transform: translateX') === -1);
+check('页面用 fixed 锁定视口（内容不再滑到浏览器工具栏下方）', /#app\s*\{[^}]*position:\s*fixed/.test(py));
+check('会话列表是独立滚动容器', /\.conv-list\s*\{[^}]*overflow-y:\s*auto/.test(py));
+check('聊天记录是独立滚动容器', /\.chat-stream\s*\{[^}]*overflow-y:\s*auto/.test(py));
+check('页面切换改用 display 而非 transform', py.indexOf('.view.active { display: flex; }') !== -1);
+check('弹性高度用 min-height:0 收敛（保证内部能滚动）', (py.match(/min-height:\s*0/g) || []).length >= 3);
+
 console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
 process.exit(fail === 0 ? 0 : 1);

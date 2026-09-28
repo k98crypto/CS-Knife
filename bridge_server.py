@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import asyncio
 import socket
 import urllib.request
@@ -69,6 +70,19 @@ _IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，�
 # 最近一次有消息活动的工单 ID（供 /api/ticket 定位"当前工单"，比按插入顺序取最后一个更准）
 _LAST_ACTIVE = {"gid": None}
 
+
+async def safe_send(client, payload):
+    """向单个客户端发送；失败（对端已断开）时静默忽略并剔除该连接。
+
+    避免一个失效连接抛异常打断整个广播循环，导致其他客户端收不到更新。
+    """
+    try:
+        await client.send_json(payload)
+    except Exception:
+        for _group in active_clients.values():
+            _group.discard(client)
+
+
 def push_bark(title, body, group_id=""):
     """推送 Bark 通知。
 
@@ -121,15 +135,15 @@ async def handle_ai_automation(group_id: str):
     if tag == "WAITING":
         # 新增：向手机端推送 WAITING 状态（修复 BUG-020）
         for m in list(active_clients["mobile"]):
-            await m.send_json({"type": "AI_STATUS", "groupID": group_id, "status": "waiting", "message": "等待玩家回复中"})
+            await safe_send(m, {"type": "AI_STATUS", "groupID": group_id, "status": "waiting", "message": "等待玩家回复中"})
         return
 
     if "【规章库未收录" in reply:
         if state["afk_mode"]:
-            for ext in list(active_clients["extension"]): await ext.send_json({"command": "ACTION_HANGUP", "groupID": group_id})
+            for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "ACTION_HANGUP", "groupID": group_id})
             push_bark("🚨 疑难单等待接入", "请在手机端介入处理", group_id)
         else:
-            for ext in list(active_clients["extension"]): await ext.send_json({"command": "FILL_DRAFT", "content": reply})
+            for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "FILL_DRAFT", "content": reply})
         return
 
     if reply:
@@ -139,18 +153,20 @@ async def handle_ai_automation(group_id: str):
                 group_id, {"name": group_id, "msgs": []})
             if not isinstance(conv.get("msgs"), list):
                 conv["msgs"] = []
-            conv["msgs"].append({"sender": "agent", "text": reply, "time": now_str})
+            conv["msgs"].append({"sender": "agent", "text": reply, "time": now_str,
+                                 "ts": int(time.time() * 1000)})
+            conv["updatedAt"] = int(time.time() * 1000)
             _LAST_ACTIVE["gid"] = group_id
-            for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
+            for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
 
             if "TIMEOUT_CLOSE" in tag:
-                for ext in list(active_clients["extension"]): await ext.send_json({"command": "ACTION_REPLY_CLOSE", "category": "其他", "content": reply, "groupID": group_id})
+                for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "ACTION_REPLY_CLOSE", "category": "其他", "content": reply, "groupID": group_id})
             else:
-                for ext in list(active_clients["extension"]): await ext.send_json({"command": "SEND_REPLY", "content": reply, "groupID": group_id})
+                for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "SEND_REPLY", "content": reply, "groupID": group_id})
         else:
             # 半自动模式：草稿推到网页与手机输入框
-            for ext in list(active_clients["extension"]): await ext.send_json({"command": "FILL_DRAFT", "content": reply, "category": "其他"})
-            for m in list(active_clients["mobile"]): await m.send_json({"type": "FILL_DRAFT", "content": reply})
+            for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "FILL_DRAFT", "content": reply, "category": "其他"})
+            for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": reply})
 
 
 # ================= 手机端 H5 界面 =================
@@ -160,45 +176,54 @@ HTML_CONTENT = """<!DOCTYPE html>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Agent Workspace</title>
   <style>
-    :root { --bg: #131314; --card-bg: #1E1F20; --surface-variant: #444746; --text-primary: #E3E3E3; --text-secondary: #C4C7C5; --accent: #A8C7FA; --safe-top: env(safe-area-inset-top, 24px); --safe-bottom: env(safe-area-inset-bottom, 24px); }
+    :root { --bg: #131314; --card-bg: #1E1F20; --line: #2C2D2F; --text-primary: #E3E3E3; --text-secondary: #9AA0A6; --accent: #A8C7FA; --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px); }
     * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-    body { font-family: 'Google Sans', -apple-system, sans-serif; background: var(--bg); color: var(--text-primary); height: 100vh; overflow: hidden; display: flex; flex-direction: column; -webkit-overflow-scrolling: touch; }
-    header { padding: calc(var(--safe-top) + 12px) 20px 16px 20px; display: flex; justify-content: space-between; align-items: center; background: #131314; border-bottom: 1px solid #333; z-index: 10;}
-    .page-title { font-size: 20px; font-weight: 500; }
-    .afk-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: bold; color: var(--text-secondary); background: #333; padding: 6px 12px; border-radius: 20px; }
-    .afk-toggle.active { background: rgba(168, 199, 250, 0.2); color: var(--accent); border: 1px solid var(--accent); }
+    html, body { height: 100%; }
+    body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text-primary); -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; overflow: hidden; }
+    #app { position: fixed; left: 0; right: 0; top: 0; bottom: 0; display: flex; flex-direction: column; overflow: hidden; }
+    @supports (height: 100dvh) { #app { height: 100dvh; } }
+    header { flex: 0 0 auto; padding: calc(var(--safe-top) + 10px) 16px 12px; display: flex; justify-content: space-between; align-items: center; background: var(--bg); border-bottom: 1px solid var(--line); }
+    .page-title { font-size: 19px; font-weight: 600; letter-spacing: .2px; }
+    .afk-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; color: var(--text-secondary); background: #2A2B2D; padding: 6px 12px; border-radius: 999px; user-select: none; }
+    .afk-toggle.active { background: rgba(168, 199, 250, 0.18); color: var(--accent); border: 1px solid var(--accent); }
     
-    .view-container { position: relative; flex: 1; overflow: hidden; }
-    .view { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; background: var(--bg); transition: transform 0.3s ease; }
-    #chat-view { transform: translateX(100%); z-index: 100; }
-    #chat-view.active { transform: translateX(0); }
-    .conv-list { flex: 1; overflow-y: auto; padding: 8px 16px; -webkit-overflow-scrolling: touch; }
-    .conv-card { padding: 16px; margin-bottom: 8px; border-radius: 16px; background: var(--card-bg); display: flex; gap: 16px; align-items: center; }
-    .avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #1A73E8, #A8C7FA); display: flex; align-items: center; justify-content: center; font-weight: bold; color: #131314; }
-    .conv-meta { flex: 1; overflow: hidden; }
-    .conv-name { font-size: 16px; margin-bottom: 4px; color: var(--text-primary); }
-    .conv-lastmsg { font-size: 14px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .view-container { flex: 1 1 auto; min-height: 0; position: relative; }
+    .view { display: none; position: absolute; left: 0; right: 0; top: 0; bottom: 0; flex-direction: column; background: var(--bg); }
+    .view.active { display: flex; }
+    .conv-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; touch-action: pan-y; padding-bottom: calc(var(--safe-bottom) + 12px); }
+    .conv-card { display: flex; gap: 12px; align-items: center; padding: 12px 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
+    .conv-card:active { background: #1B1C1E; }
+    .avatar { flex: 0 0 auto; width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, #1A73E8, #A8C7FA); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 17px; color: #131314; }
+    .conv-body { flex: 1 1 auto; min-width: 0; }
+    .conv-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    .conv-name { font-size: 16px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .conv-time { flex: 0 0 auto; font-size: 12px; color: var(--text-secondary); }
+    .conv-lastmsg { margin-top: 3px; font-size: 13px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .unread-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #FF5A5F; margin-left: 6px; vertical-align: middle; }
+    .conv-empty { padding: 56px 24px; text-align: center; color: #6B7075; font-size: 14px; line-height: 1.9; }
     
-    .chat-nav { padding: calc(var(--safe-top) + 8px) 16px 12px 16px; display: flex; align-items: center; gap: 16px; background: var(--card-bg); }
-    .back-btn { background: none; border: none; color: var(--accent); font-size: 24px; cursor: pointer; }
+    .chat-nav { flex: 0 0 auto; padding: calc(var(--safe-top) + 6px) 12px 10px; display: flex; align-items: center; gap: 10px; background: var(--card-bg); border-bottom: 1px solid var(--line); }
+    .back-btn { flex: 0 0 auto; background: none; border: none; color: var(--accent); font-size: 22px; padding: 4px 8px; }
+    .chat-title { flex: 1 1 auto; min-width: 0; font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     
-    .action-bar { display: flex; gap: 8px; padding: 10px 16px; background: var(--card-bg); border-bottom: 1px solid #333; overflow-x: auto; white-space: nowrap; }
-    .action-btn { flex-shrink: 0; padding: 8px 14px; border-radius: 18px; border: 1px solid #444; background: var(--bg); color: var(--text-primary); font-size: 13px; font-weight: 500; cursor: pointer; }
+    .action-bar { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 12px; background: var(--card-bg); border-bottom: 1px solid var(--line); overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .action-btn { flex: 0 0 auto; padding: 7px 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--text-primary); font-size: 13px; }
     .action-btn.ai { color: var(--accent); border-color: var(--accent); background: rgba(168,199,250,0.1); }
     
-    .chat-stream { flex: 1; overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 24px; -webkit-overflow-scrolling: touch; }
+    .chat-stream { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; touch-action: pan-y; padding: 14px 12px 18px; display: flex; flex-direction: column; gap: 12px; }
     .msg-row { display: flex; flex-direction: column; width: 100%; }
     .msg-row.player { align-items: flex-start; } 
     .msg-row.agent { align-items: flex-end; }
-    .msg-bubble { max-width: 80%; padding: 12px 16px; font-size: 15px; line-height: 1.5; border-radius: 18px; word-break: break-word; }
+    .msg-bubble { max-width: 78%; padding: 10px 14px; font-size: 15px; line-height: 1.5; border-radius: 16px; word-break: break-word; white-space: pre-wrap; }
+    .msg-time { margin-top: 4px; font-size: 11px; color: var(--text-secondary); }
     .msg-row.player .msg-bubble { background: #282A2C; color: #E3E3E3; border-bottom-left-radius: 4px; }
     .msg-row.agent .msg-bubble { background: #1A73E8; color: #FFFFFF; border-bottom-right-radius: 4px; }
     
-    .input-bar { padding: 12px 16px calc(var(--safe-bottom) + 12px) 16px; background: var(--card-bg); display: flex; gap: 12px; align-items: center;}
-    .chat-text-input { flex: 1; background: var(--bg); border: 1px solid #444; border-radius: 24px; padding: 10px 16px; color: white; font-size: 15px; outline: none; }
-    .send-btn { width: 40px; height: 40px; border-radius: 50%; background: var(--accent); border: none; display: flex; align-items: center; justify-content: center; font-weight:bold; }
+    .input-bar { flex: 0 0 auto; padding: 10px 12px calc(var(--safe-bottom) + 10px); background: var(--card-bg); display: flex; gap: 10px; align-items: center; border-top: 1px solid var(--line); }
+    .chat-text-input { flex: 1 1 auto; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 10px 16px; color: #fff; font-size: 15px; outline: none; }
+    .send-btn { flex: 0 0 auto; width: 40px; height: 40px; border-radius: 50%; background: var(--accent); border: none; color: #131314; font-size: 18px; font-weight: 700; }
     
-    #alarm-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(180, 0, 0, 0.9); z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+    #alarm-overlay { position: fixed; left: 0; right: 0; top: 0; bottom: 0; background: rgba(180, 0, 0, 0.92); z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.2s; }
     #alarm-overlay.active { opacity: 1; pointer-events: auto; }
     .alarm-title { font-size: 28px; font-weight: bold; color: white; margin-bottom: 20px; animation: blink 1s infinite; }
     .silence-btn { background: white; color: red; font-size: 18px; font-weight: bold; padding: 12px 32px; border-radius: 24px; border: none; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
@@ -208,13 +233,14 @@ HTML_CONTENT = """<!DOCTYPE html>
 <body>
   <div id="alarm-overlay"><div class="alarm-title">🚨 异常掉线警报 🚨</div><div style="color:white; margin-bottom: 40px;">VPN 或网页网络连接断开</div><button class="silence-btn" onclick="silenceAlarm()">点击静音并忽略</button></div>
 
+  <div id="app">
   <header>
-    <div class="page-title">✨ Workspace</div>
+    <div class="page-title">Agent Workspace</div>
     <div class="afk-toggle" id="afk-btn" onclick="toggleAFK()">🔒 半自动</div>
   </header>
 
   <div class="view-container">
-    <div class="view" id="list-view"><div class="conv-list" id="conv-container"></div></div>
+    <div class="view active" id="list-view"><div class="conv-list" id="conv-container"></div></div>
     <div class="view" id="chat-view">
       <div class="chat-nav">
         <button class="back-btn" onclick="popChat()">←</button>
@@ -231,6 +257,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <button class="send-btn" onclick="execCommand('SEND')">↑</button>
       </div>
     </div>
+  </div>
   </div>
 
   <script>
@@ -251,6 +278,37 @@ HTML_CONTENT = """<!DOCTYPE html>
             try { ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
         }
         return false;
+    }
+
+    // 取会话表（带防御，结构异常时不会报错）
+    function getConvs() {
+        const c = globalState && globalState.companies && globalState.companies['main'];
+        return (c && c.conversations) || {};
+    }
+    function getConv(gid) {
+        if (!gid) return null;
+        return getConvs()[gid] || null;
+    }
+
+    // 时间显示：今天显示 HH:MM，其它日期显示 M/D（微信式）
+    function fmtTime(ts) {
+        if (!ts) return '';
+        const d = new Date(Number(ts));
+        if (isNaN(d.getTime())) return '';
+        const now = new Date();
+        const p = n => (n < 10 ? '0' + n : '' + n);
+        if (d.toDateString() === now.toDateString()) return p(d.getHours()) + ':' + p(d.getMinutes());
+        return (d.getMonth() + 1) + '/' + d.getDate();
+    }
+
+    // 页面切换（列表 / 会话）：用 class 控制 display，不用 transform（避免 iOS 文字发虚）
+    function showList() {
+        document.getElementById('list-view').classList.add('active');
+        document.getElementById('chat-view').classList.remove('active');
+    }
+    function showChat() {
+        document.getElementById('list-view').classList.remove('active');
+        document.getElementById('chat-view').classList.add('active');
     }
 
     function playMobileSiren() {
@@ -297,7 +355,9 @@ HTML_CONTENT = """<!DOCTYPE html>
         try { payload = JSON.parse(e.data); } catch (err) { return; }   // 脏包不打断脚本
         if (!payload) return;
         if (payload.type === 'FULL_SYNC') { 
-            globalState = payload.data; 
+            globalState = payload.data || null;
+            // 若当前打开的会话已不存在（如被清理），自动退回列表
+            if (activeGroupId && !getConv(activeGroupId)) { activeGroupId = null; showList(); }
             renderAll(); 
             const btn = document.getElementById('afk-btn');
             if(globalState && globalState.afk_mode) { btn.className = 'afk-toggle active'; btn.innerText = '🚀 AFK 已接管'; }
@@ -320,20 +380,39 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     function renderAll() {
       if (!globalState) return;
-      const compData = globalState.companies['main'];
+      const compData = globalState.companies['main'] || {};
       const container = document.getElementById('conv-container');
-      const keys = Object.keys(compData.conversations || {});
-      if(keys.length === 0) { container.innerHTML = '<div style="text-align:center; padding: 40px; color: #666;">暂无会话</div>'; return; }
+      const convs = compData.conversations || {};
+      // 按最后活动时间倒序：最近有新消息的排最前（像微信会话列表）
+      const keys = Object.keys(convs).sort((a, b) => {
+        const ta = (convs[a] && convs[a].updatedAt) || 0;
+        const tb = (convs[b] && convs[b].updatedAt) || 0;
+        return tb - ta;
+      });
+      if (keys.length === 0) {
+        container.innerHTML = '<div class="conv-empty">暂无会话<br>请在电脑端打开玩家工单</div>';
+        return;
+      }
       
       container.innerHTML = keys.map(gid => {
-        const c = compData.conversations[gid] || {};
+        const c = convs[gid] || {};
         const msgs = Array.isArray(c.msgs) ? c.msgs : [];
-        const lastMsg = msgs.length > 0 ? (msgs[msgs.length - 1] || {}).text : '...';
+        const last = msgs.length > 0 ? (msgs[msgs.length - 1] || {}) : null;
         const name = c.name || gid;
+        const preview = (last && last.text) ? last.text : '（暂无消息）';
+        const time = fmtTime((last && last.ts) || c.updatedAt);
+        // 未读标记：最后一条是玩家发的，且不是当前正在看的会话
+        const unread = !!(last && last.sender === 'player' && gid !== activeGroupId);
         // 全部走 esc() 转义；gid 改用 data-* 传递，避免内联 onclick 属性逃逸
         return `<div class="conv-card" data-gid="${esc(gid)}">
             <div class="avatar">${esc(String(name).charAt(0) || '玩')}</div>
-            <div class="conv-meta"><div class="conv-name">${esc(name)}</div><div class="conv-lastmsg">${esc(lastMsg || '...')}</div></div>
+            <div class="conv-body">
+              <div class="conv-top">
+                <div class="conv-name">${esc(name)}${unread ? '<span class="unread-dot"></span>' : ''}</div>
+                <div class="conv-time">${esc(time)}</div>
+              </div>
+              <div class="conv-lastmsg">${esc(preview)}</div>
+            </div>
           </div>`;
       }).join('');
 
@@ -342,30 +421,37 @@ HTML_CONTENT = """<!DOCTYPE html>
         el.addEventListener('click', () => pushChat(el.dataset.gid));
       });
       
-      if (activeGroupId && compData.conversations[activeGroupId]) renderChatStream(compData.conversations[activeGroupId]);
+      if (activeGroupId && getConv(activeGroupId)) renderChatStream(getConv(activeGroupId));
     }
 
     function pushChat(gid) {
-      if (!globalState || !gid) return;
-      const conv = globalState.companies['main'].conversations[gid];
+      const conv = getConv(gid);
       if (!conv) return;
       activeGroupId = gid;
       document.getElementById('chat-player-name').innerText = conv.name || gid;
-      renderChatStream(conv); document.getElementById('chat-view').classList.add('active');
+      renderChatStream(conv);
+      showChat();
+      renderAll();                 // 刷新列表（清掉该会话的未读点）
     }
 
-    function popChat() { activeGroupId = null; document.getElementById('chat-view').classList.remove('active'); }
+    function popChat() {
+      activeGroupId = null;
+      showList();
+      renderAll();
+    }
 
     function renderChatStream(conv) {
       const stream = document.getElementById('chat-stream');
       const currentScroll = stream.scrollTop;
       const isAtBottom = (stream.scrollHeight - stream.clientHeight) <= currentScroll + 20;
       
-      const rows = Array.isArray(conv.msgs) ? conv.msgs : [];
+      const rows = (conv && Array.isArray(conv.msgs)) ? conv.msgs : [];
+      if (rows.length === 0) { stream.innerHTML = '<div class="conv-empty">暂无消息</div>'; return; }
       // sender 仅允许 player/agent，防止通过 class 注入；text 全量转义，防存储型 XSS
       stream.innerHTML = rows.map(m => {
         const who = (m && m.sender === 'player') ? 'player' : 'agent';
-        return `<div class="msg-row ${who}"><div class="msg-bubble">${esc((m || {}).text)}</div></div>`;
+        const t = (m && m.ts) ? `<div class="msg-time">${esc(fmtTime(m.ts))}</div>` : '';
+        return `<div class="msg-row ${who}"><div class="msg-bubble">${esc((m || {}).text)}</div>${t}</div>`;
       }).join('');
       if (isAtBottom) stream.scrollTop = stream.scrollHeight;
     }
@@ -439,7 +525,7 @@ async def ws_ext_handler(request):
                     # 新增：异常掉线警报闭环
                     state["alarm_status"] = True
                     # 推送给手机端
-                    for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
+                    for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 推送 Bark 通知（P0 修复：缺失的 Bark 警报）
                     push_bark("🚨 异常掉线警报", "VPN 或网页网络连接断开，请立即检查！")
                     # 向探针发送确认回执（修复 BUG-002：防止重复上报）
@@ -447,7 +533,7 @@ async def ws_ext_handler(request):
                     
                 elif ev == "ALARM_RECOVERED":
                     state["alarm_status"] = False
-                    for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
+                    for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 向探针发送确认回执
                     await ws.send_json({"command": "RECOVERY_CONFIRMED"})
                     
@@ -455,29 +541,48 @@ async def ws_ext_handler(request):
                     payload = pkt.get("data", {})
                     gid = payload.get("groupID")
                     
-                    # 修复 BUG-005：清理旧会话数据，防止无限膨胀
                     target = state["companies"]["main"]
-                    # 限制会话数量为最新的 20 个
-                    if len(target["conversations"]) >= 20:
-                        # 删除最旧的会话
-                        oldest_gid = next(iter(target["conversations"]))
-                        del target["conversations"][oldest_gid]
-                        print(f"[清理] 移除最早会话：{oldest_gid}")
+                    # 会话上限 50，超出时淘汰"最久没有新消息"的那个（而不是最早创建的），避免误删活跃工单
+                    if len(target["conversations"]) >= 50:
+                        oldest_gid = min(target["conversations"],
+                                         key=lambda k: target["conversations"][k].get("updatedAt") or 0)
+                        if oldest_gid != gid:
+                            del target["conversations"][oldest_gid]
+                            print(f"[清理] 移除最久未活动的会话：{oldest_gid}")
                     
                     if not gid:
                         continue
-                    c = target["conversations"].setdefault(
-                        gid, {"name": str(payload.get("playerInfo", "玩家")).split('|')[0][:6], "msgs": []})
+                    # 会话名称：优先用探针传来的玩家名，其次从 playerInfo 首段推断
+                    name = str(payload.get("name") or "").strip()[:20]
+                    if not name:
+                        name = str(payload.get("playerInfo", "")).split('|')[0].strip()[:12] or "玩家"
+
+                    c = target["conversations"].setdefault(gid, {"name": name, "msgs": [], "updatedAt": 0})
+                    c["name"] = name                       # 每次都刷新名称，不再只在首次写入
                     raw_msgs = payload.get("messages", [])
-                    # 覆盖数组杜绝雪球；同时过滤脏数据（非 dict / 缺 text），避免下游 KeyError
+                    now_ms = int(time.time() * 1000)
+                    # 覆盖数组杜绝雪球；过滤脏数据；并为每条消息补时间戳（保留已有消息的原时间）
                     if isinstance(raw_msgs, list):
-                        c["msgs"] = [m for m in raw_msgs if isinstance(m, dict) and m.get("text")]
+                        prev_ts = {}
+                        for pm in (c.get("msgs") or []):
+                            if isinstance(pm, dict):
+                                prev_ts[(pm.get("sender"), pm.get("text"))] = pm.get("ts")
+                        cleaned = []
+                        for m in raw_msgs:
+                            if not (isinstance(m, dict) and m.get("text")):
+                                continue
+                            sender = m.get("sender") if m.get("sender") in ("player", "agent") else "agent"
+                            key = (sender, m.get("text"))
+                            cleaned.append({"sender": sender, "text": m.get("text"),
+                                            "ts": prev_ts.get(key) or now_ms})
+                        c["msgs"] = cleaned
                     else:
                         c["msgs"] = []
                     c["playerInfo"] = payload.get("playerInfo", "")
+                    c["updatedAt"] = now_ms
                     _LAST_ACTIVE["gid"] = gid
                     
-                    for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
+                    for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     asyncio.create_task(handle_ai_automation(gid))
     finally:
         active_clients["extension"].discard(ws)
@@ -501,15 +606,15 @@ async def ws_mobile_handler(request):
                 
                 if act == "TOGGLE_AFK":
                     state["afk_mode"] = pkt.get("status", False)
-                    for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
+                    for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                 elif act == "SILENCE_ALARM":
                     state["alarm_status"] = False
-                    for ext in list(active_clients["extension"]): await ext.send_json({"command": "SILENCE_ALARM"})
-                    for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
+                    for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "SILENCE_ALARM"})
+                    for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                 elif act == "TRIGGER_F9":
                     asyncio.create_task(handle_ai_automation(pkt.get("groupID")))
                 elif act == "EXT_COMMAND":
-                    for ext in list(active_clients["extension"]): await ext.send_json(pkt)
+                    for ext in list(active_clients["extension"]): await safe_send(ext, pkt)
                 elif act == "SEND_REPLY":
                     gid = pkt.get("groupID")
                     text = pkt.get("content")
@@ -518,12 +623,15 @@ async def ws_mobile_handler(request):
                     conv = state["companies"]["main"]["conversations"].setdefault(gid, {"name": gid, "msgs": []})
                     if not isinstance(conv.get("msgs"), list):
                         conv["msgs"] = []
-                    conv["msgs"].append({"sender": "agent", "text": text, "time": datetime.now().strftime("%H:%M:%S")})
+                    conv["msgs"].append({"sender": "agent", "text": text,
+                                         "time": datetime.now().strftime("%H:%M:%S"),
+                                         "ts": int(time.time() * 1000)})
+                    conv["updatedAt"] = int(time.time() * 1000)
                     _LAST_ACTIVE["gid"] = gid
-                    for m in list(active_clients["mobile"]): await m.send_json({"type": "FULL_SYNC", "data": state})
+                    for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 修复 BUG-011：过滤 action 字段，仅转发必要字段
                     for ext in list(active_clients["extension"]): 
-                        await ext.send_json({
+                        await safe_send(ext, {
                             "command": act,
                             "groupID": gid,
                             "content": text

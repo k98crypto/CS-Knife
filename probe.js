@@ -32,6 +32,62 @@
         return null;
     }
 
+    // ==================== 工单身份识别（区分不同玩家，手机端才能分别显示） ====================
+    // 注意：旧版本把所有工单都硬编码成 "当前工单"，导致手机端永远只有一个会话、
+    //       新玩家上来就把旧玩家的记录覆盖掉。这里改为生成稳定且互不相同的工单标识。
+    function simpleHash(str) {
+        let h = 5381;
+        const s = String(str || "");
+        for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+        return (h >>> 0).toString(36);
+    }
+
+    function pickTicketId() {
+        // 1) URL 查询串 / hash 中的工单号
+        try {
+            const m = location.href.match(/(?:ticketId|ticket_id|sessionId|session_id|chatId|chat_id|orderId|order_id|id)=([A-Za-z0-9_-]{3,64})/i);
+            if (m) return m[1];
+        } catch (e) {}
+
+        // 2) DOM 上常见的 data-* 工单属性
+        const attrs = ['data-ticket-id', 'data-session-id', 'data-chat-id', 'data-conversation-id'];
+        for (let i = 0; i < attrs.length; i++) {
+            const el = document.querySelector('[' + attrs[i] + ']');
+            if (el) {
+                const v = el.getAttribute(attrs[i]);
+                if (v) return String(v).slice(0, 64);
+            }
+        }
+
+        // 3) 左侧会话列表中"当前选中"的那一项
+        const actives = ['.is-active[data-id]', '.active[data-id]', '.conv-item.active',
+                         '.session-item.active', '.chat-item.active', '.conversation-item.active'];
+        for (let i = 0; i < actives.length; i++) {
+            const el = document.querySelector(actives[i]);
+            if (el) {
+                const v = el.getAttribute('data-id') || el.getAttribute('data-key') || el.id;
+                if (v) return String(v).slice(0, 64);
+            }
+        }
+        return "";
+    }
+
+    // 返回 { gid, name }：gid 稳定且能区分玩家；name 用于手机端会话列表显示
+    function buildTicketIdentity(playerInfo, messages) {
+        const firstLine = String(playerInfo || "").split('|')[0].trim().slice(0, 20);
+        const name = firstLine || "玩家";
+        let gid = pickTicketId();
+        if (!gid) {
+            // 兜底：用"玩家信息 + 该工单最早一条玩家消息"生成稳定摘要
+            let seedText = "";
+            for (let i = 0; i < messages.length; i++) {
+                if (messages[i].sender === 'player') { seedText = messages[i].text; break; }
+            }
+            gid = "P" + simpleHash((playerInfo || "") + "##" + seedText);
+        }
+        return { gid: gid, name: name };
+    }
+
     // ==================== 音效引擎 ====================
     function initAudio() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -330,8 +386,18 @@
 
         if (messages.length === 0) return;
 
-        const currentHash = messages.map(m => m.text).join('').replace(/\s+/g, '');
+        // 识别当前工单：不同玩家/工单必须得到不同的 groupID，手机端才会分开显示
+        const ident = buildTicketIdentity(playerInfo, messages);
+
+        const currentHash = ident.gid + "||" + messages.map(m => m.text).join('').replace(/\s+/g, '');
         if (window._lastChatHash === currentHash) return;   // 内容未变化，不上报
+
+        const payload = {
+            event: "PLAYER_MESSAGE",
+            data: { groupID: ident.gid, name: ident.name, messages: messages, playerInfo: playerInfo }
+        };
+        // 未连接时不更新 hash，等重连后自动补发
+        if (!sendToBrain(payload)) return;
 
         const lastSender = messages[messages.length - 1].sender;
         if (lastSender === 'player' ||
@@ -339,11 +405,6 @@
             playDingDong();
         }
         window._lastChatHash = currentHash;
-
-        sendToBrain({
-            event: "PLAYER_MESSAGE",
-            data: { groupID: "当前工单", messages: messages, playerInfo: playerInfo }
-        });
     }, 2000);
 
     // ==================== 启动 ====================

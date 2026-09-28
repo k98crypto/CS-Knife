@@ -354,4 +354,79 @@ python token_leak_test.py            -> 无泄露（退出码 0）
 - 表格实时同步（当前只读权限，采用本地 Excel 方案）
 
 ---
+
+## 📱 第五轮（2026/9/28）：手机端体验重构 + 多工单隔离
+
+用户反馈 4 个问题，全部定位并修复：
+
+### 问题 1：手机端主页永远只有一个玩家，新消息会把旧的顶掉
+
+- **根因**: `probe.js` 把 `groupID` **硬编码为常量 `"当前工单"`**，
+  所有工单都写进同一个 key → 服务端 `c["msgs"] = payload["messages"]` 覆盖数组，
+  于是"新玩家上来就把旧玩家的记录覆盖掉"。
+- **修复**: `probe.js` 新增 `pickTicketId()` / `buildTicketIdentity()`，
+  分层获取真实工单标识：
+  1. URL 中的 `ticketId|sessionId|chatId|orderId|id`
+  2. 页面上 `data-ticket-id` / `data-session-id` / `data-chat-id` / `data-conversation-id`
+  3. 左侧会话列表中当前选中项（`.active[data-id]` 等）
+  4. 兜底：`"P" + simpleHash(playerInfo + "##" + 首条玩家消息)` —— 稳定且能区分玩家
+- **服务端配套**: 每次上报都刷新会话名；单条消息打 `ts` 时间戳；
+  新增 `updatedAt`；淘汰策略由「最早创建」改为「**最久无活动**」，上限提到 50。
+
+### 问题 2：屏幕上方模糊
+
+- **根因**: `#chat-view { transform: translateX(100%) }` + `transition: transform`。
+  iOS Safari 会为带 `transform` 的元素建立合成层，文字被栅格化后**发虚**。
+  另外 `body { height: 100vh }` 在 iOS 上大于可视高度，页面会滑到半透明工具栏下方。
+- **修复**: 页面切换改用 `display: none/flex`（`.view.active`）；
+  根容器改 `#app { position: fixed; inset: 0 }` + `@supports (height:100dvh)`；
+  加 `-webkit-font-smoothing: antialiased`。
+
+### 问题 3：界面无法上下滑动
+
+- **修复**: `html/body { height:100% }` + `#app` flex 列布局；
+  滚动容器显式声明 `flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain; touch-action: pan-y`。
+  `min-height: 0` 是让 flex 子项真正能滚动的关键。
+
+### 问题 4：不能像微信那样区分好友
+
+- **修复**: 重做会话列表 —— 头像（首字取色）+ 昵称 + 最后一条消息预览 +
+  时间（今天 `HH:MM`，其它 `M/D`）+ 未读红点；按 `updatedAt` 倒序；
+  聊天页气泡下显示时间戳。打开某会话再返回，其余会话全部保留。
+
+### 附带修复：广播健壮性（BUG-027）
+
+- **现象**: 测试连跑时手机端收不到更新。
+- **根因**: 向已断开的客户端 `send_json` 抛异常会**打断整个广播循环**，
+  使同批其他客户端也收不到；`finally` 只会清理当前连接，不会清理死连接。
+- **修复**: 新增 `safe_send(client, payload)`，发送失败时静默忽略并 `discard` 该连接；
+  17 处广播调用点（9 处 mobile + 8 处 extension）全部替换。
+
+### 验证
+
+```
+python -m py_compile 4 文件          -> 4/4 [OK]
+node probe_smoke_test.js probe.js    -> 26 通过 / 0 失败
+node h5_security_test.js             -> 34 通过 / 0 失败
+python agent_core_test.py            -> 16 通过 / 0 失败
+python token_leak_test.py            -> 无泄露
+python multi_conv_test.py            -> 通过（连跑 3 轮均通过）
+
+关键断言：
+  两个玩家的会话同时存在（不再只剩一个）      -> 本次运行键=['T-A-...','T-B-...']
+  甲的记录没有被乙的消息覆盖                  -> 甲=['回复给甲'] 乙=['回复给乙']
+  主页同时显示全部 3 个会话                    -> 卡片数=3
+  按最近活动倒序排列（乙 → 丙 → 甲）
+  不同玩家得到不同标识                        -> P9uwuac  vs  Pc2s5sp
+  已移除 transform 滑动（iOS 文字发虚的元凶）
+```
+
+### 新增回归测试
+
+| 文件 | 用途 |
+|------|------|
+| `multi_conv_test.py` | 端到端验证多工单隔离（会话共存 / 消息互不覆盖 / 时间戳 / 脏数据容错） |
+
+---
 *此文档由 AI Bug 排查 Agent 自动生成*

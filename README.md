@@ -52,6 +52,17 @@
 - **Bark 推送**: 疑难单、异常掉线实时通知
 - **AFK 模式**: 全自动托管，AI 直接回复
 
+#### 手机端界面（微信式好友列表）
+- 主页按**最近活动时间倒序**列出所有玩家会话（头像 / 昵称 / 最后一条消息 / 时间）
+- 玩家发来且未打开的会话显示**未读红点**
+- 点进任一玩家进入聊天页（气泡 + 时间戳），返回列表后**原有会话全部保留**
+- 列表与聊天记录各自独立滚动；页面顶部不遮挡、不模糊
+
+> ⚠️ **多工单隔离的前提**：`probe.js` 需要拿到能区分工单的标识。
+> 它会依次尝试：① URL 中的 `ticketId/sessionId/chatId/...` ② 页面上的
+> `data-ticket-id` 等属性 ③ 左侧会话列表的选中项 ④ 最后用「玩家信息 + 首条玩家消息」
+> 生成稳定摘要。若你的工单页有固定字段，可在 `probe.js` 的 `pickTicketId()` 里加上对应选择器。
+
 ## 🔧 快速开始
 
 ### 环境要求
@@ -165,17 +176,20 @@ python -c "from agent_core import CustomerServiceCore; print('OK')"
 # 油猴脚本 probe.js 语法检查（需 Node.js）
 node --check probe.js
 
-# 油猴脚本功能冒烟测试（18 项，模拟浏览器环境，无需打开浏览器）
+# 油猴脚本功能冒烟测试（26 项：抓取 / 防雪球 / 掉线警报 / 断线重连 / 工单身份识别）
 node probe_smoke_test.js probe.js
 
-# 手机端 H5 安全回归测试（15 项：XSS / 断线容错 / 重连退避）
+# 手机端 H5 回归测试（34 项：XSS / 断线容错 / 重连退避 / 多会话列表 / 布局滚动）
 node h5_security_test.js
 
-# 业务核心回归测试（疑难单标记归一化 / AI 报错不外发 / 前后端契约）
+# 业务核心回归测试（16 项：疑难单标记归一化 / AI 报错不外发 / 前后端契约）
 python agent_core_test.py
 
-# Token 泄露回归测试（会临时启动 bridge_server 占用 8765 端口）
+# Token 泄露回归测试（需先启动 bridge_server；会占用 8765 端口）
 python token_leak_test.py
+
+# 多工单隔离端到端测试（需先启动 bridge_server；验证多玩家互不覆盖）
+python multi_conv_test.py
 ```
 
 ### 打包为 EXE
