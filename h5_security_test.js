@@ -29,9 +29,10 @@ function makeEl(id) {
         set innerHTML(v) { this._html = String(v); },
         get innerHTML() { return this._html; },
         addEventListener(ev, fn) { this._listeners[ev] = fn; if (ev === 'click') this._click = fn; },
+        insertAdjacentHTML(pos, v) { if (pos === 'beforeend') this._html += String(v); },
         querySelectorAll(sel) {
             const out = [];
-            if (sel === '.conv-card') {
+            if (sel.indexOf('.conv-card') === 0) {
                 const re = /data-gid="([^"]*)"/g;
                 let mm;
                 while ((mm = re.exec(this._html)) !== null) {
@@ -40,6 +41,18 @@ function makeEl(id) {
                     out.push(card);
                 }
                 this._cards = out;      // 缓存，便于测试触发点击
+            } else if (sel.indexOf('[data-openname]') === 0) {
+                // ★ V8.0："电脑网页上的会话"行（data-openname / data-opengid / data-openlast）
+                const re = /data-openname="([^"]*)"\s+data-opengid="([^"]*)"\s+data-openlast="([^"]*)"/g;
+                let mm;
+                while ((mm = re.exec(this._html)) !== null) {
+                    const row = makeEl('page-conv-row');
+                    row.dataset.openname = mm[1];
+                    row.dataset.opengid = mm[2];
+                    row.dataset.openlast = mm[3];
+                    out.push(row);
+                }
+                this._openRows = out;
             }
             return out;
         }
@@ -227,6 +240,55 @@ if (cards3.length === 3) {
             && els['list-view'].classList.contains('active');
     })());
 }
+
+console.log('\n[7.5] V8.0 电脑网页全部会话（conv_list）+ 远程切会话');
+onmsg({
+    type: 'FULL_SYNC',
+    data: {
+        afk_mode: false, alarm_status: false,
+        conv_list: [
+            { name: '玩家甲', last: '甲的问题', time: '5分钟前', active: true },
+            { name: '玩家丁' + EVIL_IMG, last: '丁的问题', time: '刚刚', active: false },
+            { name: '玩家戊', last: '戊的问题', time: '1小时前', active: false }
+        ],
+        companies: { main: { conversations: {
+            'T-1': { name: '玩家甲', updatedAt: nowMs - 300000, msgs: [{ sender: 'player', text: '甲的问题', ts: nowMs - 300000 }] },
+            'T-2': { name: '玩家乙', updatedAt: nowMs - 10000,  msgs: [{ sender: 'agent',  text: '乙的回复', ts: nowMs - 10000 }] }
+        } } }
+    }
+});
+const lh = els['conv-container'].innerHTML;
+check('主页出现"电脑网页上的会话"分区（电脑端每一个会话都能看到）',
+    lh.indexOf('电脑网页上的会话') !== -1);
+check('电脑上还没聊过的会话也列出来了（标「未打开」）',
+    lh.indexOf('玩家戊') !== -1 && lh.indexOf('未打开') !== -1);
+check('电脑网页当前打开的那个会话有「当前」标记', lh.indexOf('当前') !== -1 && lh.indexOf('page-active') !== -1);
+check('会话行用 data-* 传值（不拼内联 onclick）且名字已转义',
+    lh.indexOf('data-openname=') !== -1 && lh.indexOf('<img') === -1,
+    'onclick=' + (lh.indexOf('onclick="openConv') !== -1));
+const openRows = els['conv-container']._openRows || [];
+check('解析出可点击的网页会话行', openRows.length === 3, '数量=' + openRows.length);
+wsInst.readyState = 1;                     // 恢复"已连接"，否则点击只会提示断线
+FakeWebSocket.sent.length = 0;
+const rowXin = openRows.filter(r => r.dataset.openname.indexOf('玩家戊') !== -1)[0];
+rowXin && rowXin._click();
+const openSent = FakeWebSocket.sent.filter(m => m.action === 'OPEN_CONV');
+check('点「未打开」的会话 -> 请电脑网页切过去（OPEN_CONV）',
+    openSent.length === 1 && openSent[0].name.indexOf('玩家戊') !== -1, JSON.stringify(openSent));
+FakeWebSocket.sent.length = 0;
+const rowKnown = openRows.filter(r => r.dataset.opengid)[0];
+rowKnown && rowKnown._click();
+check('点已聊过的会话 -> 直接打开本地聊天，不再重复下发切会话',
+    FakeWebSocket.sent.filter(m => m.action === 'OPEN_CONV').length === 0
+    && els['chat-view'].classList.contains('active'));
+// ★ V8.0：手机端发送时会把会话名带上（这样中继不知道会话名时也能自动切会话）
+els['chat-input'].value = '你好呀';
+FakeWebSocket.sent.length = 0;
+sandbox.execCommand('SEND');
+const sendPkt = FakeWebSocket.sent.filter(m => m.action === 'SEND_REPLY');
+check('手机端代发带上 name（供中继自动切会话用）',
+    sendPkt.length === 1 && sendPkt[0].name === '玩家甲', JSON.stringify(sendPkt));
+check('打开后返回列表', (function () { sandbox.popChat(); return els['list-view'].classList.contains('active'); })());
 
 console.log('\n[8] 布局与滚动（静态检查）');
 check('已移除 transform 滑动（iOS 文字发虚的元凶）', py.indexOf('transform: translateX') === -1);

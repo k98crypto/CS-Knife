@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V7.9 hover 触发修正 + 指令自检版)
+// @name         智能工单探针 (V8.0 会话列表 + 远程切会话版)
 // @namespace    http://tampermonkey.net/
-// @version      7.9
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）
+// @version      8.0
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）；V8.0 会话列表上报（手机端"全部会话"）+ 远程/自动切会话（OPEN_CONV，回复前先切对工单）
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "7.9";
+    const PROBE_VERSION = "8.0";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -1254,6 +1254,53 @@
                 console.log("📲 [探针] 收到手机端切换状态指令：" + (map[cmd.status] || cmd.status));
                 Operator.switchIMStatus(map[cmd.status]);
             }
+            else if (cmd.command === "OPEN_CONV") {
+                // ★ V8.0：把电脑网页切到指定会话。
+                //   为什么必须有它：探针的「回复/草稿/回复并关单」永远作用于**页面当前打开的工单**，
+                //   手机端远程回复与 AI 自动回复都必须先把页面切到目标会话，才不会发错玩家。
+                const wantName = normText(cmd.name || "");
+                const wantLast = normText(cmd.lastText || "");
+                const items = [];
+                try {
+                    Array.from(document.querySelectorAll('.session-item')).forEach(el => {
+                        if (!isVisibleEl(el)) return;
+                        const pick = sel => {
+                            try { const n = el.querySelector(sel); return n ? normText(n.innerText) : ""; } catch (e) { return ""; }
+                        };
+                        items.push({ el: el, name: pick('.session-name'), last: pick('.session-last'),
+                                     active: (function () { try { return el.classList.contains('active'); } catch (e) { return false; } })() });
+                    });
+                } catch (e) {}
+                const hit = items.find(o => o.name === wantName && (!wantLast || o.last === wantLast))
+                    || items.find(o => o.name === wantName)
+                    || items.find(o => o.name && wantName && o.name.indexOf(wantName) !== -1);
+                if (!hit) {
+                    reportActionResult("OPEN_CONV", false,
+                        "会话列表里没找到「" + (cmd.name || "") + "」；当前列表："
+                        + items.map(o => o.name).join("/").slice(0, 140));
+                    return;
+                }
+                if (hit.active) {
+                    reportActionResult("OPEN_CONV", true, "「" + hit.name + "」已经是网页当前会话");
+                    return;
+                }
+                fireClick(hit.el);
+                console.log("🖱️ [探针] 已点击会话：" + hit.name);
+                reportActionResult("OPEN_CONV", true, "已点击「" + hit.name + "」，正在切换…");
+                // ★ 回执要**确认页面真的切过去了**才说 ok（中继据此把"页面当前工单"绑到这个会话，
+                //   从而允许后续发送；点不动就如实说失败，中继会立刻拒发而不是干等超时）。
+                (function confirmSwitch(tries) {
+                    setTimeout(() => {
+                        const nowActive = scanConversationList().filter(r => r.active)[0];
+                        const okNow = !!(nowActive && nowActive.name === hit.name);
+                        if (!okNow && tries > 0) { confirmSwitch(tries - 1); return; }
+                        reportActionResult("OPEN_CONV", okNow,
+                            okNow ? ("已切到「" + hit.name + "」")
+                                  : ("已点击「" + hit.name + "」，但页面当前还是「"
+                                     + ((nowActive && nowActive.name) || "未知") + "」"));
+                    }, 900);
+                })(1);
+            }
             else if (cmd.command === "REQUEST_IM_STATUS") {
                 // 手机端一打开 / 回到前台就来要一次真实状态（"从电脑网页获取一下"）
                 readAndReportIMStatus(true);
@@ -1425,6 +1472,50 @@
         window._lastChatHash = currentHash;
     }, 2000);
 
+    // ==================== 会话列表（★ V8.0 实机校准：客服 Console dump 的真实结构） ====================
+    //   div.session-item[.active]
+    //     ├ div.session-avatar > img[src]
+    //     ├ div.session-info
+    //     │   ├ div.session-top > span.session-name ＋ span/button.session-tag…
+    //     │   └ div.session-last        ← 最后一条消息预览
+    //     └ div.session-time
+    // ★ 列表项里**没有**工单号（无 data-id），所以身份用"会话名（+头像地址/时间）"组合，
+    //   手机端与中继都按**会话名**匹配（切会话/远程回复都靠它）。
+    function scanConversationList() {
+        const rows = [];
+        try {
+            Array.from(document.querySelectorAll('.session-item')).forEach(el => {
+                if (!isVisibleEl(el)) return;
+                const pick = sel => {
+                    try { const n = el.querySelector(sel); return n ? normText(n.innerText) : ""; } catch (e) { return ""; }
+                };
+                const name = pick('.session-name');
+                if (!name) return;
+                let avatar = "";
+                try {
+                    const img = el.querySelector('.session-avatar img');
+                    if (img) avatar = String(img.getAttribute('src') || "").slice(-60);
+                } catch (e) {}
+                const tags = [];
+                try {
+                    Array.from(el.querySelectorAll('.session-tag')).forEach(t => {
+                        const x = normText(t.innerText);
+                        if (x) tags.push(x.slice(0, 16));
+                    });
+                } catch (e) {}
+                rows.push({
+                    name: name.slice(0, 24),
+                    last: pick('.session-last').slice(0, 60),
+                    time: pick('.session-time').slice(0, 12),
+                    active: (function () { try { return el.classList.contains('active'); } catch (e) { return false; } })(),
+                    avatar: avatar,
+                    tags: tags.slice(0, 3)
+                });
+            });
+        } catch (e) {}
+        return rows;
+    }
+
     // ==================== 定时任务 3：心跳 + 胶囊状态刷新 ====================
     // 心跳让后端 /api/diag 能显示"探针活着、跑的是哪一版"，胶囊让客服肉眼可见。
     setInterval(() => {
@@ -1440,6 +1531,19 @@
         }
         if (chipKind !== 'connected') setChip('connected', "");
     }, 30000);
+
+    // 定时任务 4：会话列表上报（手机端"全部会话"就靠它；没变化不上报，防刷屏/防 Token 雪球）
+    // ⚠️ 放在最后注册：现有测试按 intervals[0/1/2] 索引取定时器（IM/聊天/心跳），别打乱顺序。
+    setInterval(() => {
+        if (!pageLoadComplete) return;
+        const rows = scanConversationList();
+        if (!rows.length) return;
+        const fp = rows.map(r => r.name + '|' + r.last + '|' + r.time + (r.active ? '|A' : '')).join('#');
+        if (fp === window._lastConvListHash) return;
+        if (!sendToBrain({ event: "CONV_LIST", data: { rows: rows } })) return;   // 未连接不更新 hash，重连后补发
+        window._lastConvListHash = fp;
+        console.log("📋 [探针] 会话列表已上报（" + rows.length + " 个）");
+    }, 3000);
 
     // ==================== 调试入口（客服/运维可在控制台直接调用） ====================
     window.__probe = {
@@ -1457,6 +1561,12 @@
         },
         // 立刻去读一次页面上的真实状态并上报（手机端"重新获取状态"走的就是这个）
         refreshStatus: function () { return readAndReportIMStatus(true) ? "已上报当前状态" : "未读到 IM 状态"; },
+        // ★ V8.0：看看网页左侧会话列表（手机端"全部会话"的数据源）
+        convs: function () {
+            const r = scanConversationList();
+            console.table ? console.table(r) : console.log(r);
+            return r;
+        },
         // ★ V7.7：把"状态下拉的可见选项"原样打进控制台并回报中继（只读诊断，不改状态）
         dumpStatus: function () { Operator.dumpStatusMenu(); return "已把状态下拉选项回报给中继（看控制台/中继日志）"; },
         // ★ V7.7：回复框到底抓到哪个元素（排查"草稿写不进去 / 回复按钮是灰的"）

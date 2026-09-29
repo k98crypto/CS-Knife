@@ -24,6 +24,7 @@
     "_说明_新消息通知": "bark_on_new_message=true 时，玩家每来一条新消息都会额外推一条 Bark（手机锁屏也能收到）；不想被刷屏就设 false",
     "bark_on_new_message": true,
     "outbound_enabled": true,
+    "auto_open_conv": true,
     "_说明_三个AI开关": "三个可单独关闭的 AI 动作：①AI回复并关单 ②AI自动起草（半自动也不再自动出手）③桌面F10 AI润色",
     "enable_ai_close": true,
     "enable_auto_draft": true,
@@ -40,5 +41,6 @@
         "im": "IM 系统",
         "honorific": "亲爱的玩家"
     },
-    "_说明_出站停发": "设为 false = 一键停发：所有会进玩家对话框的内容（代发/草稿/回复并关单）全部被拦下；也可随时访问 /api/outbound?on=0 切换，自检页 /diag 里有按钮"
+    "_说明_出站停发": "设为 false = 一键停发：所有会进玩家对话框的内容（代发/草稿/回复并关单）全部被拦下；也可随时访问 /api/outbound?on=0 切换，自检页 /diag 里有按钮",
+    "_说明_自动切会话": "true（默认）= 手机远程回复/AI 自动回复时，如果电脑网页当前打开的不是目标会话，中继会先让探针点开该会话再发送（避免发错玩家）；false = 不自动切，改为拒绝并提示"
 }

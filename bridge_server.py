@@ -88,6 +88,8 @@ state = {
     "status_menu_dump": {},         # {current, items:[{tag,cls,text}], ts}
     "ext_cmd_debug": {},            # 最近一次"下发给探针"的命令：{cmd, conns, sent, ts}
     "event_counts": {},             # 各类探针事件累计次数（V7.7 排障）
+    "conv_list": [],                # ★ V8.0：网页左侧会话列表（手机端"全部会话"的数据源）
+    "conv_list_test": [],           # ★ V8.0：测试来源的会话列表（只给诊断看，不推给真实手机端）
     "probe_pong": {},               # 探针最近一次 PONG 自报（V7.8 诊断：/api/probe_ping）
     "im_via_relay": {"count": 0, "last_ts": 0},   # 探针"确认收到指令"的次数（V7.8 硬证据）
     "extension_online": False,      # 电脑端探针是否在线（决定手机端能否远程操作）
@@ -507,6 +509,9 @@ _LAST_TEST_PAGE_GID = {"gid": ""}
 # ★ 分类候选的"按需等待者"（ensure_category_options 用）
 _CATEGORY_WAITERS = []
 _PONG_WAITERS = []                   # ★ V7.8：/api/probe_ping 等探针 PONG 的地方（诊断用）
+# ★ V8.0：探针执行 OPEN_CONV（切会话）后的回执 —— ensure_page_on 靠它"切不动就立刻放弃"，
+#   而不是干等满超时（真机上会话名对不上时能 1 秒内就说清楚原因）。
+_OPEN_CONV_RESULT = {"ts": 0.0, "ok": None, "gid": "", "detail": "", "test": None}
 TEST_WS = set()                      # ★ V7.9：带 ?test=1 连上的"测试客户端"（测试脚本专用）
 
 
@@ -536,7 +541,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "7.9"
+SERVER_VER = "8.0"
 
 
 def _probe_refresh():
@@ -595,7 +600,55 @@ def safe_outbound(text, where=""):
     return clean, left
 
 
-async def send_to_player(payload, where="", origin=None, require_page=False):
+async def ensure_page_on(gid, name=None, origin=None, timeout=4.0):
+    """确保"电脑网页当前打开的就是 gid 这个工单"；不是就先替客服切过去。返回 (ok, 说明)。
+
+    ★ V8.0：这是"手机远程回复 / AI 自动回复"能真正无人值守工作的关键 ——
+      探针的回复永远作用于**页面当前打开的那个工单**，所以要么先切过去，要么就只能等客服
+      人在电脑前手动切（那远程和自动回复就失去意义了）。
+    """
+    if not gid:
+        return False, "缺少会话标识"
+    if str(page_gid(origin)) == str(gid):
+        return True, ""
+    conv = state["companies"]["main"]["conversations"].get(str(gid)) or {}
+    conv_name = str(name or conv.get("name") or "").strip()
+    # ★ 占位名（中继为"还没在网页上打开过的会话"临时起的名字 = 工单号本身）不是网页上的真实会话名，
+    #   拿它去点会话列表只会点空 —— 这种情况如实说清楚，绝不瞎点。
+    if conv.get("placeholder") and not name:
+        conv_name = ""
+    if not conv_name or conv_name == str(gid):
+        return False, (f"这条会话还没在电脑网页上打开过（中继不知道它在网页列表里的名字），"
+                       f"无法自动切换 —— 请先在电脑上打开它一次，或在手机主页点它一下")
+    if not config.get("auto_open_conv", True):
+        return False, (f"网页当前打开的不是「{conv_name}」，且已关闭自动切换会话"
+                       f"（config.json → auto_open_conv=false）")
+    targets = ext_targets(origin)
+    if not targets:
+        return False, "电脑端探针未连接，无法切换会话"
+    msgs = conv.get("msgs") or []
+    last_text = str((msgs[-1] or {}).get("text") or "")[:60] if msgs else ""
+    for ext in targets:
+        await safe_send(ext, {"command": "OPEN_CONV", "name": conv_name,
+                              "lastText": last_text, "groupID": str(gid)})
+    print(f"[切会话] 已请探针切到「{conv_name}」（目标 {gid}）")
+    t0 = time.time()
+    deadline = t0 + max(1.5, float(timeout))
+    while time.time() < deadline:
+        await asyncio.sleep(0.25)
+        if str(page_gid(origin)) == str(gid):
+            print(f"[切会话] ✅ 网页已切到「{conv_name}」")
+            return True, ""
+        # 探针明确说"点不到/没这个会话" -> 别干等到超时，立刻如实回报
+        if (_OPEN_CONV_RESULT["ts"] > t0 and _OPEN_CONV_RESULT["ok"] is False
+                and _OPEN_CONV_RESULT["test"] == _origin_is_test(origin)
+                and str(_OPEN_CONV_RESULT["gid"] or gid) == str(gid)):
+            return False, "电脑端切不过去：" + (_OPEN_CONV_RESULT["detail"] or "会话没找到")
+    return False, (f"已请电脑端切到「{conv_name}」，但网页还没切过去（会话名可能不一致，"
+                   f"或该会话在其它分组里）")
+
+
+async def send_to_player(payload, where="", origin=None, require_page=False, page_name=None):
     """把指令发给电脑端探针去执行前，先把"玩家可见文本"过一遍安全闸。
 
     payload 形如 {"command": "SEND_REPLY"|"FILL_DRAFT"|"ACTION_REPLY_CLOSE", "content": "..."}
@@ -614,9 +667,15 @@ async def send_to_player(payload, where="", origin=None, require_page=False):
                                 "message": "已开启「停发」：所有会进玩家对话框的内容都被拦住了"
                                            "（config.json → outbound_enabled=false）"})
         return False
-    # ① 页面绑定核对（防"发错人"）
+    # ① 页面绑定核对（防"发错人"）：不对就**自动把网页切过去**，而不是让客服自己切
     if require_page:
         ok_page, note = page_binding_ok(pkt.get("groupID"), origin)
+        if not ok_page:
+            ok_sw, sw_note = await ensure_page_on(pkt.get("groupID"), name=page_name, origin=origin)
+            if ok_sw:
+                ok_page, note = page_binding_ok(pkt.get("groupID"), origin)
+            else:
+                note = note + "；自动切换失败：" + sw_note
         if not ok_page:
             print(f"[页面绑定] 拒绝发送：{note}（{where}）")
             for m in list(active_clients["mobile"]):
@@ -808,7 +867,7 @@ def page_binding_ok(gid, origin=None):
     if str(cur) == str(gid):
         return True, ""
     return False, (f"电脑网页当前打开的是「{cur}」，不是这条会话「{gid}」"
-                   f"—— 请先在电脑上切到该会话再操作（避免发错玩家）")
+                   f"（中继会先自动帮你切过去；切不过去才会拒发，避免发错玩家）")
 
 
 def outbound_enabled():
@@ -1005,6 +1064,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     .conv-card{display:flex;align-items:center;gap:12px;padding:12px;margin-bottom:8px;border-radius:var(--radius);
                background:var(--card);border:1px solid var(--line-soft);transition:background .15s,border-color .15s}
     .conv-card:active{background:var(--card-2);border-color:var(--line)}
+    .conv-card.page-active{border-color:var(--ok)}   /* ★ V8.0：电脑网页当前打开的那个会话 */
     .avatar{width:44px;height:44px;border-radius:14px;flex:0 0 auto;display:grid;place-items:center;
             font-size:16px;font-weight:700;color:#0B0C0E;background:linear-gradient(145deg,#7CC4FF,#4EC9B0)}
     .conv-body{flex:1 1 auto;min-width:0}
@@ -1806,8 +1866,48 @@ HTML_CONTENT = """<!DOCTYPE html>
       }).join('');
 
       // 事件委托绑定（不再把数据拼进 onclick）
-      container.querySelectorAll('.conv-card').forEach(el => {
+      container.querySelectorAll('.conv-card[data-gid]').forEach(el => {
         el.addEventListener('click', () => pushChat(el.dataset.gid));
+      });
+
+      // ★ V8.0：电脑网页上的**全部会话**（探针扫 .session-item 上报）—— 手机主页也能看到每一个会话
+      const pageRows = Array.isArray(globalState.conv_list) ? globalState.conv_list : [];
+      const knownNames = {};
+      keys.forEach(g => { knownNames[String((convs[g] || {}).name || '')] = g; });
+      if (pageRows.length) {
+        container.insertAdjacentHTML('beforeend',
+          '<div class="list-title" style="margin:8px 2px">电脑网页上的会话（' + pageRows.length + '）</div>' +
+          pageRows.map(r => {
+            const nm = String(r.name || '');
+            const isOpen = !!r.active;
+            const known = knownNames[nm] || '';
+            return '<div class="conv-card' + (isOpen ? ' page-active' : '') + '" data-openname="' + esc(nm) + '"' +
+                   ' data-opengid="' + esc(known) + '" data-openlast="' + esc(String(r.last || '')) + '">' +
+                   '<div class="avatar">' + esc(nm.charAt(0) || '玩') + '</div>' +
+                   '<div class="conv-body">' +
+                     '<div class="conv-top">' +
+                       '<div class="conv-name">' + esc(nm) +
+                         (isOpen ? '<span class="pin-badge">🖥 当前</span>' : '') +
+                         (known ? '' : '<span class="pin-badge">未打开</span>') +
+                       '</div>' +
+                       '<div class="conv-time">' + esc(String(r.time || '')) + '</div>' +
+                     '</div>' +
+                     '<div class="conv-lastmsg">' + esc(String(r.last || '')) + '</div>' +
+                   '</div>' +
+                 '</div>';
+          }).join(''));
+      }
+      container.querySelectorAll('[data-openname]').forEach(el => {
+        el.addEventListener('click', () => {
+          const nm = el.dataset.openname || '';
+          if (el.dataset.opengid) { pushChat(el.dataset.opengid); return; }
+          if (extensionOffline()) { toast('电脑端未连接，无法切换会话'); return; }
+          if (sendMsg({ action: 'OPEN_CONV', name: nm, lastText: el.dataset.openlast || '' })) {
+            toast('已请电脑网页切到「' + nm + '」');
+          } else {
+            toast('连接已断开，正在重连');
+          }
+        });
       });
 
       if (activeGroupId && getConv(activeGroupId)) {
@@ -1892,7 +1992,9 @@ HTML_CONTENT = """<!DOCTYPE html>
           if (cmd === 'CLOSE') {
               sendMsg({ action: 'EXT_COMMAND', command: 'ACTION_REPLY_CLOSE', groupID: activeGroupId, content: text, category: "其他" });
           } else if (cmd === 'SEND' && text) {
-              sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text });
+              const c = getConv(activeGroupId);
+              sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text,
+                        name: (c && c.name && String(c.name) !== String(activeGroupId)) ? c.name : '' });
           }
           if (input) input.value = '';
           autoGrowInput();                       // 清空后把高度收回去
@@ -2020,8 +2122,11 @@ async def api_fill_draft(request):
         return web.json_response({"ok": False, "error": "内容清洗后为空（只含内部提示），已拦截"}, status=400)
     if not active_clients["extension"]:
         return web.json_response({"ok": False, "error": "电脑端探针未连接（网页没开 / 脚本没跑）"}, status=503)
-    await send_to_player({"command": "FILL_DRAFT", "content": content}, "F9/F10 直填")
+    # ★ V8.0：`?test=1` 时只发给**测试探针** —— 测试脚本调用本接口不许往客服真实页面的回复框里填字
+    await send_to_player({"command": "FILL_DRAFT", "content": content}, "F9/F10 直填",
+                         origin=("test" if request.query.get("test") == "1" else None))
     return web.json_response({"ok": True, "clients": len(active_clients["extension"]),
+                              "test": request.query.get("test") == "1",
                               "filtered": left})
 
 def _kb_stats():
@@ -2201,6 +2306,10 @@ async def api_diag(request):
             "active_gid": _LAST_ACTIVE.get("gid"),
             "active_name": (convs.get(_LAST_ACTIVE.get("gid")) or {}).get("name", ""),
             "conversations": len(convs),
+            # ★ V8.0：网页左侧会话列表（手机端"全部会话"就是它）
+            "page_list_count": len(state.get("conv_list") or []),
+            "page_list": [str(r.get("name") or "") for r in (state.get("conv_list") or [])][:20],
+            "page_list_test_count": len(state.get("conv_list_test") or []),
         },
         "kb": _kb_stats(),
         "categories": len(state.get("category_options") or []),
@@ -2211,6 +2320,9 @@ async def api_diag(request):
             "kb_retrieval_top_k": config.get("kb_retrieval_top_k", 25),
             "local_excel": os.path.basename(str(config.get("local_excel_path", ""))),
             "close_category_path": config.get("close_category_path"),
+            # ★ V8.0：回复前是否自动把电脑网页切到目标会话（手机远程/AI 自动回复靠它）
+            "auto_open_conv": bool(config.get("auto_open_conv", True)),
+            "outbound_enabled": outbound_enabled(),
         },
         "hint": "probe.online=false => 油猴脚本没跑起来；probe.version 落后 => TM 里是旧脚本",
     })
@@ -2519,6 +2631,18 @@ async def ws_ext_handler(request):
                         "LIST_ACTIONS": "按钮清单",
                     }.get(cmd_name, cmd_name or "操作")
                     print(f"[动作] {'✅' if ok else '❌'} {label}：{detail}")
+                    # ★ V8.0：切会话的成败单独记一份（ensure_page_on 等它，能提前收工）
+                    if cmd_name == "OPEN_CONV":
+                        _cvgid = str(data.get("groupID") or "")
+                        _OPEN_CONV_RESULT.update({"ts": time.time(), "ok": ok, "gid": _cvgid,
+                                                  "detail": detail[:120], "test": ws in TEST_WS})
+                        # 探针已确认"页面当前就是目标会话" -> 直接把页面绑定更新过去，
+                        # 不必等下一次会话列表扫描（真机上切完能立刻发，不用干等）
+                        if ok and _cvgid:
+                            if ws in TEST_WS:
+                                _LAST_TEST_PAGE_GID["gid"] = _cvgid
+                            else:
+                                _LAST_PAGE_GID["gid"] = _cvgid
                     # ★ V7.7：最近一次动作请求与结果留存（/diag 可查，便于定位"点了没反应"）
                     state["last_action"] = {"command": cmd_name, "action": label, "ok": ok,
                                             "detail": detail, "ts": int(time.time()),
@@ -2611,6 +2735,37 @@ async def ws_ext_handler(request):
                         await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": emsg})
                     continue
 
+                # ★ V8.0：探针上报"网页左侧会话列表"（手机端"全部会话"的数据源 + 切会话的依据）
+                if ev == "CONV_LIST":
+                    rows = (pkt.get("data") or {}).get("rows") or []
+                    rows = [r for r in rows if isinstance(r, dict)][:40]
+                    if rows:
+                        # ★ 隔离：测试来源的会话列表只进诊断键，真实手机端不显示（和上次事故同一类问题）
+                        is_test_ws = ws in TEST_WS
+                        if is_test_ws:
+                            state["conv_list_test"] = rows
+                        else:
+                            state["conv_list"] = rows
+                        # 用"当前高亮的那一行"对齐"网页当前打开的工单"（按会话名匹配已知会话）
+                        for r in rows:
+                            if not r.get("active"):
+                                continue
+                            _n = str(r.get("name") or "")
+                            for _gid, _c in state["companies"]["main"]["conversations"].items():
+                                if str((_c or {}).get("name") or "") == _n:
+                                    if is_test_ws:
+                                        _LAST_TEST_PAGE_GID["gid"] = str(_gid)
+                                    else:
+                                        _LAST_PAGE_GID["gid"] = str(_gid)
+                                    break
+                            break
+                        for m in list(active_clients["mobile"]):
+                            await safe_send(m, {"type": "FULL_SYNC", "data": state})
+                        print(f"[会话列表] 已更新 {len(rows)} 个会话"
+                              + ("（当前：" + str([r.get('name') for r in rows if r.get('active')][:1]) + "）"
+                                 if any(r.get("active") for r in rows) else ""))
+                    continue
+
                 # ★ V7.8：探针自报家门（PONG）—— 诊断"指令到底有没有到、浏览器里是哪版代码"
                 if ev == "PONG":
                     data = pkt.get("data") or {}
@@ -2679,6 +2834,7 @@ async def ws_ext_handler(request):
 
                     c = target["conversations"].setdefault(gid, {"name": name, "msgs": [], "updatedAt": 0})
                     c["name"] = name                       # 每次都刷新名称，不再只在首次写入
+                    c.pop("placeholder", None)              # ★ V8.0：网页上报的真实会话名到手 -> 不再是"占位会话"
                     # ★ V7.9：把"这条会话的数据来自测试客户端"记在会话上（比全局标记可靠：
                     #   全局标记会被随后到来的真实消息顶掉，导致测试的延迟回复打到真实工单）
                     if _is_test_origin:
@@ -3014,6 +3170,26 @@ async def ws_mobile_handler(request):
                                              "message": f"已请电脑网页回报状态下拉选项（探针连接 {_dsent}/{len(_dconns)}，马上返回）"})
                     continue
 
+                # ★ V8.0：手机端点某个会话 -> 让电脑网页切过去（手机主页"全部会话"可点）
+                if act == "OPEN_CONV":
+                    _gid = str(pkt.get("groupID") or "")
+                    _nm = str(pkt.get("name") or "")
+                    _targets = ext_targets(ws)
+                    if not _targets:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                                             "message": "电脑端探针未连接，无法切换会话"})
+                        continue
+                    for ext in _targets:
+                        await safe_send(ext, {"command": "OPEN_CONV", "name": _nm,
+                                              "lastText": str(pkt.get("lastText") or ""),
+                                              "groupID": _gid})
+                    state["ext_cmd_debug"] = {"cmd": "OPEN_CONV(" + (_nm or _gid) + ")",
+                                              "conns": len(_targets), "sent": len(_targets),
+                                              "ts": int(time.time())}
+                    await safe_send(ws, {"type": "AI_STATUS", "status": "ok",
+                                         "message": "已请电脑网页切到「" + (_nm or _gid) + "」"})
+                    continue
+
                 # AI 一键回复并关单（AI 选问题分类 + 生成结束语，关单后会话从列表消失）
                 if act == "AI_CLOSE":
                     if not feature_flags()["ai_close"]:
@@ -3123,7 +3299,8 @@ async def ws_mobile_handler(request):
                         await safe_send(ws, {"type": "AI_STATUS", "status": "error",
                                              "message": "内容清洗后为空（只含内部提示），未发送"})
                         continue
-                    conv = state["companies"]["main"]["conversations"].setdefault(gid, {"name": gid, "msgs": []})
+                    conv = state["companies"]["main"]["conversations"].setdefault(
+                        gid, {"name": gid, "msgs": [], "placeholder": True})
                     if not isinstance(conv.get("msgs"), list):
                         conv["msgs"] = []
                     conv["msgs"].append({"sender": "agent", "text": text,
@@ -3134,7 +3311,8 @@ async def ws_mobile_handler(request):
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 修复 BUG-011：过滤 action 字段，仅转发必要字段
                     await send_to_player({"command": "SEND_REPLY", "groupID": gid,
-                                          "content": text}, "手机端代发", origin=ws, require_page=True)
+                                          "content": text}, "手机端代发", origin=ws, require_page=True,
+                                         page_name=str(pkt.get("name") or ""))
     finally:
         active_clients["mobile"].discard(ws)
         TEST_WS.discard(ws)                  # ★ V7.9：断开就摘掉，别让计数/隔离判断留在脏数据上

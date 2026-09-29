@@ -326,7 +326,7 @@ check("会在页面上动手的指令都走 ext_targets（状态/挂起/发送/�
 check("测试客户端不许真的 AI 关单（后台任务单独拦）",
       "测试客户端：已跳过真实 AI 关单" in SRC)
 check("send_to_player 带 origin + require_page（代发不会打到真实探针 / 不会发错人）",
-      'async def send_to_player(payload, where="", origin=None, require_page=False)' in SRC
+      'async def send_to_player(payload, where="", origin=None, require_page=False' in SRC
       and "origin=ws, require_page=True" in SRC)
 check("自动重试也遵守隔离（im_intent_test）",
       'ext_targets("test" if state.get("im_intent_test") else None)' in SRC)
@@ -362,6 +362,35 @@ check("分类改为按需读取（不再连接时就嗅探下拉）",
 check("按需读取只在真要选分类时调用（handle_ai_close 里）",
       "options = await ensure_category_options(" in SRC2)
 check("分类候选回报会唤醒等待者", "_notify_category_waiters(state[\"category_options\"])" in SRC2)
+
+print("\n[10.10] V8.0 自动切会话（回复前先把电脑网页切到目标工单 —— 不再让客服手动切）")
+check("有 ensure_page_on：目标会话 ≠ 网页当前工单 -> 先切过去再发",
+      "async def ensure_page_on" in SRC and 'await safe_send(ext, {"command": "OPEN_CONV"' in SRC)
+check("send_to_player 页面绑定失败时先自动切会话（切成功再发）",
+      "ok_sw, sw_note = await ensure_page_on(" in SRC
+      and "if ok_sw:" in SRC and "ok_page, note = page_binding_ok(pkt.get(\"groupID\"), origin)" in SRC)
+check("自动切会话可用 config.json 关掉（auto_open_conv）",
+      'config.get("auto_open_conv", True)' in SRC)
+check("占位会话（名字=工单号）不许拿去瞎点会话列表，且立刻拒发（不卡手机端队列）",
+      '"placeholder": True' in SRC and 'if conv.get("placeholder") and not name:' in SRC)
+check("网页真实上报会话名后会摘掉占位标记（之后就能自动切了）",
+      'c.pop("placeholder", None)' in SRC)
+check("手机端代发会把会话名一起带来（中继不知道名字时也能切过去）",
+      'page_name=str(pkt.get("name") or "")' in SRC and "name: (c && c.name" in SRC)
+check("F9/F10 直填接口支持 ?test=1 只打测试探针（测试不许往真实回复框填字）",
+      'origin=("test" if request.query.get("test") == "1" else None)' in SRC)
+check("手机端可点会话让电脑切过去（action=OPEN_CONV）",
+      'act == "OPEN_CONV"' in SRC and '"command": "OPEN_CONV"' in SRC)
+check("会话列表入库并推给手机端（CONV_LIST -> state.conv_list -> FULL_SYNC）",
+      'ev == "CONV_LIST"' in SRC and 'state["conv_list"] = rows' in SRC)
+check("测试来源的会话列表隔离到 conv_list_test（不推给真实手机端）",
+      'state["conv_list_test"] = rows' in SRC and '"page_list_test_count"' in SRC)
+check("会话列表按\"当前高亮行\"对齐网页当前工单（名字匹配已知会话）",
+      '_LAST_PAGE_GID["gid"] = str(_gid)' in SRC and 'if not r.get("active"):' in SRC)
+check("自检页/诊断能看到网页会话列表（page_list）",
+      '"page_list_count"' in SRC and '"page_list"' in SRC)
+check("H5 主页有\"电脑网页上的会话\"分区（未打开的也能看到 + 可点切）",
+      "电脑网页上的会话（" in SRC and 'action: \'OPEN_CONV\'' in SRC and "data-openname=" in SRC)
 
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

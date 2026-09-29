@@ -489,8 +489,10 @@ async def main():
         ext4 = await s.ws_connect(BASE + "/ws/extension?test=1")
         await drain(ext4, 0.4, tries=3)
         nasty = "【规章库未收录，请上报内部群核实】我们会补偿您 100 钻石并承诺 48 小时内修复这个 bug，请进群找群内客服。"
-        async with s.post(BASE + "/api/fill_draft", json={"content": nasty}) as r:
+        async with s.post(BASE + "/api/fill_draft?test=1", json={"content": nasty}) as r:
             body = await r.json() if r.status == 200 else {}
+        check("/api/fill_draft?test=1 只发给测试探针（不会往客服真实回复框里填字）",
+              body.get("test") is True, str(body)[:120])
         _, ext4_msgs = await drain(ext4, 0.5, tries=4)
         fills = [m for m in ext4_msgs if m.get("command") == "FILL_DRAFT"]
         got = str(fills[-1].get("content") if fills else "")
@@ -499,7 +501,7 @@ async def main():
               all(w not in got for w in ("内部群", "补偿", "承诺", "群聊", "上报", "bug", "BUG")) and "钻石" not in got,
               got[:100])
         # 只有内部提示的内容 -> 直接拦截
-        async with s.post(BASE + "/api/fill_draft", json={"content": "【规章库未收录，请上报内部群核实】"}) as r:
+        async with s.post(BASE + "/api/fill_draft?test=1", json={"content": "【规章库未收录，请上报内部群核实】"}) as r:
             check("纯内部提示的文案被拦截（400）", r.status == 400, f"status={r.status}")
         # 手机端代发同样过闸
         # ★ V7.9：先让"网页"打开这个工单（否则会被新增的"页面绑定"核对拦下 —— 那是防发错玩家）
@@ -510,20 +512,72 @@ async def main():
         # 先验证"目标会话 ≠ 网页当前工单"会被拦下（防发错玩家 —— 真实事故的第二道保险）
         await mobile.send_json({"action": "SEND_REPLY", "groupID": "NOTOPEN-" + RUN,
                                 "content": "这条不该发出去"})
+        _t_block = time.time()
         await asyncio.sleep(0.5)
         _, ext4_wrong = await drain(ext4, 0.5, tries=4)
         check("目标会话与网页当前工单不一致 -> 拒绝代发（防止发错玩家）",
               not any(m.get("command") == "SEND_REPLY" for m in ext4_wrong),
               str([m.get("command") for m in ext4_wrong][:5]))
+        # ★ V8.0：这种"中继压根不知道会话名"的情况要**立刻**拒发（不能卡住手机端指令队列）
+        check("不知道会话名时立刻拒发且不会去瞎点网页会话（不再卡 3~6 秒）",
+              (time.time() - _t_block) < 2.5, "%.2fs" % (time.time() - _t_block))
         await mobile.send_json({"action": "SEND_REPLY", "groupID": GID,
                                 "content": "我们会赔偿您 888 元，请进群找群内客服"})
-        await asyncio.sleep(0.5)
-        _, ext4_after = await drain(ext4, 0.5, tries=4)
+        await asyncio.sleep(0.6)
+        _, ext4_after = await drain(ext4, 0.5, tries=6)
         sent_reply = [m for m in ext4_after if m.get("command") == "SEND_REPLY"]
         payload = str(sent_reply[-1].get("content") if sent_reply else "")
         check("手机端代发也过安全闸（赔偿/群内客服 被改写）",
               "赔偿" not in payload and "群内客服" not in payload and bool(payload), payload[:80])
         await ext4.close()
+
+        # ---------- 9. V8.0：电脑网页全部会话 + 远程切会话 ----------
+        print("\n[9] 电脑网页全部会话（手机主页看得到）+ 远程切会话")
+        ext5 = await s.ws_connect(BASE + "/ws/extension?test=1")
+        await drain(ext5, 0.4, tries=3)
+        await ext5.send_json({"event": "CONV_LIST", "data": {"rows": [
+            {"name": "列表测试甲", "last": "我的契约物不见了", "time": "1小时前",
+             "active": True, "avatar": "a.png", "tags": ["客户端"]},
+            {"name": "列表测试乙", "last": "充值没到账", "time": "3分钟前",
+             "active": False, "avatar": "b.png", "tags": []},
+        ]}})
+        await asyncio.sleep(0.5)
+        snap_list = await fresh_state()
+        rows = snap_list.get("conv_list_test") or []
+        check("测试来源的会话列表进入诊断键（可断言）",
+              len(rows) == 2 and rows[0].get("name") == "列表测试甲"
+              and rows[1].get("active") is False,
+              str(rows)[:140])
+        check("测试来源的会话列表绝不进真实手机端的列表（隔离，避免上次那种污染）",
+              (snap_list.get("conv_list") or []) == []
+              or all("列表测试" not in str(r.get("name") or "") for r in (snap_list.get("conv_list") or [])),
+              str(snap_list.get("conv_list"))[:120])
+        async with s.get(BASE + "/api/diag") as r:
+            dg_list = (await r.json()) or {}
+        check("/api/diag 暴露会话列表（page_list_count / page_list_test_count）",
+              (dg_list.get("ticket") or {}).get("page_list_test_count") == 2,
+              str({k: v for k, v in (dg_list.get("ticket") or {}).items() if "page_list" in k}))
+
+        await mobile.send_json({"action": "OPEN_CONV", "name": "列表测试乙"})
+        await asyncio.sleep(0.5)
+        _, ext5_msgs = await drain(ext5, 0.5, tries=4)
+        opens = [m for m in ext5_msgs if m.get("command") == "OPEN_CONV"]
+        check("手机端点某个会话 -> 中继让电脑网页切过去（OPEN_CONV）",
+              bool(opens) and opens[-1].get("name") == "列表测试乙",
+              str(opens[-1] if opens else ext5_msgs)[:120])
+
+        # 切会话是"动真实页面"的操作：同样只发给测试探针（隔离）
+        await ext5.close()
+        real_ext2 = await s.ws_connect(BASE + "/ws/extension")
+        await asyncio.sleep(0.4)
+        await drain(real_ext2, 0.3)
+        await mobile.send_json({"action": "OPEN_CONV", "name": "列表测试丙"})
+        await asyncio.sleep(0.5)
+        _, real2_msgs = await drain(real_ext2, 0.5, tries=3)
+        check("切会话指令也不会打到真实探针（测试隔离）",
+              not any(m.get("command") == "OPEN_CONV" for m in real2_msgs),
+              str([m.get("command") for m in real2_msgs][:5]))
+        await real_ext2.close()
 
         # ---------- 收尾：把 IM 状态与告警复位，避免测试给真实使用留下"离线/忙碌" ----------
         if not mobile.closed:

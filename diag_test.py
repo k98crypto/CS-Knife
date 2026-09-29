@@ -18,7 +18,7 @@ except Exception:
     pass
 
 BASE = "http://127.0.0.1:8765"
-TEST_VER = "7.9"
+TEST_VER = "8.0"
 TEST_PAGE = "https://ticket.example.com/imChat/workstation"
 
 passed = 0
@@ -91,6 +91,14 @@ async def main():
         check("server.ip / port 可读",
               bool((diag.get("server") or {}).get("ip")) and (diag.get("server") or {}).get("port") == 8765,
               f"{(diag.get('server') or {}).get('ip')}:{(diag.get('server') or {}).get('port')}")
+        # ★ V8.0：网页会话列表（手机主页"电脑网页上的会话"）+ 自动切会话开关
+        _tk = diag.get("ticket") or {}
+        check("ticket 区块暴露网页会话列表（page_list / page_list_count）",
+              "page_list" in _tk and "page_list_count" in _tk,
+              str({k: v for k, v in _tk.items() if k.startswith("page_list")})[:120])
+        check("config 区块暴露 auto_open_conv（自动切会话开关）",
+              "auto_open_conv" in (diag.get("config") or {}),
+              str((diag.get("config") or {}).get("auto_open_conv")))
 
         # 安全：诊断接口绝不能带出密钥
         cfg_dump = json.dumps(diag.get("config") or {}, ensure_ascii=False).lower()

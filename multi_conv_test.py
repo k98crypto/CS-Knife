@@ -87,8 +87,16 @@ async def main():
               "%r / %r" % (a.get("name"), b.get("name")))
 
         print("\n[2] 消息互不覆盖")
+        # ★ V8.0：中继新增"发送前先切会话"（页面绑定闸）—— 探针的发送永远作用于页面当前工单，
+        #   所以这里像真实探针那样：先把"网页当前会话"报到 A，再发 A；然后报到 B，再发 B。
+        await ext.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": GID_A, "name": "玩家甲", "messages": [], "playerInfo": "玩家甲 | UID:1001"}})
+        await asyncio.sleep(0.15)
         await mobile.send_json({"action": "SEND_REPLY", "groupID": GID_A, "content": "回复给甲"})
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.35)
+        await ext.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": GID_B, "name": "玩家乙", "messages": [], "playerInfo": "玩家乙 | UID:2002"}})
+        await asyncio.sleep(0.15)
         await mobile.send_json({"action": "SEND_REPLY", "groupID": GID_B, "content": "回复给乙"})
         await asyncio.sleep(0.4)
 

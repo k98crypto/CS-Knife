@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '7.9';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '8.0';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -70,6 +70,30 @@ function makeEl(text, classes) {
     };
 }
 
+// ★ V8.0：模拟网页左侧会话列表项（真实结构：.session-item > .session-avatar img / .session-info > .session-top > .session-name + .session-tag / .session-last / .session-time）
+let sessionItems = [];
+function makeSessionRow(name, last, time, active, tags) {
+    const row = {
+        _active: !!active,
+        innerText: String(name) + ' ' + String(last) + ' ' + String(time),
+        classList: { contains: c => (c === 'active' ? !!row._active : (tags || []).indexOf(c) !== -1) },
+        querySelector: sel => {
+            if (sel === '.session-name') return { innerText: name };
+            if (sel === '.session-last') return { innerText: last };
+            if (sel === '.session-time') return { innerText: time };
+            if (sel === '.session-avatar img') return { getAttribute: () => 'https://cdn.example/UI_PetHead_1.png' };
+            return null;
+        },
+        querySelectorAll: sel => (sel === '.session-tag' ? [{ innerText: '客户端' }] : []),
+        // 点一下 = 页面把高亮挪到这一行（模拟真实工作台的切换效果）
+        click() {
+            sessionItems.forEach(r => { r._active = (r === row); });
+            clickedLabels.push('CONV:' + name);
+        }
+    };
+    return row;
+}
+
 let statusText = 'IM在线';
 let statusTriggerNodes = [];                   // 模拟"IM 状态显示区"节点（V7.6 等价匹配用例）
 let bubbles = [];
@@ -110,6 +134,7 @@ const documentStub = {
     querySelectorAll: sel => {
         if (sel.indexOf('.el-dropdown-menu__item') === 0) return [makeEl(statusText)];
         if (sel === 'div, span, button' || sel === 'div, span, button, a') return statusTriggerNodes;
+        if (sel === '.session-item') return sessionItems;
         if (sel.indexOf('.im-action-btn') === 0) return actionButtons;
         if (sel === '.chat-bubble-row') return bubbles;
         return [];
@@ -742,7 +767,7 @@ function check(name, ok, extra) {
     check('新增 __probe.editor() / __probe.dumpStatus() 排障入口',
         code.indexOf('editor: function ()') !== -1 && code.indexOf('dumpStatus: function ()') !== -1);
 
-    console.log('\n[8.9.5] V7.9 指令自检（PING/PONG 自报家门 + 指令出错不再静默）');
+    console.log('\n[8.9.5] V8.0 指令自检（PING/PONG 自报家门 + 指令出错不再静默）');
     check('探针能回 PING（证明"指令收到没"）',
         code.indexOf('cmd.command === "PING"') !== -1 && code.indexOf('event: "PONG"') !== -1);
     check('PONG 会自报"代码里到底有没有这些函数"（typeof 逐个查）',
@@ -752,7 +777,7 @@ function check(name, ok, extra) {
     check('onmessage 整段 try/catch，出错回报 PROBE_ERROR（不再"点了没反应还查不到"）',
         code.indexOf('event: "PROBE_ERROR"') !== -1 && code.indexOf('处理指令出错') !== -1);
 
-    console.log('\n[8.9.6] V7.9 状态胶囊实机修正（hover 触发 / 触发器由内到外 / 面板结构回报）');
+    console.log('\n[8.9.6] V8.0 状态胶囊实机修正（hover 触发 / 触发器由内到外 / 面板结构回报）');
     check('补派 hover 事件（Element 下拉默认 hover 才打开，只点 click 永远打不开）',
         code.indexOf('function fireHover') !== -1 && code.indexOf('fireHover(statusTrigger)') !== -1);
     check('候选触发器按"由内到外"排序并逐个尝试（旧版点到最外层 .el-dropdown 包装，点不开）',
@@ -848,6 +873,62 @@ function check(name, ok, extra) {
     check('分类改为按需读取（ensure_category_options，只在 AI 关单时调用）',
         serverSrc.indexOf('def ensure_category_options') !== -1
         && serverSrc.indexOf('options = await ensure_category_options(') !== -1);
+
+    console.log('\n[8.12] V8.0 会话列表上报 + 远程切会话（回复前先切对工单）');
+    check('探针会扫网页会话列表并上报 CONV_LIST',
+        code.indexOf('function scanConversationList') !== -1 && code.indexOf('event: "CONV_LIST"') !== -1);
+    check('会话列表按指纹节流（内容没变不重复上报，防刷屏/防 Token 雪球）',
+        code.indexOf('_lastConvListHash') !== -1);
+    check('新增 OPEN_CONV 指令（手机远程回复/AI 回复前先切对工单）',
+        code.indexOf('cmd.command === "OPEN_CONV"') !== -1 && code.indexOf('fireClick(hit.el)') !== -1);
+    check('调试口 __probe.convs() 可现场看会话列表', code.indexOf('convs: function ()') !== -1);
+
+    // 行为：按真实结构解析 + 上报
+    sessionItems = [
+        makeSessionRow('o超级大河马o', '辛苦久等了，您契约物的契约时间是什么时候呢', '1小时前', true),
+        makeSessionRow('莉莉安我', '左上角地图可以看见位置', '2小时前', false)
+    ];
+    // 让 pageLoadComplete 生效（探针加载 3s 后才开始上报）
+    timeouts.filter(t => t.ms === 3000).forEach(t => { try { t.fn(); } catch (e) {} });
+    const wsConv = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    wsConv.readyState = FakeWebSocket.OPEN;
+    sent.length = 0;
+    intervals[3]();
+    const convSent = sent.filter(s => s.event === 'CONV_LIST');
+    check('上报会话名/预览/时间/是否当前会话',
+        convSent.length === 1 && (convSent[0].data.rows || []).length === 2
+        && convSent[0].data.rows[0].name === 'o超级大河马o'
+        && convSent[0].data.rows[0].active === true
+        && convSent[0].data.rows[0].last.indexOf('辛苦久等') !== -1,
+        JSON.stringify(convSent[0] ? convSent[0].data.rows : null));
+    sent.length = 0;
+    intervals[3]();
+    check('内容没变化 -> 不重复上报', sent.filter(s => s.event === 'CONV_LIST').length === 0);
+
+    // 行为：OPEN_CONV 点开指定会话（手机端远程回复的前提）
+    clickedLabels = [];
+    sent.length = 0;
+    wsConv.onmessage({ data: JSON.stringify({ command: 'OPEN_CONV', name: '莉莉安我' }) });
+    check('OPEN_CONV 点到目标会话行', clickedLabels.length === 1 && clickedLabels[0] === 'CONV:莉莉安我',
+        JSON.stringify(clickedLabels));
+    check('OPEN_CONV 有动作回执',
+        sent.some(s => s.event === 'ACTION_RESULT' && s.data.command === 'OPEN_CONV'),
+        JSON.stringify(sent.filter(s => s.event === 'ACTION_RESULT').slice(-1)));
+    // 再跑一下 900ms 后的"确认回执"：探针确认页面真的切过去了才说 ok（中继据此允许后续发送）
+    timeouts.filter(t => t.ms === 900).forEach(t => { try { t.fn(); } catch (e) {} });
+    const convOk = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'OPEN_CONV' && s.data.ok);
+    check('切换成功后回执 ok=true（中继这才放行发送）',
+        convOk.length >= 1 && String(convOk[convOk.length - 1].data.detail).indexOf('已切到') !== -1,
+        JSON.stringify(convOk.slice(-1)));
+    sent.length = 0;
+    wsConv.onmessage({ data: JSON.stringify({ command: 'OPEN_CONV', name: '根本没这个会话' }) });
+    const openFail = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'OPEN_CONV');
+    check('找不到会话 -> 如实回报失败 + 列出候选（不瞎点）',
+        openFail.length === 1 && openFail[0].data.ok === false
+        && String(openFail[0].data.detail).indexOf('没找到') !== -1
+        && String(openFail[0].data.detail).indexOf('o超级大河马o') !== -1,
+        JSON.stringify(openFail));
+    sessionItems = [];
 
     console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
     const chip = (documentStub.body._children || []).find(n => n.tagName === 'DIV');
