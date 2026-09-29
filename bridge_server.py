@@ -1323,7 +1323,9 @@ HTML_CONTENT = """<!DOCTYPE html>
             const gid = String(payload.groupID || '');
             const ts = Number(payload.ts) || Date.now();
             if (gid && notifiedMsgTs[gid] && ts <= notifiedMsgTs[gid]) return;
-            if (gid) notifiedMsgTs[gid] = ts;
+            if (gid) notifiedMsgTs[gid] = ts;         // 先记账：即使这次不响，也不该以后为同一条再响
+            // ★ ① 正在看这个会话：消息马上会出现在聊天流里，不再响铃/弹提示（只有"别的会话"才提醒）
+            if (activeGroupId && gid === activeGroupId) return;
             playNewMsgSound();
             try {
                 if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(40);
@@ -2089,6 +2091,10 @@ async def ws_ext_handler(request):
                                 await safe_send(m, {"type": "NEW_MESSAGE", "groupID": gid, "name": name,
                                                     "preview": preview, "mode": mode_now, "ts": new_ts})
                             print(f"[新消息] {name}：{preview[:30]}（已即时提示手机端 · 模式 {mode_now}）")
+                            # ★ ③ 同时推一条 Bark（手机锁屏/退后台也能收到；可在 config.json 用
+                            #   "bark_on_new_message": false 关掉）。push_bark 内部走线程池，不阻塞事件循环。
+                            if config.get("bark_on_new_message", True):
+                                push_bark(f"💬 {name} 新消息", preview or "（玩家发来新消息）", gid)
                     except Exception as e:
                         print(f"[新消息] 通知失败（不影响主流程）：{e}")
 

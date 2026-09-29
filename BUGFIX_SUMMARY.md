@@ -1304,4 +1304,43 @@ token_leak 无泄露 / probe_smoke 85 / h5_security 102（+新消息音效与判
 
 ---
 
+## 🔔 第十九轮（2026/9/29）：新消息通知三档微调（不打扰当前会话 / ESC 连剪贴板一起清 / 同步推 Bark）
+
+客服要求："123 都改" —— 即上一轮列出的三个可选微调全部实现。
+
+### 1) ① 正在看的会话不响铃（只提醒"别的会话"）
+
+- 位置：H5 `NEW_MESSAGE` 分支（`bridge_server.py` 内嵌脚本）
+- 逻辑：先记账（`notifiedMsgTs[gid] = ts`，避免离开会话后又为同一条补响），
+  再判断 `activeGroupId === gid` → **直接返回**（不响铃、不弹 toast），
+  因为该消息马上会出现在聊天流里，响铃属于"自己打扰自己"；
+- 手机停在列表页（`activeGroupId` 为空）或收到**别的会话**的消息 → 照常响铃 + 提示。
+
+### 2) ② ESC **无条件**清空剪贴板
+
+- `staged_clear_plan(staged_text, clip_text)` 语义调整为：剪贴板**只要非空就清**（不再比对内容）；
+- 状态提示按实际情况区分：`🧹 已清除小窗暂存内容与剪贴板（ESC）` / `…小窗暂存内容…` / `…剪贴板…`；
+- 暂存与剪贴板**都空**时才什么都不做（平时按 Esc 不会刷出无意义提示、也不会误清）；
+- 因为 F7/F9/F10 都会把内容复制进剪贴板，这一条实际是"按 Esc 把玩家信息/草稿一次性清干净"。
+
+### 3) ③ 新消息同步推一条 Bark
+
+- 中继在推 `NEW_MESSAGE` 给手机的同时，`push_bark(f"💬 {name} 新消息", preview, gid)`；
+- 开关：`config.json` 的 **`bark_on_new_message`（默认 true）**，设 `false` 可关（避免被刷屏）；
+- `push_bark` 内部走线程池执行（`run_in_executor`），**不阻塞事件循环** —— 满足红线④。
+
+### 4) 验证
+
+```
+agent_core 16 / auto_reply 55（+6 新消息通知与 Bark 开关） /
+mobile_feature 46 / multi_conv 通过 / diag 30 / hud_layout 53（+4 ESC 无条件清剪贴板） /
+rules_sync 18 / token_leak 无泄露 / probe_smoke 85 / h5_security 107（+5 正在看会话不响铃）
+```
+
+> ⚠️ 本轮踩坑记录：往 `config.json` 末尾追加开关时留下了**尾逗号**，导致 JSON 解析失败
+> （后果会很严重：中继读不到密钥 → AI 全挂）。已立刻修正并用 `json.load` 复验通过。
+> 以后改 config 一律"改完立刻 `json.load` 验证"。
+
+---
+
 *此文档由 AI Bug 排查 Agent 自动生成*

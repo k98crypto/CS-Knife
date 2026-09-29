@@ -217,21 +217,32 @@ def main():
           getattr(mod, "STAGED_PLACEHOLDER", "").startswith("（尚无"))
 
     ph, clear_clip, had = mod.staged_clear_plan("（尚无，按 F7/F8 提炼后在此核验）", "随便什么")
-    check("本来就没有暂存内容 -> 什么都不做（也不清剪贴板）",
-          had is False and clear_clip is False and ph.startswith("（尚无"))
+    check("没有暂存内容但剪贴板里有东西 -> 仍无条件清剪贴板（客服要求）",
+          had is False and clear_clip is True and ph == "")
 
     ph, clear_clip, had = mod.staged_clear_plan("[F7·提炼] 玩家甲 UID:1001", "")
-    check("有暂存但剪贴板已是别的内容 -> 只清小窗，不动剪贴板",
+    check("有暂存、剪贴板为空 -> 只清小窗（提示也不会说清了剪贴板）",
           had is True and clear_clip is False and ph.startswith("（尚无"))
 
     ph, clear_clip, had = mod.staged_clear_plan("[F9·NORMAL] 您好，已为您处理", "[F9·NORMAL] 您好，已为您处理")
-    check("剪贴板里仍是那段暂存内容 -> 一并清掉",
+    check("剪贴板里是同一段暂存 -> 一起清掉",
           had is True and clear_clip is True and ph.startswith("（尚无"))
+
+    ph, clear_clip, had = mod.staged_clear_plan("[F9·NORMAL] 您好，已为您处理", "你后来复制的别的东西")
+    check("剪贴板里已是别的内容 -> 仍然一起清掉（ESC 无条件清剪贴板）",
+          had is True and clear_clip is True)
+
+    ph, clear_clip, had = mod.staged_clear_plan("（尚无）", "")
+    check("暂存与剪贴板都空 -> 什么都不做（不弹提示）", had is False and clear_clip is False)
 
     check("ESC 绑定到小窗窗口（聚焦时生效）", 'bind("<Escape>"' in src)
     check("ESC 注册为全局热键（浏览器聚焦时也能清）", "add_hotkey('esc'" in src)
     check("全局热键回调函数存在（无暂存时不做事）", "def clear_staged_hud" in src)
-    check("状态提示与底部提示都写明 ESC", "已清除小窗暂存内容" in src and "ESC 清除暂存" in src)
+    check("状态提示写明 ESC 清空（含剪贴板）",
+          '已清除{what}（ESC）' in src and "小窗暂存内容与剪贴板" in src)
+    check("底部提示写明 ESC 清除暂存", "ESC 清除暂存" in src)
+    check("ESC 无条件清剪贴板（不再比对内容）",
+          "piperclip" not in src and "clip_text" in src and "无条件清剪贴板" in src)
     check("清空走队列更新 UI（线程安全，不跨线程操作 Tk）",
           "def clear_staged" in src and "self._apply_ui(" in src and "self._staged_text" in src)
 

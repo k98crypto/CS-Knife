@@ -164,17 +164,21 @@ def long_human_alarm():
 
 # ==================== ESC：清空小窗"暂存内容" ====================
 # 「暂存内容」= 小窗中"最近提炼 / 框选预览 / F9·F10 结果"那一块（双击可复制）。
-# ESC 一键清空它；剪贴板**只在里面还是那段内容时**才清（你后来复制的东西不会被误删）。
+# ESC 一键清空它，并**无条件**把剪贴板也清掉（客服要求：防止玩家信息/草稿留在剪贴板里）。
+# 暂存与剪贴板都空时才什么都不做（避免平时按 ESC 刷出无意义的提示）。
 STAGED_PLACEHOLDER = "（尚无，按 F7/F8 提炼后在此核验）"
 
 
 def staged_clear_plan(staged_text: str, clip_text: str):
-    """纯逻辑（不依赖 Tk，便于单测）：返回 (新文案, 是否应清剪贴板, 是否真的有内容可清)。"""
+    """纯逻辑（不依赖 Tk，便于单测）：返回 (新文案, 是否清剪贴板, 是否有暂存内容)。
+
+    - 剪贴板：**无条件清**（只要里面有东西）—— 这是客服明确要求的"ESC 连剪贴板一起清"；
+    - 暂存内容：有就清回占位，没有就只清剪贴板。
+    """
     txt = (staged_text or "").strip()
-    if not txt or txt.startswith("（尚无"):
-        return STAGED_PLACEHOLDER, False, False          # 本来就没暂存 -> 什么都不做
-    same = bool(clip_text) and clip_text.strip() == txt
-    return STAGED_PLACEHOLDER, same, True
+    had = bool(txt) and not txt.startswith("（尚无")
+    clear_clip = bool((clip_text or "").strip())
+    return (STAGED_PLACEHOLDER if had else ""), clear_clip, had
 
 class HUDOverlay:
     """桌面悬浮窗（始终置顶 + 可折叠 + 可召回 + 连接状态灯）。
@@ -472,7 +476,7 @@ class HUDOverlay:
             pass
 
     def clear_staged(self, event=None):
-        """ESC：清空小窗"暂存内容"（最近提炼 / 框选预览 / F9·F10 结果）。
+        """ESC：清空小窗"暂存内容"（最近提炼 / 框选预览 / F9·F10 结果）**并清空剪贴板**。
 
         线程安全：只读实例变量 + 通过队列更新 UI（全局热键回调在别的线程里执行）。
         """
@@ -483,13 +487,22 @@ class HUDOverlay:
             except Exception:
                 clip = ""
             new_text, clear_clip, had = staged_clear_plan(cur, clip)
-            if not had:
-                return                            # 没有暂存内容：不做任何事（也不误清剪贴板）
-            self._apply_ui(status="🧹 已清除小窗暂存内容（ESC）", status_color=FG_DIM,
-                           last=new_text, last_color=FG_DIM)
+            if not had and not clear_clip:
+                return                            # 暂存与剪贴板都是空的：不做任何事、不弹提示
+            if had and clear_clip:
+                what = "小窗暂存内容与剪贴板"
+            elif had:
+                what = "小窗暂存内容"
+            else:
+                what = "剪贴板"
+            if had:
+                self._apply_ui(status=f"🧹 已清除{what}（ESC）", status_color=FG_DIM,
+                               last=new_text, last_color=FG_DIM)
+            else:
+                self._apply_ui(status=f"🧹 已清除{what}（ESC）", status_color=FG_DIM)
             if clear_clip:
                 try:
-                    pyperclip.copy("")            # 剪贴板里仍是那段暂存 -> 一并清掉
+                    pyperclip.copy("")            # 无条件清剪贴板（客服要求）
                 except Exception:
                     pass
         except Exception:

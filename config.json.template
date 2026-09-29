@@ -25,6 +25,9 @@
 
   "im_proxy_enabled": true,
 
+  "_说明_新消息通知": "bark_on_new_message=true 时，玩家每来一条新消息都会额外推一条 Bark（手机锁屏也能收到）；不想被刷屏就设 false",
+  "bark_on_new_message": true,
+
   "_说明_workbench": "工单工作台域名（油猴脚本 @match 用）。仓库里的 probe.js 只放占位域名，中继 /probe.js 会按这里注入你的真实域名（可多个）",
   "workbench_domains": ["ticket.example.com"],
 

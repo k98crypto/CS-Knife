@@ -205,5 +205,20 @@ for g in (G2, G3):
     B.state["companies"]["main"]["conversations"].pop(g, None)
 B._PENDING_CLOSE.clear()
 
+print("\n[9] 新消息通知（V7.5）：中继即时推送 + Bark 开关")
+SRC = open("bridge_server.py", encoding="utf-8").read()
+check("中继向手机推 NEW_MESSAGE（含 groupID/name/preview/mode/ts）",
+      '"type": "NEW_MESSAGE"' in SRC and '"preview": preview' in SRC and '"mode": mode_now' in SRC)
+check("有 _LAST_NOTIFIED 水位线（同一条不重复通知）",
+      "_LAST_NOTIFIED" in SRC and "new_ts > int(_LAST_NOTIFIED.get(gid)" in SRC)
+check("新消息也推 Bark，且可用 bark_on_new_message 关掉",
+      'config.get("bark_on_new_message", True)' in SRC and "push_bark(f\"💬 {name} 新消息\"" in SRC)
+check("Bark 开关默认开启（本机 config.json）", bool(B.config.get("bark_on_new_message", True)),
+      str(B.config.get("bark_on_new_message", None)))
+check("手动模式不再用延迟队列重复提示（改即时通知）",
+      "手机端已即时提示" in SRC and 'status": "manual"' not in SRC)
+check("H5 正在看的会话不再响铃（避免打扰当前会话）",
+      "activeGroupId && gid === activeGroupId" in SRC)
+
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

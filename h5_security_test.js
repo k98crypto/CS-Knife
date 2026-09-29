@@ -471,5 +471,31 @@ check('又一条新消息 -> 再响一次', oscCount - oscBefore === 2, '振荡�
 check('手动模式下提示"AI 未自动起草"',
     (els['toast'].innerText || '').indexOf('未自动起草') !== -1, els['toast'].innerText);
 
+console.log('\n[16] V7.5 正在看该会话时不响铃（只提醒别的会话）');
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true, im_status: 1, im_status_known: true,
+    human_alerts: [],
+    companies: { main: { conversations: {
+        'T-VIEW': { name: '正在看的人', updatedAt: nowMs, msgs: [{ sender: 'player', text: '我在看这个会话', ts: nowMs }] },
+        'T-OTHER': { name: '别的玩家', updatedAt: nowMs - 5000, msgs: [{ sender: 'player', text: '别的会话消息', ts: nowMs - 5000 }] }
+    } } }
+} });
+const cards16 = (els['conv-container']._cards || []);
+const cardView = cards16.filter(c => c.dataset.gid === 'T-VIEW')[0];
+check('会话卡片可点击进入聊天页（事件委托绑定）', !!(cardView && cardView._click));
+if (cardView && cardView._click) cardView._click();          // -> activeGroupId = T-VIEW
+let osc16 = oscCount;
+onmsg({ type: 'NEW_MESSAGE', groupID: 'T-VIEW', name: '正在看的人', preview: '又发了一条', mode: 'semi', ts: 3333 });
+check('正在看的会话来新消息 -> 不响铃/不弹提示（消息已在聊天流里）',
+    oscCount === osc16, '振荡器 +' + (oscCount - osc16));
+const toast16 = els['toast'].innerText || '';
+check('正在看的会话也不弹提示（不打扰）', toast16.indexOf('又发了一条') === -1, toast16);
+
+osc16 = oscCount;
+onmsg({ type: 'NEW_MESSAGE', groupID: 'T-OTHER', name: '别的玩家', preview: '别的会话新消息', mode: 'semi', ts: 4444 });
+check('别的会话来新消息 -> 照常响铃', oscCount - osc16 === 2, '振荡器 +' + (oscCount - osc16));
+check('别的会话提示里带玩家名',
+    (els['toast'].innerText || '').indexOf('别的玩家') !== -1, els['toast'].innerText);
+
 console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
 process.exit(fail === 0 ? 0 : 1);
