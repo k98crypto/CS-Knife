@@ -502,6 +502,19 @@ async def main():
         async with s.post(BASE + "/api/fill_draft", json={"content": "【规章库未收录，请上报内部群核实】"}) as r:
             check("纯内部提示的文案被拦截（400）", r.status == 400, f"status={r.status}")
         # 手机端代发同样过闸
+        # ★ V7.9：先让"网页"打开这个工单（否则会被新增的"页面绑定"核对拦下 —— 那是防发错玩家）
+        await ext4.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": GID, "name": "安全闸测试", "playerInfo": "安全闸测试 | UID:9001", "messages": []}})
+        await asyncio.sleep(0.3)
+        await drain(ext4, 0.3, tries=3)
+        # 先验证"目标会话 ≠ 网页当前工单"会被拦下（防发错玩家 —— 真实事故的第二道保险）
+        await mobile.send_json({"action": "SEND_REPLY", "groupID": "NOTOPEN-" + RUN,
+                                "content": "这条不该发出去"})
+        await asyncio.sleep(0.5)
+        _, ext4_wrong = await drain(ext4, 0.5, tries=4)
+        check("目标会话与网页当前工单不一致 -> 拒绝代发（防止发错玩家）",
+              not any(m.get("command") == "SEND_REPLY" for m in ext4_wrong),
+              str([m.get("command") for m in ext4_wrong][:5]))
         await mobile.send_json({"action": "SEND_REPLY", "groupID": GID,
                                 "content": "我们会赔偿您 888 元，请进群找群内客服"})
         await asyncio.sleep(0.5)

@@ -1,47 +1,44 @@
 {
-  "port": 8765,
-  "bark_key": "YOUR_BARK_KEY",
-  "deepseek_api_key": "sk-YOUR_DEEPSEEK_API_KEY",
-
-  "_说明_同步": "表格直链同步（可选）：任何能直接返回 xlsx 的地址；留空则只用本地文件/watch 目录",
-  "rules_sync_url": "",
-  "rules_sheet_id": "",
-  "rules_app_token": "",
-
-  "use_local_excel": true,
-  "local_excel_path": "rules.xlsx",
-
-  "rules_auto_sync": true,
-  "rules_sync_interval_minutes": 30,
-  "rules_watch_dir": "",
-
-  "kb_retrieval_enabled": true,
-  "kb_retrieval_top_k": 25,
-  "kb_static_max_chars": 12000,
-  "kb_entry_max_chars": 400,
-
-  "close_category_path": ["一级分类", "二级分类"],
-  "close_category_default": "其他",
-
-  "im_proxy_enabled": true,
-
-  "_说明_新消息通知": "bark_on_new_message=true 时，玩家每来一条新消息都会额外推一条 Bark（手机锁屏也能收到）；不想被刷屏就设 false",
-  "bark_on_new_message": true,
-
-  "_说明_三个AI开关": "三个可单独关闭的 AI 动作：①AI回复并关单 ②AI自动起草（半自动也不再自动出手）③桌面F10 AI润色",
-  "enable_ai_close": true,
-  "enable_auto_draft": true,
-  "enable_f10_polish": true,
-
-  "_说明_workbench": "工单工作台域名（油猴脚本 @match 用）。仓库里的 probe.js 只放占位域名，中继 /probe.js 会按这里注入你的真实域名（可多个）",
-  "workbench_domains": ["ticket.example.com"],
-
-  "_说明_brand": "品牌/称谓（可选）。仓库源码里只有通用默认词，把你自己的公司名/游戏名/玩家尊称写在这里即可，代码运行时自动替换。",
-  "brand": {
-    "company": "示例公司",
-    "product": "客服助手",
-    "game": "本游戏",
-    "im": "IM 系统",
-    "honorific": "亲爱的玩家"
-  }
+    "port": 8765,
+    "bark_key": "YOUR_BARK_KEY",
+    "deepseek_api_key": "sk-YOUR_DEEPSEEK_API_KEY",
+    "_说明_同步": "表格直链同步（可选）：任何能直接返回 xlsx 的地址；留空则只用本地文件/watch 目录",
+    "rules_sync_url": "",
+    "rules_sheet_id": "",
+    "rules_app_token": "",
+    "use_local_excel": true,
+    "local_excel_path": "rules.xlsx",
+    "rules_auto_sync": true,
+    "rules_sync_interval_minutes": 30,
+    "rules_watch_dir": "",
+    "kb_retrieval_enabled": true,
+    "kb_retrieval_top_k": 25,
+    "kb_static_max_chars": 12000,
+    "kb_entry_max_chars": 400,
+    "close_category_path": [
+        "一级分类",
+        "二级分类"
+    ],
+    "close_category_default": "其他",
+    "im_proxy_enabled": true,
+    "_说明_新消息通知": "bark_on_new_message=true 时，玩家每来一条新消息都会额外推一条 Bark（手机锁屏也能收到）；不想被刷屏就设 false",
+    "bark_on_new_message": true,
+    "outbound_enabled": true,
+    "_说明_三个AI开关": "三个可单独关闭的 AI 动作：①AI回复并关单 ②AI自动起草（半自动也不再自动出手）③桌面F10 AI润色",
+    "enable_ai_close": true,
+    "enable_auto_draft": true,
+    "enable_f10_polish": true,
+    "_说明_workbench": "工单工作台域名（油猴脚本 @match 用）。仓库里的 probe.js 只放占位域名，中继 /probe.js 会按这里注入你的真实域名（可多个）",
+    "workbench_domains": [
+        "ticket.example.com"
+    ],
+    "_说明_brand": "品牌/称谓（可选）。仓库源码里只有通用默认词，把你自己的公司名/游戏名/玩家尊称写在这里即可，代码运行时自动替换。",
+    "brand": {
+        "company": "示例公司",
+        "product": "客服助手",
+        "game": "本游戏",
+        "im": "IM 系统",
+        "honorific": "亲爱的玩家"
+    },
+    "_说明_出站停发": "设为 false = 一键停发：所有会进玩家对话框的内容（代发/草稿/回复并关单）全部被拦下；也可随时访问 /api/outbound?on=0 切换，自检页 /diag 里有按钮"
 }

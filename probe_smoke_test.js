@@ -847,7 +847,7 @@ function check(name, ok, extra) {
         serverSrc ? '' : 'bridge_server.py 不可读');
     check('分类改为按需读取（ensure_category_options，只在 AI 关单时调用）',
         serverSrc.indexOf('def ensure_category_options') !== -1
-        && serverSrc.indexOf('options = await ensure_category_options()') !== -1);
+        && serverSrc.indexOf('options = await ensure_category_options(') !== -1);
 
     console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
     const chip = (documentStub.body._children || []).find(n => n.tagName === 'DIV');

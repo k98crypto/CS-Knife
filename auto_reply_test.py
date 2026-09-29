@@ -325,12 +325,28 @@ check("会在页面上动手的指令都走 ext_targets（状态/挂起/发送/�
       "ext_targets(ws)" in SRC and SRC.count("ext_targets(ws)") >= 5)
 check("测试客户端不许真的 AI 关单（后台任务单独拦）",
       "测试客户端：已跳过真实 AI 关单" in SRC)
-check("send_to_player 带 origin（代发也不会打到真实探针）",
-      'async def send_to_player(payload, where="", origin=None)' in SRC and "origin=ws" in SRC)
+check("send_to_player 带 origin + require_page（代发不会打到真实探针 / 不会发错人）",
+      'async def send_to_player(payload, where="", origin=None, require_page=False)' in SRC
+      and "origin=ws, require_page=True" in SRC)
 check("自动重试也遵守隔离（im_intent_test）",
       'ext_targets("test" if state.get("im_intent_test") else None)' in SRC)
 check("测试脚本已全部改用 ?test=1 连接",
       True)
+print("\n[10.9] 出站硬保险（V7.9 事故后加固：绝不发错人 / 一键停发）")
+check("页面绑定核对：目标会话必须 == 网页当前打开的工单",
+      "def page_binding_ok" in SRC and "_LAST_PAGE_GID" in SRC and "require_page=True" in SRC)
+check("页面绑定区分真实/测试来源（测试假探针不污染真实页面绑定）",
+      "_LAST_TEST_PAGE_GID" in SRC and "def _origin_is_test" in SRC)
+check("send_to_player 三道闸：停发总开关 -> 页面绑定 -> 出站安全闸",
+      "if not outbound_enabled():" in SRC and "if require_page:" in SRC
+      and SRC.index("if not outbound_enabled():") < SRC.index("if pkt.get(\"content\"):"))
+check("测试来源按会话判定（避免全局标记被真实消息顶掉）",
+      'conv.get("_test_origin")' in SRC and "def _auto_origin(gid=None)" in SRC)
+check("一键停发开关 /api/outbound + 清理测试脏数据 /api/purge_test_data",
+      "def api_outbound" in SRC and '"/api/outbound"' in SRC
+      and "def api_purge_test_data" in SRC and "def _purge_test_convs" in SRC)
+check("自检页展示出站安全卡（含停发/清理入口）",
+      '出站安全（V7.9）' in SRC and '立即停发所有出站内容' in SRC)
 
 print("\n[11] 三个 AI 动作的独立开关（服务端）")
 SRC2 = SRC
@@ -344,7 +360,7 @@ check("自动起草被开关拦住（半自动也不再自动出手）",
 check("分类改为按需读取（不再连接时就嗅探下拉）",
       "def ensure_category_options" in SRC2 and 'await safe_send(ext, {"command": "REQUEST_CATEGORIES"})' in SRC2)
 check("按需读取只在真要选分类时调用（handle_ai_close 里）",
-      "options = await ensure_category_options()" in SRC2)
+      "options = await ensure_category_options(" in SRC2)
 check("分类候选回报会唤醒等待者", "_notify_category_waiters(state[\"category_options\"])" in SRC2)
 
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")

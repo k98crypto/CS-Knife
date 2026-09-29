@@ -146,18 +146,19 @@ def feature_flags():
 state["features"] = feature_flags()
 
 
-async def ensure_category_options(timeout: float = 2.0):
+async def ensure_category_options(origin=None, timeout: float = 2.0):
     """按需拿"问题分类"候选：内存里有就用；没有才请探针读一次（避免连接时就嗅探下拉）。
 
     只有真的要选分类（AI 关单）时才会调用到这里。
+    ★ V7.9：origin 为测试客户端时只问测试探针（不然会去点客服真实页面的下拉）。
     """
     opts = state.get("category_options") or []
-    if opts or not active_clients["extension"]:
+    if opts or not ext_targets(origin):
         return opts
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     _CATEGORY_WAITERS.append(fut)
-    for ext in list(active_clients["extension"]):
+    for ext in ext_targets(origin):
         await safe_send(ext, {"command": "REQUEST_CATEGORIES"})
     try:
         return (await asyncio.wait_for(fut, timeout=timeout)) or []
@@ -498,6 +499,11 @@ _IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，�
 
 # 最近一次有消息活动的工单 ID（供 /api/ticket 定位"当前工单"，比按插入顺序取最后一个更准）
 _LAST_ACTIVE = {"gid": None}
+# ★ V7.9 血泪教训：探针的 SEND_REPLY / FILL_DRAFT / 回复并关单 永远作用于"页面当前打开的工单"，
+#   所以发送前必须核对 gid 是否就是这个工单，否则会发错玩家（测试数据曾因此发进真实工单）。
+#   真实探针与测试探针各记一份，互不干扰。
+_LAST_PAGE_GID = {"gid": ""}
+_LAST_TEST_PAGE_GID = {"gid": ""}
 # ★ 分类候选的"按需等待者"（ensure_category_options 用）
 _CATEGORY_WAITERS = []
 _PONG_WAITERS = []                   # ★ V7.8：/api/probe_ping 等探针 PONG 的地方（诊断用）
@@ -589,15 +595,35 @@ def safe_outbound(text, where=""):
     return clean, left
 
 
-async def send_to_player(payload, where="", origin=None):
+async def send_to_player(payload, where="", origin=None, require_page=False):
     """把指令发给电脑端探针去执行前，先把"玩家可见文本"过一遍安全闸。
 
     payload 形如 {"command": "SEND_REPLY"|"FILL_DRAFT"|"ACTION_REPLY_CLOSE", "content": "..."}
-    返回 True=已发出；False=清洗后为空（调用方需兜底，比如改发安抚话术）。
+    返回 True=已发出；False=清洗后为空 / 被安全策略拦下（调用方需兜底）。
 
     origin：指令的来源连接。★ V7.9 —— 若来源是"测试客户端"，只发给测试探针（绝不点真实工单）。
+    require_page：★ V7.9 —— 发送前核对"目标工单 == 网页当前打开的工单"，
+                  对不上就拒绝（探针的发送永远作用于页面当前工单，错了就会发错玩家）。
     """
     pkt = dict(payload or {})
+    # ⓪ 总开关（一键止血）
+    if not outbound_enabled():
+        print(f"[停发] outbound_enabled=false，已拦截（{where}）")
+        for m in list(active_clients["mobile"]):
+            await safe_send(m, {"type": "AI_STATUS", "status": "error",
+                                "message": "已开启「停发」：所有会进玩家对话框的内容都被拦住了"
+                                           "（config.json → outbound_enabled=false）"})
+        return False
+    # ① 页面绑定核对（防"发错人"）
+    if require_page:
+        ok_page, note = page_binding_ok(pkt.get("groupID"), origin)
+        if not ok_page:
+            print(f"[页面绑定] 拒绝发送：{note}（{where}）")
+            for m in list(active_clients["mobile"]):
+                await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": note,
+                                    "groupID": str(pkt.get("groupID") or "")})
+            return False
+    # ② 出站安全闸（玩家可见文本的唯一出口）
     if pkt.get("content"):
         clean, left = safe_outbound(pkt["content"], where or str(pkt.get("command") or ""))
         if not clean:
@@ -729,14 +755,88 @@ async def send_hold_and_alert(group_id: str, conv: dict, history_str: str, reply
     return alert
 
 
-# ==================== ★ V7.9 测试隔离 ====================
-def _auto_origin():
+# ==================== ★ V7.9 测试隔离 + 页面绑定 + 停发开关 ====================
+def _auto_origin(gid=None):
     """自动起草/自动回复的指令来源标记。
 
-    若最近这批"玩家消息"是测试脚本（?test=1）发来的，就返回 "test" —— 后续指令只会
-    发给测试探针，绝不填/发客服的真实工单（客服投诉过测试把他的工单点了）。
+    若这条会话是测试脚本（?test=1）造出来的，就返回 "test" —— 后续指令只会发给测试探针，
+    绝不填/发客服的真实工单（客服投诉过测试把问候语发进了玩家真实工单）。
+
+    ★ 按**会话**判断（`conv["_test_origin"]`），不依赖全局标记 —— 全局标记会被随后到来的
+      真实玩家消息顶掉，那正是会把测试的延迟回复打到真实工单的漏洞。
     """
-    return "test" if state.get("automation_origin_test") else None
+    try:
+        if gid:
+            conv = state["companies"]["main"]["conversations"].get(str(gid)) or {}
+            if conv.get("_test_origin"):
+                return "test"
+    except Exception:
+        pass
+    return "test" if state.get("automation_origin_test") and not gid else None
+
+
+def _origin_is_test(origin):
+    """"测试来源"判定：连接对象带 ?test=1，或用 "test" 哨兵（自动/延迟流程用）。"""
+    if origin == "test":
+        return True
+    try:
+        return origin is not None and origin in TEST_WS
+    except Exception:
+        return False
+
+
+def page_gid(origin=None):
+    """电脑网页"此刻打开的那个工单"（由探针的 PLAYER_MESSAGE 上报）。真实/测试各记一份。"""
+    if _origin_is_test(origin):
+        return _LAST_TEST_PAGE_GID.get("gid") or ""
+    return _LAST_PAGE_GID.get("gid") or ""
+
+
+def page_binding_ok(gid, origin=None):
+    """发送前核对：目标工单 == 网页当前打开的工单？返回 (ok, 说明)。
+
+    ★ V7.9 血泪教训（真实事故）：探针的 SEND_REPLY / FILL_DRAFT / 回复并关单 永远作用在
+      **页面当前打开的那个工单**上。只要 gid 与页面对不上，这条指令就会发错人
+      —— 测试数据曾因此把问候语发进了玩家真实工单并被撤回。
+    """
+    cur = page_gid(origin)
+    is_test = _origin_is_test(origin)
+    if not cur:
+        if is_test:
+            return False, "网页还没上报当前工单，测试模式下拒绝发送"
+        return True, "（网页尚未上报当前工单，放行但请留意）"
+    if str(cur) == str(gid):
+        return True, ""
+    return False, (f"电脑网页当前打开的是「{cur}」，不是这条会话「{gid}」"
+                   f"—— 请先在电脑上切到该会话再操作（避免发错玩家）")
+
+
+def outbound_enabled():
+    """总开关：停发所有"会进玩家对话框"的文本（config.json → outbound_enabled，默认 true）。
+
+    这是给客服的"一键止血"：历史上出现过测试数据把消息发进真实工单的事故。
+    """
+    return bool(config.get("outbound_enabled", True))
+
+
+def _purge_test_convs():
+    """清掉测试脚本造的会话（形如 F-<数字>/AUTO-<数字>/T-A-<数字>/CLOSEFAIL-<数字>）。
+
+    真实工单的 id 是"页面上真实工单号"或 P+hash，绝不会长成这些形状，所以不会被误删。
+    """
+    import re as _re
+    pat = _re.compile(r"^(F|AUTO|AUTO2|T-A|T-B|T-C|CLOSEFAIL)-\d{6,}$")
+    convs = state["companies"]["main"]["conversations"]
+    gone = [k for k in list(convs.keys()) if pat.match(str(k))]
+    for k in gone:
+        convs.pop(k, None)
+    if _LAST_ACTIVE.get("gid") in gone:
+        _LAST_ACTIVE["gid"] = None
+    for k in gone:
+        _PENDING.pop(k, None)
+        _PENDING_CLOSE.pop(k, None)
+        _LAST_NOTIFIED.pop(k, None)
+    return gone
 
 
 async def handle_ai_automation(group_id: str, source: str = "", force: bool = False):
@@ -807,14 +907,17 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
                 await send_to_player({"command": "ACTION_REPLY_CLOSE", "category": "其他",
                                       "categoryPath": (config.get("close_category_path") or ["一级分类", "二级分类"]),
                                       "defaultCategory": config.get("close_category_default", "其他"),
-                                      "content": body, "groupID": group_id}, "超时关单", origin=_auto_origin())
+                                      "content": body, "groupID": group_id}, "超时关单",
+                                     origin=_auto_origin(group_id), require_page=True)
             else:
                 await send_to_player({"command": "SEND_REPLY", "content": body,
-                                      "groupID": group_id}, "AFK 自动回复", origin=_auto_origin())
+                                      "groupID": group_id}, "AFK 自动回复",
+                                     origin=_auto_origin(group_id), require_page=True)
         else:
             # 半自动模式：草稿推到网页与手机输入框（同样已过安全闸）
-            await send_to_player({"command": "FILL_DRAFT", "content": body, "category": "其他"},
-                                 "半自动草稿", origin=_auto_origin())
+            await send_to_player({"command": "FILL_DRAFT", "content": body, "category": "其他",
+                                  "groupID": group_id}, "半自动草稿",
+                                 origin=_auto_origin(group_id), require_page=True)
             for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": body})
 
 
@@ -1981,6 +2084,39 @@ async def api_probe_ping(request):
     return web.json_response({"ok": True, "conns": len(conns), "sent": sent, "pong": data})
 
 
+async def api_outbound(request):
+    """🛑 一键止血开关：停发 / 恢复所有"会进玩家对话框"的内容。
+
+    用法：`/api/outbound?on=0` 立即停发（SEND_REPLY / FILL_DRAFT / 回复并关单 全被拦下），
+          `/api/outbound?on=1` 恢复。对应 config.json 的 `outbound_enabled`（落盘生效）。
+    """
+    on = str(request.query.get("on", "1")).lower() not in ("0", "false", "off", "no")
+    config["outbound_enabled"] = bool(on)
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"[停发] 写入 config.json 失败（内存里已生效）：{e}")
+    print(f"[停发] {'已恢复发送' if on else '🛑 已停发所有出站内容'}")
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "FULL_SYNC", "data": state})
+        await safe_send(m, {"type": "AI_STATUS", "status": "ok" if on else "error",
+                            "message": ("已恢复发送" if on else "🛑 已停发：所有会进玩家对话框的内容都被拦住")})
+    return web.json_response({"ok": True, "outbound_enabled": bool(on)})
+
+
+async def api_purge_test_data(request):
+    """🧹 清掉测试脚本造成的脏数据（形如 F-<数字>/AUTO-<数字>/T-A-<数字>/CLOSEFAIL-<数字> 的会话）。
+
+    真实工单 id 是"页面上真实工单号"或 P+hash，不会被误删。
+    """
+    gone = _purge_test_convs()
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "FULL_SYNC", "data": state})
+    print(f"[清理] 已移除 {len(gone)} 个测试会话：{', '.join(gone[:10])}")
+    return web.json_response({"ok": True, "removed": gone, "removed_count": len(gone)})
+
+
 async def api_diag(request):
     # 顺手刷新一次三个开关（配置文件被改过也能反映出来）
     state["features"] = feature_flags()
@@ -1992,6 +2128,16 @@ async def api_diag(request):
         "ok": True,
         "server_ver": SERVER_VER,
         "features": state.get("features") or feature_flags(),
+        # ★ V7.9 安全状态：出站总开关 + "网页当前打开的工单" + 测试客户端数（一键止血/防发错人）
+        "safety": {
+            "outbound_enabled": outbound_enabled(),
+            "page_gid": page_gid(),
+            "test_clients": len(TEST_WS),
+            "pause_url": "/api/outbound?on=0",
+            "purge_test_url": "/api/purge_test_data",
+            "note": "outbound_enabled=false 时所有会进玩家对话框的内容都会被拦下；"
+                    "page_gid 与目标会话不一致时会拒绝发送（探针永远发到页面当前打开的工单）",
+        },
         "server": {
             "port": PORT,
             "ip": get_local_ip(),
@@ -2263,6 +2409,15 @@ async def diag_page_handler(request):
                                      if state.get("ext_cmd_debug") else "无（还没下发过指令）")) +
                  '</div>')
 
+    cards.append('<div class="card"><div class="k">出站安全（V7.9）</div>' +
+                 row("是否允许发送", "✅ 允许" if outbound_enabled() else
+                     "🛑 已停发（<a href=\"/api/outbound?on=1\">点这里恢复</a>）") +
+                 row("网页当前工单", page_gid() or "（探针还没上报）") +
+                 row("测试客户端连接数", len(TEST_WS)) +
+                 row("一键停发", '<a href="/api/outbound?on=0">立即停发所有出站内容</a>') +
+                 row("清理测试脏数据", '<a href="/api/purge_test_data">清掉测试造的会话</a>') +
+                 '</div>')
+
     cards.append('<div class="card"><div class="k">工单与知识库</div>' +
                  row("会话数", len(convs)) +
                  row("问题分类数", len(state.get("category_options") or [])) +
@@ -2492,9 +2647,19 @@ async def ws_ext_handler(request):
                     
                 elif ev == "PLAYER_MESSAGE":
                     payload = pkt.get("data", {})
-                    # ★ V7.9：记下"这批玩家消息是不是测试脚本发来的"，后续自动起草/回复只打到测试探针
-                    state["automation_origin_test"] = (ws in TEST_WS)
+                    # ★ V7.9：记下"这批玩家消息是不是测试脚本发来的"（同时落到会话上，见下），
+                    #   后续自动起草/自动回复只打到测试探针 —— 绝不填/发客服的真实工单。
+                    _is_test_origin = (ws in TEST_WS)
+                    state["automation_origin_test"] = _is_test_origin
                     gid = payload.get("groupID")
+                    # ★ V7.9 血泪教训：探针的"发送/填写"永远作用于**页面当前打开的那个工单**。
+                    #   这里记下"网页上此刻打开的工单"，发送前必须核对，避免发错人。
+                    #   真实探针与测试探针各记一份（测试的假探针不该污染真实页面的绑定）。
+                    if gid:
+                        if _is_test_origin:
+                            _LAST_TEST_PAGE_GID["gid"] = str(gid)
+                        else:
+                            _LAST_PAGE_GID["gid"] = str(gid)
                     
                     target = state["companies"]["main"]
                     # 会话上限 50，超出时淘汰"最久没有新消息"的那个（而不是最早创建的），避免误删活跃工单
@@ -2514,6 +2679,10 @@ async def ws_ext_handler(request):
 
                     c = target["conversations"].setdefault(gid, {"name": name, "msgs": [], "updatedAt": 0})
                     c["name"] = name                       # 每次都刷新名称，不再只在首次写入
+                    # ★ V7.9：把"这条会话的数据来自测试客户端"记在会话上（比全局标记可靠：
+                    #   全局标记会被随后到来的真实消息顶掉，导致测试的延迟回复打到真实工单）
+                    if _is_test_origin:
+                        c["_test_origin"] = True
                     raw_msgs = payload.get("messages", [])
                     now_ms = int(time.time() * 1000)
                     # 覆盖数组杜绝雪球；过滤脏数据；并为每条消息补时间戳（保留已有消息的原时间）
@@ -2591,6 +2760,7 @@ async def ws_ext_handler(request):
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
     finally:
         active_clients["extension"].discard(ws)
+        TEST_WS.discard(ws)                  # ★ V7.9：断开就摘掉，别让计数/隔离判断留在脏数据上
         _PROBE_CONNS.pop(ws, None)
         _probe_refresh()
         if not active_clients["extension"]:
@@ -2693,7 +2863,7 @@ async def handle_ai_close(group_id: str, origin=None):
         return False, "会话不存在（可能已关单）"
 
     history_str = build_chat_history_str(group_id) or str(conv.get("playerInfo") or "") or "（无聊天记录）"
-    options = await ensure_category_options() or config.get("close_category_options") or []
+    options = await ensure_category_options(origin) or config.get("close_category_options") or []
 
     try:
         category, content = await asyncio.get_event_loop().run_in_executor(
@@ -2720,7 +2890,7 @@ async def handle_ai_close(group_id: str, origin=None):
         "defaultCategory": config.get("close_category_default", "其他"),
         "groupID": group_id,
     }
-    await send_to_player(payload, "关单结束语", origin=origin)
+    await send_to_player(payload, "关单结束语", origin=origin, require_page=True)
 
     # ★ 关键改动：不再立刻移除会话 —— 先标记"关单中"，等探针回执确认成功后才移除。
     #   （旧实现删早了：页面点失败会导致"卡片消失但工单还挂着"）
@@ -2964,9 +3134,10 @@ async def ws_mobile_handler(request):
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 修复 BUG-011：过滤 action 字段，仅转发必要字段
                     await send_to_player({"command": "SEND_REPLY", "groupID": gid,
-                                          "content": text}, "手机端代发", origin=ws)
+                                          "content": text}, "手机端代发", origin=ws, require_page=True)
     finally:
         active_clients["mobile"].discard(ws)
+        TEST_WS.discard(ws)                  # ★ V7.9：断开就摘掉，别让计数/隔离判断留在脏数据上
     return ws
 
 # ==================== 后台任务 ====================
@@ -3027,6 +3198,8 @@ app.router.add_post("/api/mode", api_mode)
 app.router.add_get("/api/diag", api_diag)
 app.router.add_get("/api/im_reset", api_im_reset)
 app.router.add_get("/api/probe_ping", api_probe_ping)
+app.router.add_get("/api/outbound", api_outbound)
+app.router.add_get("/api/purge_test_data", api_purge_test_data)
 app.router.add_get("/ws/extension", ws_ext_handler)
 app.router.add_get("/ws/mobile", ws_mobile_handler)
 
