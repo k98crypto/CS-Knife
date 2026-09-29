@@ -117,6 +117,30 @@ async def main():
                   d2.get("im_status") == 1 and d2.get("alarm_status") is False,
                   f"im_status={d2.get('im_status')} alarm={d2.get('alarm_status')}")
 
+        # ---------- 1.5 逃生舱：以网页真实现状为准重置（V7.7） ----------
+        print("\n[1.5] IM 状态逃生舱（RESET_IM_STATE：记录与网页不一致时一键跟随网页）")
+        await mobile.send_json({"action": "SET_IM_STATUS", "status": 2})      # 先造一个"人工忙碌"
+        await asyncio.sleep(0.4)
+        await drain(ext, 0.3)
+        await drain(mobile, 0.3)
+        await mobile.send_json({"action": "RESET_IM_STATE"})
+        await asyncio.sleep(0.5)
+        snap_r, m_msgs_r = await drain(mobile, 0.5)
+        check("重置后手机端拿到完整快照（含 im 状态三件套）",
+              isinstance(snap_r, dict)
+              and all(k in snap_r for k in ("im_status", "im_status_known", "im_status_manual")),
+              str({k: (snap_r or {}).get(k) for k in ("im_status", "im_status_manual")}))
+        if external_probe:
+            check("另有真实探针在线，跳过「手动锁已清除」断言（多客户端场景）", True,
+                  f"got im_status_manual={(snap_r or {}).get('im_status_manual')}")
+        else:
+            check("重置会清掉手动锁（im_status_manual=False）",
+                  (snap_r or {}).get("im_status_manual") is False,
+                  str((snap_r or {}).get("im_status_manual")))
+        check("重置给出可读提示（以网页真实现状为准）",
+              any("网页" in str(m.get("message")) for m in m_msgs_r if m.get("type") == "AI_STATUS"),
+              str([m.get("message") for m in m_msgs_r if m.get("type") == "AI_STATUS"][:1]))
+
         # ---------- 2. 唤醒补拉 ----------
         print("\n[2] 唤醒补拉（REQUEST_SNAPSHOT）")
         await mobile.send_json({"action": "REQUEST_SNAPSHOT"})

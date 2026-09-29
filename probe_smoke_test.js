@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '7.6';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '7.7';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -524,19 +524,37 @@ function check(name, ok, extra) {
     check('分类选不中时不再盲选第一项（改回报候选）',
         code.indexOf('兜底：取第一项') === -1 && code.indexOf('宁可不选') !== -1);
 
-    console.log('\n[8.9.0] V7.6 IM 状态：写法等价 + 切换后回读回报 + 手动"忙碌"也守住');
+    console.log('\n[8.9.0] V7.7 IM 状态：写法等价 + 懒渲染重试 + 回读回报 + 人手/中继分开上报');
+    // 只跑指定毫秒的待执行计时器（运行前先摘掉自己，避免连"执行期间新排的计时器"一起删掉）
+    const flushMs = (msList) => {
+        const pend = timeouts.filter(t => msList.indexOf(t.ms) !== -1);
+        pend.forEach(t => {
+            const i = timeouts.indexOf(t);
+            if (i !== -1) timeouts.splice(i, 1);
+        });
+        pend.forEach(t => { try { t.fn(); } catch (e) {} });
+        return pend.length;
+    };
     check('状态文本兼容"在线/忙碌/离线"（不要求必须带 IM 前缀）',
         code.indexOf('function normStatus') !== -1 && code.indexOf("bare === '离线'") !== -1);
     check('状态胶囊类名兜底（is-im-online / is-im-busy / is-im-offline）',
         code.indexOf('is-im-busy') !== -1 && code.indexOf('is-im-offline') !== -1);
     check('状态选项等价匹配（菜单写"在线"也能对上"IM在线"）',
-        code.indexOf('function sameStatus') !== -1 && code.indexOf('items.find(item => sameStatus') !== -1);
+        code.indexOf('function sameStatus') !== -1 && code.indexOf('sameStatus(o.text, targetStatus)') !== -1);
+    check('下拉是懒渲染：轮询等菜单 + 最多重试 3 次（不再固定 200ms 只点一下）',
+        code.indexOf('waitForMenu') !== -1 && code.indexOf('attempt < 3') !== -1
+        && code.indexOf('}, 200);') === -1);
+    check('失败时回报候选（带 tag/class/文本，便于实机校准）',
+        code.indexOf("o.tag + ':' + o.text") !== -1 && code.indexOf('dumpStatusMenu') !== -1);
     check('切完立刻回读并回报（不再"显示成功其实没变"）',
         code.indexOf('点完立刻回读真实状态并回报') !== -1
         && code.indexOf('reportActionResult("CHANGE_STATUS"') !== -1);
     check('手动"忙碌"与"离线"都纳入守护（不许被自动改成在线）',
         code.indexOf('isManualAway') !== -1 && code.indexOf('manualAwayStatus') !== -1
         && code.indexOf('isManualAway && manualAwayStatus') !== -1);
+    check('人手点击 / 中继指令分开上报（不再自己绕过中继的手动锁）',
+        code.indexOf('manualByUser') !== -1 && code.indexOf('manualViaRelay') !== -1
+        && code.indexOf('via_relay: manualViaRelay') !== -1);
 
     // 行为：菜单项写"在线"（无 IM 前缀）时也要点得到
     statusTriggerNodes = [makeEl('在线')];
@@ -547,14 +565,36 @@ function check(name, ok, extra) {
     if (wsStat.readyState !== FakeWebSocket.OPEN) wsStat.readyState = FakeWebSocket.OPEN;
     wsStat.onmessage({ data: JSON.stringify({ command: 'CHANGE_STATUS', status: 1 }) });
     await new Promise(r => setTimeout(r, 5));
-    timeouts.filter(t => t.ms === 200).forEach(t => t.fn());
+    flushMs([0]);                                          // waitForMenu 首次轮询 -> 命中菜单
     await new Promise(r => setTimeout(r, 5));
-    timeouts.filter(t => t.ms === 350).forEach(t => t.fn());
+    flushMs([400]);                                        // 点击后回读并回报
+    await new Promise(r => setTimeout(r, 5));
     check('页面写"在线"也能点到（等价匹配）', clickedLabels.indexOf('在线') !== -1,
         JSON.stringify(clickedLabels));
     check('切换结果回报给手机端（ACTION_RESULT/CHANGE_STATUS）',
         sent.some(s => s.event === 'ACTION_RESULT' && s.data.command === 'CHANGE_STATUS'),
         JSON.stringify(sent.filter(s => s.event === 'ACTION_RESULT').slice(-1)));
+    check('中继指令触发的上报标了 via_relay（人工标记留给"人手点网页"）',
+        sent.some(s => s.event === 'IM_STATUS' && s.data.via_relay === true && s.data.manual === false),
+        JSON.stringify(sent.filter(s => s.event === 'IM_STATUS').slice(-1)));
+    statusTriggerNodes = [];
+    statusText = 'IM在线';
+
+    // 8.9.0b：菜单里什么都没有（懒渲染失败）-> 如实回报候选清单，不谎报成功
+    statusTriggerNodes = [makeEl('IM在线')];
+    clickedLabels = [];
+    sent.length = 0;
+    wsStat.onmessage({ data: JSON.stringify({ command: 'CHANGE_STATUS', status: 2 }) });
+    for (let round = 0; round < 6; round++) {              // 3 次尝试 + 每次等待
+        await new Promise(r => setTimeout(r, 3));
+        flushMs([0, 150, 400]);
+    }
+    const failRes = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'CHANGE_STATUS');
+    check('找不到选项时如实回报失败（ok=false）',
+        failRes.some(r => r.data.ok === false), JSON.stringify(failRes.slice(-1)));
+    check('失败原因里带上"重试次数/候选"便于定位',
+        failRes.length > 0 && String(failRes[failRes.length - 1].data.detail).indexOf('页面候选') !== -1,
+        failRes.length ? failRes[failRes.length - 1].data.detail : 'none');
     statusTriggerNodes = [];
     statusText = 'IM在线';
 
@@ -591,7 +631,7 @@ function check(name, ok, extra) {
     composerStub = {
         tagName: 'DIV', getAttribute: () => null, parentElement: null,
         querySelector: sel => (sel === 'textarea' ? composerInput : null),
-        querySelectorAll: () => [sendBtnStub]
+        querySelectorAll: sel => (sel.indexOf('[contenteditable') === 0 ? [] : [sendBtnStub])
     };
     composerStub.parentElement = composerStub;
     clickedLabels = [];
@@ -647,6 +687,37 @@ function check(name, ok, extra) {
         sendRes.length >= 1 && sendRes[sendRes.length - 1].data.ok === false
         && String(sendRes[sendRes.length - 1].data.detail).indexOf('手动') !== -1,
         JSON.stringify(sendRes.slice(-1)));
+
+    console.log('\n[8.9.4] V7.7 回复框实机校准（Quill .ql-editor / .reply-btn / 只读模式）');
+    check('回复框优先 Quill 的 .ql-editor，且绝不写隐藏的 .ql-clipboard',
+        code.indexOf("querySelector('.ql-editor')") !== -1 && code.indexOf('ql-clipboard') !== -1);
+    check('发送键认实机类名 .reply-btn，并跳过灰按钮',
+        code.indexOf('button.im-action-btn.reply-btn') !== -1 && code.indexOf('!el.disabled') !== -1);
+    check('只读模式如实回报（.editor-readonly -> 提示先接入会话）',
+        code.indexOf('editorFailureReason') !== -1 && code.indexOf('editor-readonly') !== -1
+        && code.indexOf('请先在左侧会话列表接入') !== -1);
+    check('新增 __probe.editor() / __probe.dumpStatus() 排障入口',
+        code.indexOf('editor: function ()') !== -1 && code.indexOf('dumpStatus: function ()') !== -1);
+
+    // 行为：.editor-composer 里既有普通 input（分类框）又有 .ql-editor -> 必须写进 .ql-editor
+    const qlStub = { tagName: 'DIV', className: 'ql-editor ql-blank', innerText: '', textContent: '',
+                     classList: { contains: c => c === 'ql-blank', remove: () => {} },
+                     focus: () => {}, dispatchEvent: () => true, querySelector: () => null };
+    const catInputStub = { tagName: 'INPUT', value: '', dispatchEvent: () => true,
+                           getAttribute: () => null, className: 'el-input__inner' };
+    composerStub = {
+        tagName: 'DIV', getAttribute: () => null, parentElement: null,
+        querySelector: sel => (sel === '.ql-editor' ? qlStub
+                               : ((sel === 'textarea' || sel === 'input') ? catInputStub : null)),
+        querySelectorAll: () => []
+    };
+    composerStub.parentElement = composerStub;
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'FILL_DRAFT', content: '草稿内容', groupID: 'T-QL' }) });
+    await new Promise(r => setTimeout(r, 5));
+    check('草稿写进 .ql-editor（不再误写"请选择问题分类"输入框）',
+        qlStub.innerText === '草稿内容' && catInputStub.value === '',
+        'ql=' + JSON.stringify(qlStub.innerText) + ' 分类框=' + JSON.stringify(catInputStub.value));
 
     // 收尾：还原回复框为空（后续用例不受影响）
     composerStub = null;

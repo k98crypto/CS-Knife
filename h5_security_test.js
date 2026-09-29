@@ -281,6 +281,32 @@ check('面板已显示', els['sheet'].classList.contains('show'));
 sandbox.closeSheet();
 check('取消后关闭面板', !els['sheet'].classList.contains('show'));
 
+console.log('\n[10.2] V7.7 状态不一致时如实显示 + 逃生舱按钮');
+check('依赖服务端的「网页实际状态」字段（不做假的"已同步"）',
+    h5code.indexOf('im_status_page') !== -1);
+check('不一致时胶囊标出「网页仍 X」', h5code.indexOf('（网页仍') !== -1);
+check('新增 retryIMStatus / resetIMStatus 两个函数',
+    h5code.indexOf('function retryIMStatus') !== -1 && h5code.indexOf('function resetIMStatus') !== -1);
+check('「以网页为准」走 RESET_IM_STATE 动作', py.indexOf("action: 'RESET_IM_STATE'") !== -1);
+check('排障入口：请电脑端读一下状态选项（DUMP_STATUS）', py.indexOf("action: 'DUMP_STATUS'") !== -1);
+
+// 行为：记录=忙碌 但网页实际=在线 -> 胶囊如实标出，不假装一致
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true,
+    im_status: 2, im_status_known: true, im_status_manual: true, im_status_page: 1,
+    companies: { main: { conversations: {} } }
+} });
+check('记录=忙碌、网页=在线 -> 胶囊显示「IM 忙碌（网页仍在线）」',
+    els['im-label'].innerText.indexOf('网页仍在线') !== -1, els['im-label'].innerText);
+sandbox.openSheet('im');
+check('冲突时面板出现「重试同步」与「以网页为准」',
+    els['sheet-body'].innerHTML.indexOf('im:retry') !== -1
+    && els['sheet-body'].innerHTML.indexOf('im:page') !== -1,
+    els['sheet-body'].innerHTML.slice(0, 160));
+check('面板里常驻「读一下网页的状态选项」（排障）',
+    els['sheet-body'].innerHTML.indexOf('im:dump') !== -1);
+sandbox.closeSheet();
+
 // 行为：探针掉线 -> 胶囊显示"电脑未连接"，不亮绿灯
 onmsg({ type: 'FULL_SYNC', data: {
     afk_mode: false, alarm_status: false, extension_online: false,

@@ -1343,4 +1343,81 @@ rules_sync 18 / token_leak 无泄露 / probe_smoke 85 / h5_security 107（+5 正
 
 ---
 
+## 🔧 第十九轮（2026/9/29）：IM 状态「两边都改不动」修复 + 回复框 Quill 实机校准（v7.7）
+
+### 客服反馈
+
+> "之前在手机改了次 IM 忙碌没同步到电脑，现在电脑切忙碌也改不了，我也改不了手机状态。"
+> 附：工作台 Console 里的两段真实 DOM dump（会话列表 + 输入区）。
+
+### 1) 诊断：三个独立问题叠加（都有证据，不是猜的）
+
+| # | 证据 | 根因 |
+|---|------|------|
+| 1 | Console 日志 `⚠️ [探针] 未找到可见的 IM 状态选项：IM在线` —— 这句在仓库里**已不存在**；`git log -S` 显示它在 `013474d` 引入、v7.6 提交 `0b95467` 删除；两处日志行号（740 / 959）与 `1411508`/`6ee0698` 的 738 / 957 正好差 2 行（中继把 1 行 `@match` 展开成 3 个域名） | **浏览器里跑的是旧版脚本**（v7.5 时代），它的状态匹配是 `normText(菜单项).indexOf(normText('IM在线'))` → 菜单写「在线」时**永远匹配不上**，手机发的切换指令在页面上**一次都没生效过** |
+| 2 | `bridge_server.py` 原第 2109 行：`manual = bool(data.get("manual", False)) or (st in (2, 3))`；`SET_IM_STATUS` 又会乐观写入 | 探针上报的忙碌/离线被一律当成"手动"→ **探针自己就把中继的手动锁绕过**了；而"手机点了忙碌但页面没变"时中继只认意图、不认事实 → **两边都不一致，且谁也改不动**（落盘 `im_state.json` = `{status:2, manual:true}` 就是这状态） |
+| 3 | `probe.js` 原 `switchIMStatus`：固定 `setTimeout(…, 200)` + 只点一次；`CHANGE_STATUS` 处理里 `isManualAway = (cmd.status===2||3)` | Element 下拉**懒渲染/有过渡** → 200ms 常空手；且"中继让我切的"被记成"人手点的"，上报 `manual:true` 等于自己解除守卫 |
+| 4 | 输入区 dump：`{hasQlEditor:false, editable:false}` + `.editor-readonly = "管理员查看全部会话时为只读模式"` + 所有 `.im-action-btn` 都 `is-disabled` | 第一段 dump 是**只读视角**（不能据此写选择器——红线②禁止猜）；第二段（已接入会话）才拿到真靶点：回复框 = `div.ql-editor[contenteditable=true]`，发送键 = `button.im-action-btn.reply-btn`（**空/只读时 disabled**） |
+
+### 2) 修复：把「网页事实」和「人工意图」分开记（`bridge_server.py`）
+
+- `apply_im_status(status, manual=None, source="", from_probe=False)`：
+  - `from_probe=True`（探针读 DOM）只更新新增的 **`im_status_page`（网页实际）**，并置 `im_status_known=True`；
+  - 一旦"事实 ≠ 意图"，除了照旧拦住，还会 `_schedule_reassert()` **把人工意图重新下发**（≤3 次）；
+  - 连续 3 次仍不生效 → `_reassert_im_status()` **如实推手机**（不再假装成功），并用 `im_status_notified` 去重防刷屏；
+  - `manual=True`（手机/小窗或"人手点网页"）才更新手动锁时间戳并清掉冲突/重试计数。
+- `IM_STATUS` 事件：**删掉 `or (st in (2, 3))`**，`manual` 只认探针新字段 `manual`（人手点网页），
+  另记 `via_relay`；探针回读与要求不一致时打印 `[状态] ⚠️ 探针回读不一致：要求「X」，网页实际「Y」`。
+- **逃生舱**：新增 `reset_im_state()` + `act=="RESET_IM_STATE"`（手机） + `GET /api/im_reset`（浏览器直接开）
+  → 以网页真实现状为准、清掉卡住的手动锁（已验证：返回 `{"ok":true,"im_status":1,...}`）。
+- 自检页 `/diag` 与 `/api/diag` 新增：**网页实际 / 同步状态(是否冲突) / 重试次数 / 以网页为准重置**；
+  同时暴露 `GET /api/im_reset` 链接。
+
+### 3) 修复：手机端如实显示 + 三个排障按钮（H5）
+
+- `renderIMStatus()`：`im_status_page ≠ im_status` 时显示 `🟡 IM 忙碌（网页仍在线）`（灯变黄），不再假装一致；
+- 状态面板：冲突时多出 `🔁 重试同步` / `♻️ 以网页为准`，常驻 `🧭 读一下网页的状态选项`（发 `DUMP_STATUS`）。
+
+### 4) 修复：探针靶点与重试（`probe.js`，V7.7 实机校准）
+
+- **回复框**：优先 `.ql-editor` → 其它 `contenteditable`（排除 Quill 隐藏的 `.ql-clipboard`，
+  且只认 DIV/SPAN/P 容器）→ 最后才退回 `input/textarea`；写入走 `execCommand('insertText')`
+  并把光标移到末尾，再派发 `beforeinput/input/keyup/change`（Quill 才会把「回复」点亮）；
+- **发送键**：先找 `.im-action-btn.reply-btn`（**灰的跳过**），关键字/图标/回车兜底，
+  并在整页兜底里跳过 disabled 的按钮（旧版会点灰按钮却回报"成功"）；
+- **只读如实回报**：命中 `.editor-readonly` 时提示「当前是只读模式（管理员查看全部会话时为只读模式）
+  —— 请先在左侧会话列表接入/接手该工单」，不再报含糊的"未找到输入框"；
+- **IM 状态下拉**：`statusMenuItems()` + `waitForMenu()`（轮询 ≤1.8s）+ 最多 3 次尝试；
+  候选集扩到 `.el-dropdown-menu__item / .el-select-dropdown__item / [role=menuitem] / li`；
+  失败回执带 `TAG:文本` 候选清单；
+- **人手/中继分开**：新增 `manualByUser` / `manualViaRelay`，上报 `manual` + `via_relay`；
+- 排障入口：`__probe.dumpStatus()`（把下拉可见选项回报中继 + 打印）、`__probe.editor()`（回复框抓到谁/空不空）。
+
+### 5) 红线自查（对照 `.clinerules`）
+
+| 红线 | 本轮是否触碰 |
+|------|--------------|
+| ① 出站安全闸不可绕过 | ❌ 未触碰（未改 `safe_outbound` / `sanitize_*`） |
+| ② 实机 DOM 靶点不可猜 | ✅ 遵守：`.ql-editor` / `.reply-btn` / `.editor-readonly` / `.im-action-btn` 全部来自客服 Console 实测；`composerInput` 仍保留旧靶点作兜底 |
+| ③ 0-Token 预检与 `[TAG:...]` | ❌ 未触碰（未改 `agent_core.py`） |
+| ④ 去重 Hash / `msgs[-8:]` 截断 | ❌ 未触碰 |
+| ⑤ 默认草稿模式、非 AFK 不自动发送 | ❌ 未触碰（`sendFilledReply` 只在收到 `SEND_REPLY` 时动作） |
+| 行为约束（最小 diff / 新功能新函数 / 探针 try-catch 静默 / 改前汇报） | ✅ 全部遵守（本轮改动前已先汇报文件+函数+插入逻辑） |
+
+### 6) 验证
+
+```
+probe_smoke 104（+11 懒渲染重试/候选回报/人手↔中继分离/Quill 写入） / h5_security 119（+8 冲突显示/逃生舱按钮）
+auto_reply 75（+9 网页事实 vs 人工意图/重置逃生舱） / mobile_feature 49（+3 RESET_IM_STATE）/ diag 30
+multi_conv 通过 / hud_layout 55 / agent_core 16 / rules_sync 18 / token_leak 无泄露
+线上实测：重启中继后 /api/diag.im = {"status":2,"page_status":1,"conflict":true,"tries":3}（如实暴露不一致）
+         → GET /api/im_reset → {"ok":true,"im_status":1,"im_status_text":"在线"}（手动锁已清除）
+```
+
+> ⚠️ 本轮踩坑记录：1) 诊断阶段最关键的证据是"Console 里的报错文案在仓库里根本不存在"——
+> 由此定位到**浏览器跑的是旧脚本**（中继发的是新脚本），所以"改了没生效"必须**先核对探针版本**；
+> 2) 写测试助手时踩到"先删除待跑计时器再执行"会把执行期间新排的计时器一起删掉 → 必须**按对象身份摘除**。
+
+---
+
 *此文档由 AI Bug 排查 Agent 自动生成*

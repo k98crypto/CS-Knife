@@ -75,6 +75,12 @@ state = {
     "im_status": 1,                 # 1=IM在线 2=IM忙碌 3=IM离线（由探针上报真实值）
     "im_status_known": False,       # 本进程是否已从"电脑网页"核实过真实状态（未核实前手机端显示"正在获取…"）
     "im_status_manual": False,      # 该状态是否来自客服手动选择（手动离线必须稳住，不能被自动改成在线）
+    # ★ V7.7：把"网页真实现状"和"人工意图"分开记（真机 bug：手机显示忙碌、网页其实在线、两边都改不动）
+    "im_status_page": 0,            # 探针最后一次读到的网页真实状态（0=还没读到）
+    "im_status_manual_at": 0,       # 最近一次"人工设置状态"的时间戳
+    "im_status_tries": 0,           # 已把"人工意图"重新下发给探针几次
+    "im_status_conflict": "",       # "意图:网页" 不一致组合（内部去重用）
+    "im_status_notified": "",       # 已经提示过手机的冲突组合（避免刷屏）
     "extension_online": False,      # 电脑端探针是否在线（决定手机端能否远程操作）
     "probe_version": "",            # 探针（油猴脚本）版本号，来自 PROBE_HELLO/PROBE_HEARTBEAT
     "probe_last_seen": 0,           # 探针最近一次心跳时间戳（秒），手机端可据此判断新鲜度
@@ -161,12 +167,89 @@ def _notify_category_waiters(options):
                 pass
 
 
-def apply_im_status(status, manual=None, source=""):
+def _im_txt(code):
+    """状态码 -> 中文（日志/提示统一用词）。"""
+    try:
+        return {1: "在线", 2: "忙碌", 3: "离线"}.get(int(code or 0), "未知")
+    except Exception:
+        return "未知"
+
+
+def _schedule_reassert(target_code):
+    """把"人工设定的状态"重新下发给探针（网页自己跳回去 / 切换没生效时兜底）。
+
+    没有运行中的事件循环（例如同步的单元测试）就直接返回，绝不在这里阻塞。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    except Exception:
+        return
+    try:
+        asyncio.ensure_future(_reassert_im_status(int(target_code)))
+    except Exception as e:
+        print(f"[状态] 重新下发失败：{e}")
+
+
+async def _reassert_im_status(target_code):
+    """重试把人工意图切上去；连续多次仍不生效 -> 如实告诉手机（绝不假装成功）。"""
+    tries = int(state.get("im_status_tries") or 0) + 1
+    state["im_status_tries"] = tries
+    for ext in list(active_clients["extension"]):
+        await safe_send(ext, {"command": "CHANGE_STATUS", "status": int(target_code)})
+    want = _im_txt(target_code)
+    if tries <= 3:
+        print(f"[状态] 🔁 网页状态和你手动设的不一致，已第 {tries} 次把「{want}」重新下发到电脑网页")
+        return
+    page = state.get("im_status_page")
+    key = f"{target_code}:{page}"
+    if state.get("im_status_notified") == key:
+        return
+    state["im_status_notified"] = key
+    state["im_status_tries"] = 0
+    msg = (f"⚠️ 已重试 {tries} 次切到「{want}」，但网页仍是「{_im_txt(page)}」——"
+           f"可能是页面上没有这个选项、或当前是只读/管理员视角。"
+           f"请在电脑上确认，或在状态面板里点「以网页为准」")
+    print("[状态] " + msg)
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": msg})
+
+
+def reset_im_state(source=""):
+    """♻️ 以"电脑网页的真实现状"为准重置 IM 状态（清掉卡住的手动锁）。返回采用的状态码。
+
+    真机场景：手机切忙碌时页面上没生效（旧脚本标签匹配不上），中继却把"忙碌+手动"锁住了，
+    于是手机显示忙碌、网页显示在线，两边都改不动 —— 这个口子就是给这种情况的逃生舱。
+    """
+    page = state.get("im_status_page") or state.get("im_status") or 1
+    try:
+        page = int(page)
+    except Exception:
+        page = 1
+    if page not in (1, 2, 3):
+        page = 1
+    state["im_status_manual"] = False
+    state["im_status_manual_at"] = 0
+    state["im_status_tries"] = 0
+    state["im_status_conflict"] = ""
+    state["im_status_notified"] = ""
+    apply_im_status(page, manual=False, source="重置（以网页为准）")
+    print(f"[状态] ♻️ 已按网页真实现状重置为「{_im_txt(page)}」（来源：{source or '手动'}）")
+    return page
+
+
+def apply_im_status(status, manual=None, source="", from_probe=False):
     """IM 状态唯一写入口：内存 + 落盘 + 标记"已核实"，返回是否有变化。
 
     ★ 客服铁律（第三轮补充）：**任何情况都不得把"离线/忙碌"自动改成"在线"**，除非是人工手动动作。
       这里加一道守卫：当内存里是 2(忙碌)/3(离线) 且带 manual 标记时，
       探针上报的"在线"（网页自己跳回去的）会被拦下并提示 —— 想切在线只能通过手机/小窗手动点。
+
+    ★ V7.7：把「网页事实」(im_status_page) 和「人工意图」(im_status) 分开记。
+      from_probe=True 表示这条来自探针读 DOM（网页事实），只更新 im_status_page；
+      一旦"事实 ≠ 意图"除了拦住，还会把人工意图**重新下发给探针**（最多 3 次），
+      重试无效就如实推手机 —— 不再出现"手机显示忙碌、网页其实在线、两边都改不动"。
     """
     try:
         st = int(status)
@@ -176,23 +259,37 @@ def apply_im_status(status, manual=None, source=""):
         st = 1
     prev = int(state.get("im_status") or 1)
     manual_held = bool(state.get("im_status_manual"))
+    if from_probe:
+        state["im_status_page"] = st            # 网页真实现状（不管采不采纳都记下来）
+        state["im_status_known"] = True         # 网页刚读过 -> 我们确实知道现状（手机端才不会显示"正在获取…"）
     if st == 1 and prev in (2, 3) and manual_held and not manual:
-        _prev_txt = {2: "忙碌", 3: "离线"}.get(prev, str(prev))
+        _prev_txt = _im_txt(prev)
+        state["im_status_conflict"] = f"{prev}:{st}"
         print(f"[状态] 🛡️ 拦截自动上线：你手动设的是「{_prev_txt}」，"
               f"网页想跳回在线（来源：{source or '探针上报'}）—— 只有手动切才会变")
-        for m in list(active_clients["mobile"]):
-            try:
-                asyncio.get_event_loop().create_task(safe_send(m, {
-                    "type": "AI_STATUS", "status": "error",
-                    "message": f"已拦截：网页自动跳回「在线」，你手动设的是「{_prev_txt}」"}))
-            except Exception:
-                pass
+        if from_probe:
+            _schedule_reassert(prev)            # 网页没跟上：把人工意图重新发下去
+        else:
+            for m in list(active_clients["mobile"]):
+                try:
+                    asyncio.get_event_loop().create_task(safe_send(m, {
+                        "type": "AI_STATUS", "status": "error",
+                        "message": f"已拦截：网页自动跳回「在线」，你手动设的是「{_prev_txt}」"}))
+                except Exception:
+                    pass
         return False
     changed = (state.get("im_status") != st) or (not state.get("im_status_known"))
     state["im_status"] = st
     state["im_status_known"] = True
     if manual is not None:
         state["im_status_manual"] = bool(manual)
+    if manual:
+        state["im_status_manual_at"] = time.time()
+    # 一致了（或人工自己改了）-> 清掉冲突与重试计数，下次不一致还能再提示
+    if manual or (from_probe and st == prev):
+        state["im_status_conflict"] = ""
+        state["im_status_tries"] = 0
+        state["im_status_notified"] = ""
     if st == 1:
         state["alarm_status"] = False
     save_im_state(st, state.get("im_status_manual", False))
@@ -402,7 +499,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "7.6"
+SERVER_VER = "7.7"
 
 
 def _probe_refresh():
@@ -1033,9 +1130,13 @@ HTML_CONTENT = """<!DOCTYPE html>
             return;
         }
         const st = Number(globalState.im_status) || 1;
+        const page = Number(globalState.im_status_page) || 0;
+        // ★ V7.7：网页实际状态和我们的记录不一致时如实标出来（不再"手机显示忙碌、网页其实在线"却不吭声）
+        const conflict = !!page && page !== st;
         if (pill) pill.className = 'pill';
-        setText('im-label', IM_STATUS_TEXT[st] || IM_STATUS_TEXT[1]);
-        setDot('im-dot', IM_DOT_CLASS[st] || 'idle');
+        setText('im-label', (IM_STATUS_TEXT[st] || IM_STATUS_TEXT[1])
+            + (conflict ? '（网页仍' + String(IM_STATUS_TEXT[page] || '').replace('IM ', '') + '）' : ''));
+        setDot('im-dot', conflict ? 'warn' : (IM_DOT_CLASS[st] || 'idle'));
     }
 
     function currentMode() {
@@ -1105,10 +1206,20 @@ HTML_CONTENT = """<!DOCTYPE html>
                 body.innerHTML = '<div class="sheet-item"><span class="hint">正在从电脑网页获取真实状态…</span></div>';
             } else {
                 const cur = Number(globalState.im_status) || 1;
+                const page = Number(globalState.im_status_page) || 0;
                 body.innerHTML = [1, 2, 3].map(function (n) {
                     return '<div class="sheet-item' + (n === cur ? ' cur' : '') + '" data-set="im:' + n + '">' +
                         IM_STATUS_FULL[n] + (n === cur ? '<span class="tick">✓</span>' : '') + '</div>';
-                }).join('');
+                }).join('')
+                // ★ V7.7：网页实际与记录不一致 -> 给出"重试 / 以网页为准"两个逃生按钮
+                + (page && page !== cur
+                    ? '<div class="sheet-item" data-set="im:retry"><span>🔁 重试同步</span>' +
+                      '<span class="hint">网页仍是 ' + (IM_STATUS_TEXT[page] || '') + '</span></div>' +
+                      '<div class="sheet-item" data-set="im:page"><span>♻️ 以网页为准</span>' +
+                      '<span class="hint">清除卡住的状态，跟随网页真实现状</span></div>'
+                    : '')
+                + '<div class="sheet-item" data-set="im:dump"><span>🧭 读一下网页的状态选项</span>' +
+                  '<span class="hint">排障：看页面到底有哪些状态可选</span></div>';
             }
         } else {
             if (title) title.innerText = '回复模式';
@@ -1130,7 +1241,10 @@ HTML_CONTENT = """<!DOCTYPE html>
             el.addEventListener('click', function () {
                 const v = String(el.dataset.set || '');
                 closeSheet();
-                if (v.indexOf('im:') === 0) setIMStatus(Number(v.slice(3)));
+                if (v === 'im:retry') retryIMStatus();
+                else if (v === 'im:page') resetIMStatus();
+                else if (v === 'im:dump') { sendMsg({ action: 'DUMP_STATUS' }); toast('已请电脑网页回报状态选项'); }
+                else if (v.indexOf('im:') === 0) setIMStatus(Number(v.slice(3)));
                 else if (v.indexOf('mode:') === 0) setReplyMode(v.slice(5));
             });
         });
@@ -1157,6 +1271,23 @@ HTML_CONTENT = """<!DOCTYPE html>
         if (globalState) { globalState.im_status = st; globalState.im_status_known = true; }
         renderIMStatus();
         toast('已切换为 ' + (IM_STATUS_TEXT[st] || ''));
+        return true;
+    }
+
+    // ★ V7.7：把"人工意图"再切一次（页面没跟上时用）
+    function retryIMStatus() {
+        const st = Number((globalState && globalState.im_status) || 1);
+        if (extensionOffline()) { toast('电脑端未连接，无法重试'); return false; }
+        if (!sendMsg({ action: 'SET_IM_STATUS', status: st })) { toast('连接已断开，正在重连'); return false; }
+        toast('已重试把状态切到 ' + (IM_STATUS_TEXT[st] || ''));
+        return true;
+    }
+
+    // ★ V7.7：以网页真实现状为准（清掉卡住的手动锁）——"两边都改不动"时的逃生舱
+    function resetIMStatus() {
+        if (extensionOffline()) { toast('电脑端未连接，无法重置状态'); return false; }
+        if (!sendMsg({ action: 'RESET_IM_STATE' })) { toast('连接已断开，正在重连'); return false; }
+        toast('已按电脑网页真实现状重置');
         return true;
     }
 
@@ -1755,6 +1886,22 @@ def _kb_stats():
         return {"error": str(e)[:80]}
 
 
+async def api_im_reset(request):
+    """♻️ 以电脑网页的真实现状为准重置 IM 状态（清掉卡住的手动锁）—— V7.7 逃生舱。
+
+    真机场景：手机切"忙碌"时页面上没生效，中继却把"忙碌 + 手动"锁死了，
+    于是手机显示忙碌、网页显示在线、两边都改不动。浏览器直接打开
+    http://127.0.0.1:8765/api/im_reset 即可恢复成"跟随网页真实状态"。
+    """
+    st = reset_im_state(source="接口 /api/im_reset")
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "FULL_SYNC", "data": state})
+    for ext in list(active_clients["extension"]):
+        await safe_send(ext, {"command": "REQUEST_IM_STATUS"})
+    return web.json_response({"ok": True, "im_status": st, "im_status_text": _im_txt(st),
+                              "note": "已重置为跟随网页真实现状（手动锁已清除）"})
+
+
 async def api_diag(request):
     # 顺手刷新一次三个开关（配置文件被改过也能反映出来）
     state["features"] = feature_flags()
@@ -1799,11 +1946,19 @@ async def api_diag(request):
         "alerts_count": len(state.get("human_alerts", [])),
         "im": {
             "status": state.get("im_status"),
-            "status_text": {1: "在线", 2: "忙碌", 3: "离线"}.get(state.get("im_status"), "未知"),
+            "status_text": _im_txt(state.get("im_status")),
             "known": bool(state.get("im_status_known")),
             "manual": bool(state.get("im_status_manual")),
+            # ★ V7.7：网页真实现状 / 是否与记录不一致 / 已重试几次（专治"手机改不了、网页也不对"）
+            "page_status": state.get("im_status_page") or 0,
+            "page_status_text": _im_txt(state.get("im_status_page")) if state.get("im_status_page") else "",
+            "conflict": bool(state.get("im_status_page")
+                             and int(state.get("im_status_page")) != int(state.get("im_status") or 1)),
+            "tries": int(state.get("im_status_tries") or 0),
+            "reset_url": "/api/im_reset",
             "state_file": os.path.basename(IM_STATE_PATH),
-            "hint": "known=false 表示本进程还没从电脑网页核实过状态（手机端会显示\"正在获取…\"，不会假装在线）",
+            "hint": "known=false 表示本进程还没从电脑网页核实过状态（手机端会显示\"正在获取…\"，不会假装在线）；"
+                    "conflict=true 时手机上可点「以网页为准」，或直接访问 /api/im_reset",
         },
         "ticket": {
             "active_gid": _LAST_ACTIVE.get("gid"),
@@ -1966,13 +2121,21 @@ async def diag_page_handler(request):
     else:
         im_line = im_txt
     _im_st2, _im_man2, _im_ts2 = load_im_state()
+    _page2 = state.get("im_status_page") or 0
     cards.append('<div class="card"><div class="k">IM 状态（手机端顶部下拉框）</div>' +
                  row("当前状态", im_line) +
+                 row("网页实际（探针读到的）", {1: "🟢 在线", 2: "🟡 忙碌", 3: "🔴 离线"}.get(_page2, "未知（还没读到）")) +
+                 row("同步状态", ("⚠️ 不一致：记录是「%s」、网页是「%s」—— 中继会自动重试，手机上也能点「以网页为准」"
+                                  % (_im_txt(state.get("im_status")), _im_txt(_page2)))
+                                 if (_page2 and int(_page2) != int(state.get("im_status") or 1))
+                                 else "✅ 一致（或网页还没上报）") +
+                 row("重试次数", int(state.get("im_status_tries") or 0)) +
                  row("状态记忆", ("%s · %s" % ({1: "在线", 2: "忙碌", 3: "离线"}.get(_im_st2, _im_st2),
                                                 time.strftime("%m-%d %H:%M", time.localtime(_im_ts2))))
                                 if _im_ts2 else "无（还没上报过）") +
                  row("离线守护", "开启（网页自己跳回在线会被改回）"
                                 if config.get("keep_manual_offline", True) else "关闭") +
+                 row("状态卡住时", '<a href="/api/im_reset">以网页为准重置</a>（清掉手动锁，跟随网页真实状态）') +
                  '</div>')
 
     cards.append('<div class="card"><div class="k">工单与知识库</div>' +
@@ -2105,13 +2268,32 @@ async def ws_ext_handler(request):
                         st = int(data.get("status", 1))
                     except Exception:
                         st = 1
-                    # 离线/忙碌都视为"人工状态"：绝不允许网页随后自动跳回在线（见 apply_im_status 守卫）
-                    manual = bool(data.get("manual", False)) or (st in (2, 3))
-                    apply_im_status(st, manual=manual, source="探针上报")
+                    # ★ V7.7：manual 只认"人手在网页上点的"（探针新字段 manual）。
+                    #   旧版是 `or (st in (2, 3))` —— 探针上报的忙碌/离线一律被当"手动"，
+                    #   于是探针自己就把中继的手动锁绕过了（网页真实状态反过来盖掉客服的选择）。
+                    manual = bool(data.get("manual", False))
+                    via_relay = bool(data.get("via_relay", False))
+                    _want = int(state.get("im_status") or 1)
+                    apply_im_status(st, manual=manual, source="探针上报", from_probe=True)
                     if data.get("guarded"):
                         print("[状态] 🛡️ 探针已按手动离线设置，把网页自动跳回的在线改回离线")
+                    if via_relay and st != _want:
+                        # 探针对"中继指令"的回读：和我们要的不一致就记一笔（_reassert 会重试/如实提示）
+                        print(f"[状态] ⚠️ 探针回读不一致：要求「{_im_txt(_want)}」，网页实际「{_im_txt(st)}」")
                     for m in list(active_clients["mobile"]):
                         await safe_send(m, {"type": "FULL_SYNC", "data": state})
+                    continue
+
+                # 探针回报的"状态下拉可见选项"（V7.7 排障：实机校准状态匹配，绝不靠猜标签）
+                if ev == "STATUS_MENU_DUMP":
+                    data = pkt.get("data") or {}
+                    items = data.get("items") or []
+                    lines = [f"{it.get('tag', '')}:{it.get('text', '')}" for it in items if isinstance(it, dict)]
+                    msg = ("网页状态下拉选项：" + (" / ".join(lines) if lines else "（没读到可见选项）")
+                           + f"（当前显示：{data.get('current') or '未知'}）")
+                    print("[状态] 🧭 " + msg)
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "AI_STATUS", "status": "ok", "message": msg})
                     continue
 
                 if ev == "ABNORMAL_OFFLINE":
@@ -2442,6 +2624,27 @@ async def ws_mobile_handler(request):
                         await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     continue
 
+                # ♻️ 以网页真实现状为准重置 IM 状态（清掉卡住的手动锁）—— V7.7 逃生舱
+                if act == "RESET_IM_STATE":
+                    st = reset_im_state(source="手机端")
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "FULL_SYNC", "data": state})
+                    await safe_send(ws, {"type": "AI_STATUS", "status": "ok",
+                                         "message": f"已按电脑网页真实现状重置为「{_im_txt(st)}」"})
+                    continue
+
+                # 🧭 请探针把"状态下拉的可见选项"回报过来（实机校准用，只读诊断）
+                if act == "DUMP_STATUS":
+                    for ext in list(active_clients["extension"]):
+                        await safe_send(ext, {"command": "DUMP_STATUS_MENU"})
+                    if not active_clients["extension"]:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                                             "message": "电脑端探针未连接，读不到状态下拉选项"})
+                    else:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "ok",
+                                             "message": "已请电脑网页回报状态下拉选项（马上返回）"})
+                    continue
+
                 # AI 一键回复并关单（AI 选问题分类 + 生成结束语，关单后会话从列表消失）
                 if act == "AI_CLOSE":
                     if not feature_flags()["ai_close"]:
@@ -2613,6 +2816,7 @@ app.router.add_get("/api/alerts", api_alerts)
 app.router.add_post("/api/alerts/ack", api_alerts_ack)
 app.router.add_post("/api/mode", api_mode)
 app.router.add_get("/api/diag", api_diag)
+app.router.add_get("/api/im_reset", api_im_reset)
 app.router.add_get("/ws/extension", ws_ext_handler)
 app.router.add_get("/ws/mobile", ws_mobile_handler)
 

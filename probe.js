@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V7.6 状态守护与靶点兼容版)
+// @name         智能工单探针 (V7.7 实机靶点校准版)
 // @namespace    http://tampermonkey.net/
-// @version      7.6
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号
+// @version      7.7
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "7.6";
+    const PROBE_VERSION = "7.7";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -34,6 +34,10 @@
     // ★ V7.5：手动"离开"状态（离线或忙碌）——客服铁律：离线/忙碌都不许被网页自动改成在线
     let isManualAway = false;
     let manualAwayStatus = null;      // 'IM离线' | 'IM忙碌' | null（手动设的目标状态）
+    // ★ V7.7：把"人手在网页上点的"与"中继（手机/小窗）让探针切的"分成两个标志上报。
+    //   旧版共用一个 manual 标志 —— 中继的"手动状态锁"被探针自己绕过，网页真实状态反而盖掉了客服的手动选择。
+    let manualByUser = false;         // 人在网页上点过状态下拉（真实人工意图）
+    let manualViaRelay = false;       // 最近一次状态变更来自中继指令（手机/小窗）
     let lastIMStatus = null;          // 上一次上报过的 IM 状态，用于变化检测
     let lastUserStatusClickAt = 0;    // 用户最近一次自己点状态的时间（区分"人点的" vs "网页自己跳的"）
     let lastGuardAt = 0;              // 上次离线守护动作时间
@@ -395,6 +399,7 @@
         initAudio();
         if (e.target && e.target.innerText) {
             const text = normStatus(e.target.innerText);
+            if (text) { manualByUser = true; manualViaRelay = false; }   // ★ V7.7：这是"真人点的"
             if (text === 'IM离线') {
                 isManualOffline = true;
                 isManualAway = true;
@@ -471,13 +476,75 @@
     }
 
     const Operator = {
-        composerInput: function() {          // 回复输入框（textarea / input / contenteditable）
-            const composer = document.querySelector('.editor-composer');
+        // 回复输入框（★ V7.7 实机校准：本工作台的回复框是 Quill 富文本 div.ql-editor[contenteditable]）
+        //   实机路径：.chat-input-area > .editor-composer > .im-editor-container.im-rich-editor
+        //             > .im-quill-editor.ql-container > .ql-editor
+        //   坑①：.editor-composer 里常有一个普通 input（"请选择问题分类"），旧版优先取 input ->
+        //        草稿被我写进了分类框，真编辑区一直是空的（所以"回复"按钮一直是灰的）。
+        //   坑②：Quill 自带一个隐藏的 .ql-clipboard（同样是 contenteditable），绝不能往里写。
+        composerInput: function() {
+            const composer = document.querySelector('.editor-composer') || document.querySelector('.chat-input-area');
             if (!composer) return null;
+            const notClipboard = el => String((el && el.className) || '').indexOf('ql-clipboard') === -1;
+            // ① Quill 正文优先
+            try {
+                const ql = composer.querySelector('.ql-editor');
+                if (ql && notClipboard(ql)) return ql;
+            } catch (e) {}
+            // ② 其它 contenteditable（排除 Quill 的隐藏剪贴板；只认 DIV/SPAN/P 这类真正的编辑容器，
+            //    避免把按钮等杂节点当成输入框 —— 测试桩里就踩到过）
+            try {
+                const ces = Array.from(composer.querySelectorAll('[contenteditable="true"]'))
+                    .filter(notClipboard)
+                    .filter(el => /^(DIV|SPAN|P|SECTION|ARTICLE)$/i.test(String(el.tagName || '')));
+                if (ces.length) return ces[0];
+            } catch (e) {}
+            // ③ 普通输入框兜底（textarea 优先，其次 input；老工作台是 textarea）
             let el = null;
             try { el = composer.querySelector('textarea') || composer.querySelector('input'); } catch (e) {}
             if (!el && composer.getAttribute && composer.getAttribute('contenteditable')) el = composer;
             return el;
+        },
+        // 只读模式的原因（如实告诉客服，别报含糊的"未找到输入框"）
+        editorFailureReason: function() {
+            try {
+                const ro = document.querySelector('.editor-readonly');
+                if (ro && isVisibleEl(ro)) {
+                    const t = normText(ro.innerText).slice(0, 40);
+                    return "当前是只读模式（" + (t || '页面提示只读') + "）——请先在左侧会话列表接入/接手该工单";
+                }
+            } catch (e) {}
+            return "未找到回复输入框（.editor-composer / .ql-editor 都没有，页面结构可能变了）";
+        },
+        // 往 contenteditable（Quill）里插入文本：优先 execCommand（能触发 Quill 的 text-change，
+        //   页面上的"回复"按钮才会从灰色变可点），失败再直接写 DOM 并派发完整事件序列。
+        insertIntoEditor: function(el, text) {
+            try { el.focus(); } catch (e) {}
+            try {
+                const sel = window.getSelection ? window.getSelection() : null;
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                range.collapse(false);                       // 光标放到末尾
+                if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+            } catch (e) {}
+            let ok = false;
+            try { if (document.execCommand) ok = document.execCommand('insertText', false, text); } catch (e) { ok = false; }
+            let got = "";
+            try { got = el.innerText || el.textContent || ""; } catch (e) {}
+            if (!ok || normText(got) !== normText(text)) {      // 兜底：直接写 DOM
+                try { el.innerText = text; } catch (e) { try { el.textContent = text; } catch (e2) {} }
+            }
+            try { el.classList && el.classList.remove('ql-blank'); } catch (e) {}
+            ['beforeinput', 'input', 'keyup', 'change'].forEach(t => {
+                try {
+                    if (t === 'beforeinput' && typeof InputEvent === 'function') {
+                        el.dispatchEvent(new InputEvent(t, { bubbles: true, cancelable: true, data: text }));
+                    } else {
+                        el.dispatchEvent(new Event(t, { bubbles: true }));
+                    }
+                } catch (e) {}
+            });
+            return true;
         },
         fillReplyBox: function(text) {
             const inputBox = Operator.composerInput();
@@ -485,11 +552,9 @@
             if (inputBox.tagName === 'TEXTAREA' || inputBox.tagName === 'INPUT') {
                 inputBox.value = text;
                 inputBox.dispatchEvent(new Event('input', { bubbles: true }));
-            } else {
-                inputBox.innerText = text;
-                inputBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
+                return true;
             }
-            return true;
+            return Operator.insertIntoEditor(inputBox, text);      // Quill / contenteditable
         },
         selectCategory: function(l1, l2, l3, fallbackKeyword) {
             Operator.selectCategoryByKeyword(l3 || "", [l1, l2], fallbackKeyword);
@@ -646,17 +711,27 @@
         },
         // 找"发送"按钮：先在回复框所在容器里按文字/aria/图标找，再退回整页的精确文字
         clickSendButton: function() {
+            // ★ V7.7 实机校准：本工作台的"发送"就是 .im-action-btn.reply-btn（"回复"，primary 样式）；
+            //   输入框为空/只读时它是 disabled（点不动）；"回复并关单"是 .close-btn，绝不能当发送键。
+            try {
+                const area = document.querySelector('.chat-input-area') || document;
+                const reps = Array.from(area.querySelectorAll('button.im-action-btn.reply-btn, button.reply-btn'))
+                    .filter(isVisibleEl);
+                const rep = reps.filter(el => !el.disabled)[0];
+                if (rep && fireClick(rep)) return true;
+                Operator._sendDiag = reps.length ? "页面上的「回复」按钮是灰的（disabled，说明编辑区还是空的或当前只读）" : "";
+            } catch (e) {}
             const strict = ['发送', '发送消息', 'send'];
             const loose = ['发送', '发送消息', '回复', '提交', 'send'];
             const iconHints = ['send', 'submit', 'send-btn', 'icon-send', 'sendbtn'];
             const scopes = [];
             try {
-                const c = document.querySelector('.editor-composer');
+                const c = document.querySelector('.editor-composer') || document.querySelector('.chat-input-area');
                 if (c) { scopes.push(c); if (c.parentElement) scopes.push(c.parentElement); }
             } catch (e) {}
             for (let s = 0; s < scopes.length; s++) {
                 const list = Array.from(scopes[s].querySelectorAll('button, [role="button"], .el-button, a, i, svg, span, div'))
-                    .filter(isVisibleEl)
+                    .filter(el => isVisibleEl(el) && !el.disabled)     // 灰按钮点了也没用，别谎报成功
                     .map(el => ({ el: el, texts: elTextsOf(el), cls: elClassOf(el) }));
                 for (let k = 0; k < loose.length; k++) {
                     for (let i = list.length - 1; i >= 0; i--) {          // 从右往左：发送键通常在右侧
@@ -674,6 +749,7 @@
                 for (let g = 0; g < 2; g++) {
                     const list = Operator._candidates()[g];
                     for (let i = list.length - 1; i >= 0; i--) {
+                        if (list[i].el.disabled) continue;             // 灰按钮不点（避免"报成功其实没发出去"）
                         if (list[i].texts.some(t => t === strict[k])) { fireClick(list[i].el); return true; }
                     }
                 }
@@ -708,6 +784,7 @@
         isComposerEmpty: function() {
             const el = Operator.composerInput();
             if (!el) return null;
+            try { if (el.classList && el.classList.contains('ql-blank')) return true; } catch (e) {}
             let v = "";
             try { v = (el.value !== undefined && el.value !== null) ? el.value : (el.innerText || ""); } catch (e) {}
             return normText(String(v)).length === 0;
@@ -724,7 +801,9 @@
                             (clicked ? "已点击发送按钮" : "已用回车发送") + (empty === true ? "，输入框已清空" : ""));
                     } else {
                         reportActionResult("SEND_REPLY", false,
-                            "已填入内容，但没找到发送按钮、回车也没生效 —— 请在电脑上手动点发送/按回车");
+                            "内容已填入编辑区，但发送没成功：" +
+                            (Operator._sendDiag || "没找到可点的「回复/发送」按钮，回车也没生效")
+                            + " —— 请在电脑上手动点发送/按回车");
                     }
                 }, 500);
             }, 500);
@@ -755,45 +834,97 @@
             setTimeout(tick, 400);
             return false;
         },
+        // 收集"可见的状态菜单项"（Element 下拉/级联/原生 li 都认；菜单常是懒渲染）
+        statusMenuItems: function() {
+            const sel = '.el-dropdown-menu__item, .el-select-dropdown__item, [role="menuitem"], li';
+            let nodes = [];
+            try { nodes = Array.from(document.querySelectorAll(sel)); } catch (e) { nodes = []; }
+            const out = [];
+            for (let i = 0; i < nodes.length; i++) {
+                const el = nodes[i];
+                if (!isVisibleEl(el)) continue;                  // 隐藏项绝不算（V7.3 的教训）
+                const t = normText(el.innerText);
+                if (!t || t.length > 12) continue;               // 只认短标签，避免误点容器
+                if (out.some(o => o.el === el)) continue;
+                out.push({ el: el, text: t, cls: elClassOf(el), tag: el.tagName });
+            }
+            return out;
+        },
+        // 轮询等下拉渲染出来（★ V7.7：Element 下拉有过渡/懒渲染，旧版固定 200ms 经常空手）
+        waitForMenu: function(done, deadlineMs, pollMs) {
+            const t0 = Date.now();
+            const step = () => {
+                const items = Operator.statusMenuItems();
+                if (items.length || (Date.now() - t0) >= deadlineMs) { done(items); return; }
+                setTimeout(step, pollMs);
+            };
+            setTimeout(step, 0);
+        },
         switchIMStatus: function(targetStatus) {
             if (!targetStatus) return;
-            // 触发下拉：只点"看得见"的状态显示区，避免点到隐藏节点
-            const statusTrigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
-                const t = statusTextOf(el);
-                if (!t) return false;
-                if (isMenuOption(el)) return false;
-                return isVisibleEl(el);
-            });
-            if (!statusTrigger) {
-                reportActionResult("CHANGE_STATUS", false,
-                    "未找到「可见」的 IM 状态显示区（页面结构可能变了），状态没切");
-                return;
-            }
-            statusTrigger.click();
+            const wantTxt = normText(targetStatus);
+            let attempt = 0;
+            const doAttempt = () => {
+                attempt++;
+                // 触发下拉：只点"看得见"的状态显示区（菜单项 / 隐藏节点都不算）
+                const statusTrigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
+                    const t = statusTextOf(el);
+                    if (!t) return false;
+                    if (isMenuOption(el)) return false;
+                    return isVisibleEl(el);
+                });
+                if (!statusTrigger) {
+                    reportActionResult("CHANGE_STATUS", false,
+                        "未找到「可见」的 IM 状态显示区（页面结构可能变了），状态没切");
+                    return;
+                }
+                fireClick(statusTrigger);
 
-            setTimeout(() => {
-                const items = Array.from(document.querySelectorAll('.el-dropdown-menu__item'))
-                    .filter(item => isVisibleEl(item));      // 只点可见的菜单项
-                // ★ 等价匹配：页面状态区写"IM在线"，菜单项可能只写"在线"（反之亦然）
-                const target = items.find(item => sameStatus(item.innerText, targetStatus))
-                    || items.find(item => normText(item.innerText).indexOf(normText(targetStatus)) !== -1);
-                if (target) {
-                    target.click();
+                Operator.waitForMenu(function(items) {
+                    // ★ 等价匹配：页面状态区写"IM在线"，菜单项可能只写"在线"（反之亦然）
+                    const target = items.find(o => sameStatus(o.text, targetStatus))
+                        || items.find(o => o.text.indexOf(wantTxt) !== -1);
+                    if (!target) {
+                        const cand = items.map(o => o.tag + ':' + o.text).filter(Boolean);
+                        if (attempt < 3) { setTimeout(doAttempt, 400); return; }   // 菜单可能还没渲染完，再试一次
+                        reportActionResult("CHANGE_STATUS", false,
+                            "点了 " + attempt + " 次都没找到可见的状态选项「" + targetStatus + "」；页面候选："
+                            + (cand.join("/") || "（下拉里没有任何可见选项）")
+                            + "；完整清单见页面控制台 __probe.dumpStatus()");
+                        return;
+                    }
+                    fireClick(target.el);
                     // 点完立刻回读真实状态并回报（切成功与否手机端马上能看到，不再"显示成功其实没变"）
                     setTimeout(() => {
                         const now = findIMStatusText();
                         const okNow = sameStatus(now, targetStatus);
-                        reportActionResult("CHANGE_STATUS", okNow,
-                            okNow ? ("已切换为 " + targetStatus) :
-                                    ("点了「" + normText(target.innerText) + "」但页面仍是 " + (now || "未知")));
-                        if (PROBE_CONFIG.forceStatusOnConnect) readAndReportIMStatus(true);
-                    }, 350);
-                } else {
-                    const cand = items.map(i => normText(i.innerText)).filter(Boolean);
-                    reportActionResult("CHANGE_STATUS", false,
-                        "未找到可见的状态选项「" + targetStatus + "」；页面候选：" + cand.join("/"));
-                }
-            }, 200);
+                        if (okNow || attempt >= 3) {
+                            reportActionResult("CHANGE_STATUS", okNow,
+                                okNow ? ("已切换为 " + targetStatus + (attempt > 1 ? ("（第 " + attempt + " 次尝试）") : ""))
+                                      : ("点了「" + target.text + "」但页面仍是 " + (now || "未知")
+                                         + "（可能当前是只读/管理员视角）"));
+                            readAndReportIMStatus(true);
+                            return;
+                        }
+                        setTimeout(doAttempt, 400);              // 回读不一致 -> 换个时机再试
+                    }, 400);
+                }, 1800, 150);
+            };
+            doAttempt();
+        },
+        // 排障：把状态下拉"全部可见选项"原样回报（tag/class/文本），用于实机校准，绝不靠猜标签
+        dumpStatusMenu: function() {
+            const trigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
+                const t = statusTextOf(el);
+                return !!t && !isMenuOption(el) && isVisibleEl(el);
+            });
+            if (trigger) fireClick(trigger);
+            Operator.waitForMenu(function(items) {
+                const rows = items.map(o => ({ tag: o.tag, cls: o.cls, text: o.text }));
+                sendToBrain({ event: "STATUS_MENU_DUMP", data: { current: findIMStatusText(), items: rows } });
+                console.log("🧭 [探针] 状态下拉可见选项：", rows);
+                try { if (trigger) fireClick(trigger); } catch (e) {}    // 收起下拉
+            }, 1500, 150);
         }
     };
 
@@ -843,7 +974,7 @@
         lastIMStatus = st;
         sendToBrain({
             event: "IM_STATUS",
-            data: { status: imStatusCode(st), manual: isManualAway, forced: !!forced }
+            data: { status: imStatusCode(st), manual: manualByUser, via_relay: manualViaRelay, forced: !!forced }
         });
         console.log("📡 [探针] 状态复核：" + st + (forced ? "（服务端请求）" : ""));
         return true;
@@ -953,7 +1084,7 @@
             }
             else if (cmd.command === "ACTION_REPLY_CLOSE") {
                 const filled = cmd.content ? Operator.fillReplyBox(cmd.content) : false;
-                if (cmd.content && !filled) reportActionResult("ACTION_REPLY_CLOSE", false, "未找到回复输入框(.editor-composer)，已停止关单");
+                if (cmd.content && !filled) reportActionResult("ACTION_REPLY_CLOSE", false, Operator.editorFailureReason() + "，已停止关单");
                 if (!cmd.content) reportActionResult("ACTION_REPLY_CLOSE", true, "（无结束语，直接关单）");
                 const path = cmd.categoryPath || ["一级分类", "二级分类"];
                 if (cmd.category) {
@@ -1003,7 +1134,7 @@
             else if (cmd.command === "SEND_REPLY") {
                 const filled = Operator.fillReplyBox(cmd.content);
                 if (!filled) {
-                    reportActionResult("SEND_REPLY", false, "未找到回复输入框(.editor-composer)，消息没发出去");
+                    reportActionResult("SEND_REPLY", false, Operator.editorFailureReason() + "，消息没发出去");
                 } else {
                     // V7.5：发送闭环（点发送按钮 -> 没找到就回车 -> 复验输入框是否清空）
                     Operator.sendFilledReply();
@@ -1016,6 +1147,10 @@
                 // ★ V7.5 补充：忙碌也算"手动状态"（客服要求：离线/忙碌都不许被自动改成在线）
                 isManualAway = (cmd.status === 2 || cmd.status === 3);
                 isManualOffline = (cmd.status === 3);
+                // ★ V7.7：这是"中继让我切的"，不是"人在网页上点的" —— 分开上报，
+                //   否则中继的"手动状态锁"会被探针自己绕过（网页真实状态反过来盖掉客服的选择）。
+                manualViaRelay = true;
+                manualByUser = false;
                 lastUserStatusClickAt = Date.now();
                 lastIMStatus = null;                 // 下一次 tick 重新读 DOM 并如实上报
                 console.log("📲 [探针] 收到手机端切换状态指令：" + (map[cmd.status] || cmd.status));
@@ -1024,6 +1159,10 @@
             else if (cmd.command === "REQUEST_IM_STATUS") {
                 // 手机端一打开 / 回到前台就来要一次真实状态（"从电脑网页获取一下"）
                 readAndReportIMStatus(true);
+            }
+            else if (cmd.command === "DUMP_STATUS_MENU") {
+                // 排障（★ V7.7）：把状态下拉的可见选项清单回报给中继/手机，用于实机校准匹配
+                Operator.dumpStatusMenu();
             }
             else if (cmd.command === "POLICY") {
                 if (cmd.keepManualOffline !== undefined) PROBE_CONFIG.keepManualOffline = !!cmd.keepManualOffline;
@@ -1066,7 +1205,7 @@
         //    （否则手机端会一直显示旧状态，手动挂"离线"更是永远同步不过去）
         sendToBrain({
             event: "IM_STATUS",
-            data: { status: imStatusCode(currentStatus), manual: isManualAway }
+            data: { status: imStatusCode(currentStatus), manual: manualByUser, via_relay: manualViaRelay }
         });
 
         // 2) 只有"异常掉线"才拉警报；手动离线不报警
@@ -1184,6 +1323,17 @@
         },
         // 立刻去读一次页面上的真实状态并上报（手机端"重新获取状态"走的就是这个）
         refreshStatus: function () { return readAndReportIMStatus(true) ? "已上报当前状态" : "未读到 IM 状态"; },
+        // ★ V7.7：把"状态下拉的可见选项"原样打进控制台并回报中继（只读诊断，不改状态）
+        dumpStatus: function () { Operator.dumpStatusMenu(); return "已把状态下拉选项回报给中继（看控制台/中继日志）"; },
+        // ★ V7.7：回复框到底抓到哪个元素（排查"草稿写不进去 / 回复按钮是灰的"）
+        editor: function () {
+            const el = Operator.composerInput();
+            const info = el
+                ? { tag: el.tagName, cls: String(el.className || ""), empty: Operator.isComposerEmpty(), hint: "" }
+                : { tag: "", cls: "", empty: null, hint: Operator.editorFailureReason() };
+            console.table ? console.table(info) : console.log(info);
+            return info;
+        },
         reconnect: function () { reconnectAttempts = 0; connectBrain(); return "已触发重连"; }
     };
 

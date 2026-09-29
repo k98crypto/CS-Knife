@@ -250,6 +250,50 @@ finally:
 check("apply_im_status 支持来源标注（便于排查是谁改的）",
       "source" in B.apply_im_status.__code__.co_varnames)
 
+print("\n[10.5] V7.7 IM 状态：网页事实 vs 人工意图（真机 bug：两边都改不动）")
+prev_st, prev_manual = B.state.get("im_status"), B.state.get("im_status_manual")
+prev_page = B.state.get("im_status_page")
+try:
+    # 中继记的是"手动忙碌"，探针读网页说"其实是在线"
+    B.state["im_status"] = 2
+    B.state["im_status_manual"] = True
+    B.state["im_status_page"] = 0
+    B.state["im_status_conflict"] = ""
+    ch = B.apply_im_status(1, manual=False, source="探针上报", from_probe=True)
+    check("探针上报的「网页在线」与手动忙碌冲突 -> 不采纳（仍保持忙碌）",
+          B.state.get("im_status") == 2 and ch is False, f"status={B.state.get('im_status')}")
+    check("同时记下「网页实际状态」与冲突组合（手机端能如实显示）",
+          int(B.state.get("im_status_page") or 0) == 1
+          and str(B.state.get("im_status_conflict")) == "2:1",
+          f"page={B.state.get('im_status_page')} conflict={B.state.get('im_status_conflict')}")
+    # 逃生舱：以网页为准重置 -> 采用网页实际值 + 清掉手动锁
+    page = B.reset_im_state(source="测试")
+    check("reset_im_state 以网页真实现状为准（清掉卡住的手动锁）",
+          page == 1 and B.state.get("im_status") == 1 and B.state.get("im_status_manual") is False,
+          f"page={page} status={B.state.get('im_status')} manual={B.state.get('im_status_manual')}")
+    check("重置后冲突/重试计数清零（下次不一致还能再提示）",
+          not B.state.get("im_status_conflict") and int(B.state.get("im_status_tries") or 0) == 0)
+finally:
+    B.state["im_status"] = prev_st
+    B.state["im_status_manual"] = prev_manual
+    B.state["im_status_page"] = prev_page or 0
+    B.state["im_status_conflict"] = ""
+    B.state["im_status_tries"] = 0
+    B.state["im_status_notified"] = ""
+    B.save_im_state(B.state.get("im_status") or 1, bool(B.state.get("im_status_manual")))
+
+check("apply_im_status 支持 from_probe（区分「网页事实」与「人工意图」）",
+      "from_probe" in B.apply_im_status.__code__.co_varnames)
+check("探针上报不再被当成「手动」（不再有 manual... or (st in (2,3)) 这种代码）",
+      'data.get("manual", False)) or' not in SRC and "from_probe=True" in SRC)
+check("中继会把人工意图重下发（最多 3 次）+ 无效时如实提示手机",
+      "def _reassert_im_status" in SRC and "tries <= 3" in SRC and "已重试" in SRC)
+check("新增逃生舱 reset_im_state + /api/im_reset + RESET_IM_STATE/RESET 动作",
+      "def reset_im_state" in SRC and '"/api/im_reset"' in SRC
+      and 'act == "RESET_IM_STATE"' in SRC)
+check("H5 会把「网页实际状态 X」如实带给客服看",
+      "im_status_page" in SRC and "（网页仍" in SRC)
+
 print("\n[11] 三个 AI 动作的独立开关（服务端）")
 SRC2 = SRC
 check("开关函数 feature_flags 存在且三项都在",
