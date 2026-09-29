@@ -159,6 +159,9 @@ _srv.err
 .cline/
 *.skill
 
+# 项目规则文件（本地开发用；含内部品牌词，不入公开仓库）
+.clinerules
+
 # 内部资料归档夹（个人笔记/内部文档）
 _internal/
 

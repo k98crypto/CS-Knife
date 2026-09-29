@@ -162,6 +162,20 @@ def long_human_alarm():
     except Exception:
         pass
 
+# ==================== ESC：清空小窗"暂存内容" ====================
+# 「暂存内容」= 小窗中"最近提炼 / 框选预览 / F9·F10 结果"那一块（双击可复制）。
+# ESC 一键清空它；剪贴板**只在里面还是那段内容时**才清（你后来复制的东西不会被误删）。
+STAGED_PLACEHOLDER = "（尚无，按 F7/F8 提炼后在此核验）"
+
+
+def staged_clear_plan(staged_text: str, clip_text: str):
+    """纯逻辑（不依赖 Tk，便于单测）：返回 (新文案, 是否应清剪贴板, 是否真的有内容可清)。"""
+    txt = (staged_text or "").strip()
+    if not txt or txt.startswith("（尚无"):
+        return STAGED_PLACEHOLDER, False, False          # 本来就没暂存 -> 什么都不做
+    same = bool(clip_text) and clip_text.strip() == txt
+    return STAGED_PLACEHOLDER, same, True
+
 class HUDOverlay:
     """桌面悬浮窗（始终置顶 + 可折叠 + 可召回 + 连接状态灯）。
 
@@ -181,6 +195,7 @@ class HUDOverlay:
         self.mode_owner = "default"   # 谁设的：mobile=手机端优先
         self._q = queue.Queue()
         self._pos_fixed = False
+        self._staged_text = ""        # 小窗暂存内容（最近提炼/框选预览/F9·F10 结果）——供 ESC 清空
         # 记录"我们想要的坐标"。不要依赖 winfo_x()：窗口还没映射时它返回 0，
         # 会把 (962,592) 这种正确位置写成 (0,0)（第七轮踩过的坑）。
         self._target = (DEFAULT_MARGIN, DEFAULT_MARGIN)
@@ -268,13 +283,18 @@ class HUDOverlay:
                                  anchor="nw", justify="left", wraplength=wrap, height=3)
         self.lbl_last.pack(fill="x", padx=pad, pady=(0, self._px(8)))
         self.lbl_last.bind("<Double-Button-1>", self._copy_last)
+        # ESC 一键清空小窗暂存内容（窗口聚焦时；浏览器聚焦时由全局热键兜底）
+        try:
+            self.root.bind("<Escape>", self.clear_staged)
+        except Exception:
+            pass
 
         self.footer = tk.Frame(self.outer, bg=BG_BAR)
         self.footer.pack(fill="x")
         self.lbl_links = tk.Label(self.footer, text="正在检测中继服务…",
                                   font=("Microsoft YaHei UI", 8), fg=FG_DIM, bg=BG_BAR, anchor="w")
         self.lbl_links.pack(fill="x", padx=self._px(10), pady=(self._px(4), self._px(1)))
-        self.lbl_hint = tk.Label(self.footer, text="拖动移动 · Ctrl+Alt+H 召回 · Ctrl+Alt+M 折叠",
+        self.lbl_hint = tk.Label(self.footer, text="拖动移动 · Ctrl+Alt+H 召回 · Ctrl+Alt+M 折叠 · ESC 清除暂存",
                                  font=("Microsoft YaHei UI", 7), fg=FG_HINT, bg=BG_BAR, anchor="w")
         self.lbl_hint.pack(fill="x", padx=self._px(10), pady=(0, self._px(4)))
 
@@ -445,8 +465,33 @@ class HUDOverlay:
                 self.lbl_status.config(fg=status_color)
             if last is not None:
                 self.lbl_last.config(text=last)
+                self._staged_text = str(last)      # 记住暂存内容，ESC 清空时用（不依赖读 Tk 控件）
             if last_color is not None:
                 self.lbl_last.config(fg=last_color)
+        except Exception:
+            pass
+
+    def clear_staged(self, event=None):
+        """ESC：清空小窗"暂存内容"（最近提炼 / 框选预览 / F9·F10 结果）。
+
+        线程安全：只读实例变量 + 通过队列更新 UI（全局热键回调在别的线程里执行）。
+        """
+        try:
+            cur = self._staged_text
+            try:
+                clip = pyperclip.paste()
+            except Exception:
+                clip = ""
+            new_text, clear_clip, had = staged_clear_plan(cur, clip)
+            if not had:
+                return                            # 没有暂存内容：不做任何事（也不误清剪贴板）
+            self._apply_ui(status="🧹 已清除小窗暂存内容（ESC）", status_color=FG_DIM,
+                           last=new_text, last_color=FG_DIM)
+            if clear_clip:
+                try:
+                    pyperclip.copy("")            # 剪贴板里仍是那段暂存 -> 一并清掉
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -790,6 +835,8 @@ def register_hotkeys():
     # 悬浮窗自救热键：任何情况下都能把窗找回来（F 键被别的软件抢也不怕）
     keyboard.add_hotkey('ctrl+alt+h', recall_hud)
     keyboard.add_hotkey('ctrl+alt+m', toggle_hud_fold)
+    # ESC：清空小窗暂存内容（suppress 默认 False -> 不吞按键，浏览器/弹窗里的 ESC 照常生效）
+    keyboard.add_hotkey('esc', clear_staged_hud)
     keyboard.wait()
 
 
@@ -805,6 +852,15 @@ def toggle_hud_fold():
     """Ctrl+Alt+M：折叠 / 展开悬浮窗。"""
     if hud:
         hud.toggle_fold()
+
+
+def clear_staged_hud():
+    """ESC：清空小窗暂存内容（全局热键兜底：浏览器聚焦时也能清）。
+
+    注意：没有暂存内容时 clear_staged() 什么都不做 —— 所以平时按 ESC 不会有副作用。
+    """
+    if hud:
+        hud.clear_staged()
 
 
 if __name__ == "__main__":

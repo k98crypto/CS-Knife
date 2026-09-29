@@ -336,6 +336,24 @@ async def main():
         greets = [m for m in ext3_msgs if m.get("command") == "SEND_REPLY"]
         check("玩家第一条消息 -> 立刻发开场语（来自表格）",
               bool(greets) and ("亲" in str(greets[-1].get("content"))), str(greets[:1]))
+
+        # ★ V7.5：玩家来新消息 -> 手机端必须**立刻**收到 NEW_MESSAGE（新消息通知：叮咚 + 提示 + 震动）
+        _, mob_new = await drain(mobile, 0.5)
+        nm = [m for m in mob_new if m.get("type") == "NEW_MESSAGE"]
+        check("玩家来消息 -> 手机端立刻收到 NEW_MESSAGE（新消息通知）",
+              bool(nm) and nm[-1].get("groupID") == gid2, str(nm[:1]))
+        check("NEW_MESSAGE 带 玩家名 / 预览 / 当前模式",
+              bool(nm) and bool(nm[-1].get("name")) and "preview" in nm[-1]
+              and nm[-1].get("mode") in ("manual", "semi", "afk"), str(nm[-1] if nm else None))
+
+        # 同一条玩家消息重复上报（探针每 2 秒抓一次，内容没变也会推）-> 不能重复通知
+        await ext3.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gid2, "name": "节奏测试", "playerInfo": "节奏测试 | UID:7777",
+            "messages": [{"sender": "player", "text": "客服"}]}})
+        await asyncio.sleep(0.4)
+        _, mob_dup = await drain(mobile, 0.4)
+        check("同一条玩家消息重复上报 -> 不重复通知（手机端不会连环响）",
+              not [m for m in mob_dup if m.get("type") == "NEW_MESSAGE"], str(mob_dup[:2]))
         info1 = await auto_info()
         check("这条会话已排队延迟回复（不是秒回）",
               gid2 in (info1.get("pending_gids") or []), str(info1.get("pending_gids")))

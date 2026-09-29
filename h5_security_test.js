@@ -63,6 +63,7 @@ const documentStub = {
 
 const alerts = [];
 const timeouts = [];
+let oscCount = 0;                             // 统计振荡器数量 = 响了几声（叮咚一次建 2 个）
 const FakeWebSocket = class {
     constructor(url) {
         this.url = url;
@@ -85,8 +86,11 @@ const windowStub = {
     AudioContext: function () {
         this.state = 'running'; this.currentTime = 0; this.destination = {};
         this.resume = () => {};
-        this.createOscillator = () => ({ frequency: { setValueAtTime() {}, linearRampToValueAtTime() {} }, connect() {}, start() {}, stop() {} });
-        this.createGain = () => ({ gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} });
+        this.createOscillator = () => {
+            oscCount++;
+            return { frequency: { setValueAtTime() {}, linearRampToValueAtTime() {} }, connect() {}, start() {}, stop() {} };
+        };
+        this.createGain = () => ({ gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {}, linearRampToValueAtTime() {} }, connect() {} });
     }
 };
 
@@ -437,6 +441,35 @@ sandbox.ackHumanAlert();
 check('点"知道了" -> 下发 ACK_ALERT 并收起横幅',
     FakeWebSocket.sent.some(m => m.action === 'ACK_ALERT') && !els['human-banner'].classList.contains('show'),
     JSON.stringify(FakeWebSocket.sent));
+
+console.log('\n[15] V7.5 新消息即时通知（手机：叮咚 + 提示 + 震动）');
+check('H5 有新消息"叮咚"音效（两个正弦音）',
+    h5code.indexOf('function playNewMsgSound') !== -1 && h5code.indexOf("osc.type = 'sine'") !== -1);
+check('三种声音分开实现（新消息/掉线警笛/需要人工）',
+    h5code.indexOf('function playNewMsgSound') !== -1
+    && h5code.indexOf('function playMobileSiren') !== -1
+    && h5code.indexOf('function playHumanAlert') !== -1);
+check('处理 NEW_MESSAGE 事件（含同一条只响一次的判重）',
+    h5code.indexOf("payload.type === 'NEW_MESSAGE'") !== -1
+    && h5code.indexOf('notifiedMsgTs') !== -1);
+check('失败原因常驻条与"已连接"提示不冲突（err-bar 仍在）', py.indexOf('id="err-bar"') !== -1);
+
+let oscBefore = oscCount;
+onmsg({ type: 'NEW_MESSAGE', groupID: 'T-M1', name: '玩家辛', preview: '在吗？充值没到账', mode: 'semi', ts: 111 });
+check('收到新消息 -> 响一次「叮咚」（两个音）', oscCount - oscBefore === 2, '振荡器 +' + (oscCount - oscBefore));
+check('收到新消息 -> 顶部提示带玩家名与预览',
+    (els['toast'].innerText || '').indexOf('玩家辛') !== -1
+    && (els['toast'].innerText || '').indexOf('充值没到账') !== -1, els['toast'].innerText);
+
+oscBefore = oscCount;
+onmsg({ type: 'NEW_MESSAGE', groupID: 'T-M1', name: '玩家辛', preview: '在吗？充值没到账', mode: 'semi', ts: 111 });
+check('同一条消息重复推送 -> 不再重复响', oscCount === oscBefore, '振荡器 +' + (oscCount - oscBefore));
+
+oscBefore = oscCount;
+onmsg({ type: 'NEW_MESSAGE', groupID: 'T-M1', name: '玩家辛', preview: '还没人理我', mode: 'manual', ts: 222 });
+check('又一条新消息 -> 再响一次', oscCount - oscBefore === 2, '振荡器 +' + (oscCount - oscBefore));
+check('手动模式下提示"AI 未自动起草"',
+    (els['toast'].innerText || '').indexOf('未自动起草') !== -1, els['toast'].innerText);
 
 console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
 process.exit(fail === 0 ? 0 : 1);

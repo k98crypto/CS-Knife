@@ -210,6 +210,31 @@ def main():
     check("取选区支持静默模式（免框选回退时不再误报「未选中文本」）",
           "def safe_capture_selection(min_len=2, quiet=False)" in src)
 
+    # ---------- V7.5：ESC 清空小窗暂存内容 ----------
+    print("[N] ESC 清空小窗暂存内容")
+    check("有纯逻辑函数 staged_clear_plan（可单测）", hasattr(mod, "staged_clear_plan"))
+    check("占位文案常量化（清空后回到占位）",
+          getattr(mod, "STAGED_PLACEHOLDER", "").startswith("（尚无"))
+
+    ph, clear_clip, had = mod.staged_clear_plan("（尚无，按 F7/F8 提炼后在此核验）", "随便什么")
+    check("本来就没有暂存内容 -> 什么都不做（也不清剪贴板）",
+          had is False and clear_clip is False and ph.startswith("（尚无"))
+
+    ph, clear_clip, had = mod.staged_clear_plan("[F7·提炼] 玩家甲 UID:1001", "")
+    check("有暂存但剪贴板已是别的内容 -> 只清小窗，不动剪贴板",
+          had is True and clear_clip is False and ph.startswith("（尚无"))
+
+    ph, clear_clip, had = mod.staged_clear_plan("[F9·NORMAL] 您好，已为您处理", "[F9·NORMAL] 您好，已为您处理")
+    check("剪贴板里仍是那段暂存内容 -> 一并清掉",
+          had is True and clear_clip is True and ph.startswith("（尚无"))
+
+    check("ESC 绑定到小窗窗口（聚焦时生效）", 'bind("<Escape>"' in src)
+    check("ESC 注册为全局热键（浏览器聚焦时也能清）", "add_hotkey('esc'" in src)
+    check("全局热键回调函数存在（无暂存时不做事）", "def clear_staged_hud" in src)
+    check("状态提示与底部提示都写明 ESC", "已清除小窗暂存内容" in src and "ESC 清除暂存" in src)
+    check("清空走队列更新 UI（线程安全，不跨线程操作 Tk）",
+          "def clear_staged" in src and "self._apply_ui(" in src and "self._staged_text" in src)
+
     print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
     return 0 if failed == 0 else 1
 

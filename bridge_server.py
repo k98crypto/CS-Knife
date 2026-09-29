@@ -321,6 +321,9 @@ _IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，�
 
 # 最近一次有消息活动的工单 ID（供 /api/ticket 定位"当前工单"，比按插入顺序取最后一个更准）
 _LAST_ACTIVE = {"gid": None}
+# ★ 玩家新消息"已提示到手机"的水位线：gid -> 最新已提示的玩家消息 ts
+#   用途：只对**新增**的玩家消息提示一次（避免 FULL_SYNC 反复刷新时重复响铃）
+_LAST_NOTIFIED = {}
 
 # ==================== 探针自检元数据（排障用，见 GET /api/diag） ====================
 # 作用：把"油猴脚本到底加载了没、跑的是哪一版"从猜测变成可查事实。
@@ -530,10 +533,10 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
 
     # ★ 「手动模式」只提醒、不自动起草：客服说"AI 自动起草关不掉"，就是这里没有开关。
     #   （force=True 表示"手机上主动点的按钮"，任何时候都放行）
+    #   ★ V7.5：手动模式的"有新消息"提示已改成 PLAYER_MESSAGE 里**即时**推 NEW_MESSAGE，
+    #     这里不再延迟 1~3 分钟重复弹一条（避免"过一会儿又突然冒出来"）。
     if not force and not state.get("afk_mode") and not state.get("auto_draft", True):
-        for m in list(active_clients["mobile"]):
-            await safe_send(m, {"type": "AI_STATUS", "groupID": group_id, "status": "manual",
-                                "message": "新消息（手动模式：AI 未自动起草）"})
+        print(f"[手动模式] {group_id} 有新消息，AI 未自动起草（手机端已即时提示）")
         return
 
     # ★ 只在"玩家最后发言、且这条还没被回过"时才动手（不抢话、不重复回）
@@ -1175,6 +1178,26 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
     function stopMobileSiren() { if (sirenInterval) { clearInterval(sirenInterval); sirenInterval = null; } }
 
+    // ★ 新消息"叮咚"（与"掉线警笛""需要人工三短一长"都不同）：两个清脆正弦音
+    //   需求：玩家发来新消息时，手机端必须**立刻**能听到/看到（旧版手机端完全没有这个提示音）。
+    function playNewMsgSound() {
+        try {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const base = audioCtx.currentTime;
+            [1046.5, 1318.5].forEach(function (f, i) {          // C6 -> E6，清脆"叮~咚~"
+                const t = base + i * 0.16;
+                const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(f, t);
+                gain.gain.setValueAtTime(0, t);
+                gain.gain.linearRampToValueAtTime(0.55, t + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.01, t + 0.35);
+                osc.connect(gain); gain.connect(audioCtx.destination);
+                osc.start(t); osc.stop(t + 0.4);
+            });
+        } catch (e) {}
+    }
+
     // ★ 人工介入专属提示音（第三种声音）：
     //   ① 新消息"叮咚"= 两个正弦音；② 掉线警报 = 连续锯齿波警笛；③ 需要人工 = 三声急促短音。
     function playHumanAlert() {
@@ -1198,6 +1221,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     // ==================== 需要人工介入（表格里没有答案） ====================
     let humanAlertIds = [];
     let lastAlertSoundId = '';
+    const notifiedMsgTs = {};                 // gid -> 已提示过的玩家消息 ts（同一条只响一次）
     function showHumanBanner(alerts) {
         const banner = document.getElementById('human-banner');
         if (!banner) return;
@@ -1293,6 +1317,21 @@ HTML_CONTENT = """<!DOCTYPE html>
             const ov = document.getElementById('alarm-overlay');
             if (globalState && globalState.alarm_status) { ov.classList.add('active'); playMobileSiren(); }
             else { ov.classList.remove('active'); stopMobileSiren(); }
+        }
+        else if (payload.type === 'NEW_MESSAGE') {
+            // ★ 玩家来新消息：立刻响"叮咚" + 顶部提示 + 轻震动（同一条消息只提示一次）
+            const gid = String(payload.groupID || '');
+            const ts = Number(payload.ts) || Date.now();
+            if (gid && notifiedMsgTs[gid] && ts <= notifiedMsgTs[gid]) return;
+            if (gid) notifiedMsgTs[gid] = ts;
+            playNewMsgSound();
+            try {
+                if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(40);
+            } catch (e) {}
+            const nm = String(payload.name || '玩家');
+            const pv = String(payload.preview || '').trim();
+            toast('💬 ' + nm + '：' + (pv || '新消息') +
+                  (payload.mode === 'manual' ? '（手动模式：AI 未自动起草）' : ''));
         }
         else if (payload.type === 'HUMAN_ALERT') {
             // 中继直接推来的"需要人工"事件（比快照更即时）
@@ -2025,6 +2064,33 @@ async def ws_ext_handler(request):
                     c["playerInfo"] = payload.get("playerInfo", "")
                     c["updatedAt"] = now_ms
                     _LAST_ACTIVE["gid"] = gid
+
+                    # ★★ 新消息即时通知（V7.5）★★
+                    # 旧行为：手机端只有"手动模式"会在 1~3 分钟延迟后收到一句提示，半自动/AFK 完全静默。
+                    #   现在：只要末尾多了**玩家**新消息，立刻推 NEW_MESSAGE 给手机
+                    #   （手机响"叮咚"双音 + 顶部提示 + 轻震动；手机不在线时什么都不做）。
+                    try:
+                        new_ts, new_txt = 0, ""
+                        for pm in reversed(c.get("msgs") or []):
+                            if isinstance(pm, dict) and pm.get("sender") == "player":
+                                new_ts = int(pm.get("ts") or 0)
+                                new_txt = str(pm.get("text") or "")
+                                break
+                        if new_ts and new_ts > int(_LAST_NOTIFIED.get(gid) or 0):
+                            _LAST_NOTIFIED[gid] = new_ts
+                            if state.get("afk_mode"):
+                                mode_now = "afk"
+                            elif state.get("auto_draft", True):
+                                mode_now = "semi"
+                            else:
+                                mode_now = "manual"
+                            preview = " ".join(new_txt.split())[:60]
+                            for m in list(active_clients["mobile"]):
+                                await safe_send(m, {"type": "NEW_MESSAGE", "groupID": gid, "name": name,
+                                                    "preview": preview, "mode": mode_now, "ts": new_ts})
+                            print(f"[新消息] {name}：{preview[:30]}（已即时提示手机端 · 模式 {mode_now}）")
+                    except Exception as e:
+                        print(f"[新消息] 通知失败（不影响主流程）：{e}")
 
                     # ★★ 自动回复节奏（V7.4）★★
                     # ① 玩家**第一次**发来消息 -> 立刻发一条开场语（严格取表格话术）
