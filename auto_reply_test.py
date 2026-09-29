@@ -327,7 +327,7 @@ check("测试客户端不许真的 AI 关单（后台任务单独拦）",
       "测试客户端：已跳过真实 AI 关单" in SRC)
 check("send_to_player 带 origin + require_page（代发不会打到真实探针 / 不会发错人）",
       'async def send_to_player(payload, where="", origin=None, require_page=False' in SRC
-      and "origin=ws, require_page=True" in SRC)
+      and "origin=ws," in SRC and "require_page=True," in SRC)
 check("自动重试也遵守隔离（im_intent_test）",
       'ext_targets("test" if state.get("im_intent_test") else None)' in SRC)
 check("测试脚本已全部改用 ?test=1 连接",
@@ -371,8 +371,23 @@ check("send_to_player 页面绑定失败时先自动切会话（切成功再发�
       and "if ok_sw:" in SRC and "ok_page, note = page_binding_ok(pkt.get(\"groupID\"), origin)" in SRC)
 check("自动切会话可用 config.json 关掉（auto_open_conv）",
       'config.get("auto_open_conv", True)' in SRC)
-check("占位会话（名字=工单号）不许拿去瞎点会话列表，且立刻拒发（不卡手机端队列）",
-      '"placeholder": True' in SRC and 'if conv.get("placeholder") and not name:' in SRC)
+check("占位会话不许拿去瞎点会话列表（中继不认识的会话直接拒发，且不再造占位卡片）",
+      'if conv.get("placeholder") and not name:' in SRC and '"placeholder": True' not in SRC
+      and "还没在电脑网页上打开过" in SRC)
+check("网页列表变化即通知（新会话/新内容）—— 探针只读当前工单，只靠 PLAYER_MESSAGE 会漏",
+      'if ev == "CONV_LIST":' in SRC and '_first_sight' in SRC
+      and 'r["fresh"] = True' in SRC and '"from_page_list": True' in SRC)
+check("通知按隔离类推送（测试行不会弹到客服真机上）",
+      "def _mobile_targets_for(is_test_origin)" in SRC
+      and "for m in _mobile_targets_for(_is_test_origin):" in SRC
+      and "for m in _mobile_targets_for(is_test_ws):" in SRC)
+check("Bark 也只在真实来源时推（测试不打扰手机锁屏）",
+      'and not _is_test_origin' in SRC)
+check("代发是「发送成功才记进会话」（不再显示没发出去的假消息）",
+      "ok_sent = await send_to_player(" in SRC and "if not ok_sent:" in SRC)
+check("H5 会话列表只有一份（网页列表为准，点一下就能进会话）",
+      "function openPageConv" in SRC and "pendingOpenName" in SRC
+      and "其它会话（不在网页列表里）" in SRC and "个（电脑网页）" in SRC)
 check("网页真实上报会话名后会摘掉占位标记（之后就能自动切了）",
       'c.pop("placeholder", None)' in SRC)
 check("手机端代发会把会话名一起带来（中继不知道名字时也能切过去）",

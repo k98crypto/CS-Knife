@@ -42,14 +42,13 @@ function makeEl(id) {
                 }
                 this._cards = out;      // 缓存，便于测试触发点击
             } else if (sel.indexOf('[data-openname]') === 0) {
-                // ★ V8.0："电脑网页上的会话"行（data-openname / data-opengid / data-openlast）
-                const re = /data-openname="([^"]*)"\s+data-opengid="([^"]*)"\s+data-openlast="([^"]*)"/g;
+                // ★ V8.0.1："电脑网页上的会话"里"中继还不认识"的行（data-openname / data-openlast）
+                const re = /data-openname="([^"]*)"\s+data-openlast="([^"]*)"/g;
                 let mm;
                 while ((mm = re.exec(this._html)) !== null) {
                     const row = makeEl('page-conv-row');
                     row.dataset.openname = mm[1];
-                    row.dataset.opengid = mm[2];
-                    row.dataset.openlast = mm[3];
+                    row.dataset.openlast = mm[2];
                     out.push(row);
                 }
                 this._openRows = out;
@@ -241,7 +240,7 @@ if (cards3.length === 3) {
     })());
 }
 
-console.log('\n[7.5] V8.0 电脑网页全部会话（conv_list）+ 远程切会话');
+console.log('\n[7.5] V8.0 电脑网页上的会话（唯一一份列表）+ 点一下就能进会话');
 onmsg({
     type: 'FULL_SYNC',
     data: {
@@ -249,7 +248,7 @@ onmsg({
         conv_list: [
             { name: '玩家甲', last: '甲的问题', time: '5分钟前', active: true },
             { name: '玩家丁' + EVIL_IMG, last: '丁的问题', time: '刚刚', active: false },
-            { name: '玩家戊', last: '戊的问题', time: '1小时前', active: false }
+            { name: '玩家戊', last: '戊的问题', time: '1小时前', active: false, fresh: true }
         ],
         companies: { main: { conversations: {
             'T-1': { name: '玩家甲', updatedAt: nowMs - 300000, msgs: [{ sender: 'player', text: '甲的问题', ts: nowMs - 300000 }] },
@@ -258,36 +257,50 @@ onmsg({
     }
 });
 const lh = els['conv-container'].innerHTML;
-check('主页出现"电脑网页上的会话"分区（电脑端每一个会话都能看到）',
-    lh.indexOf('电脑网页上的会话') !== -1);
-check('电脑上还没聊过的会话也列出来了（标「未打开」）',
-    lh.indexOf('玩家戊') !== -1 && lh.indexOf('未打开') !== -1);
-check('电脑网页当前打开的那个会话有「当前」标记', lh.indexOf('当前') !== -1 && lh.indexOf('page-active') !== -1);
-check('会话行用 data-* 传值（不拼内联 onclick）且名字已转义',
-    lh.indexOf('data-openname=') !== -1 && lh.indexOf('<img') === -1,
-    'onclick=' + (lh.indexOf('onclick="openConv') !== -1));
+check('主页有一份"电脑网页上的会话"清单（含没聊过的，标「未打开」）',
+    lh.indexOf('电脑网页上的会话（3）') !== -1 && lh.indexOf('玩家戊') !== -1 && lh.indexOf('未打开') !== -1);
+check('中继认识的会话直接渲染成完整卡片（不再两份列表互相重复）',
+    lh.indexOf('data-gid="T-1"') !== -1 && lh.indexOf('甲的问题') !== -1);
+check('不在网页列表里的会话单独收尾并写明原因',
+    lh.indexOf('其它会话（不在网页列表里）') !== -1 && lh.indexOf('data-gid="T-2"') !== -1);
+check('当前网页打开的那个会话有「当前」标记', lh.indexOf('🖥 当前') !== -1 && lh.indexOf('page-active') !== -1);
+check('网页列表里的新内容有未读点（fresh）', lh.indexOf('unread-dot') !== -1);
+check('顶栏计数跟着网页列表走', els['list-count'].innerText.indexOf('电脑网页') !== -1,
+    els['list-count'].innerText);
+check('名字已转义（未打开的会话行也用 data-* 传值）',
+    lh.indexOf('data-openname=') !== -1 && lh.indexOf('<img') === -1);
 const openRows = els['conv-container']._openRows || [];
-check('解析出可点击的网页会话行', openRows.length === 3, '数量=' + openRows.length);
+check('只有"中继还不认识"的会话才需要点一下去打开', openRows.length === 2, '数量=' + openRows.length);
 wsInst.readyState = 1;                     // 恢复"已连接"，否则点击只会提示断线
 FakeWebSocket.sent.length = 0;
 const rowXin = openRows.filter(r => r.dataset.openname.indexOf('玩家戊') !== -1)[0];
 rowXin && rowXin._click();
 const openSent = FakeWebSocket.sent.filter(m => m.action === 'OPEN_CONV');
-check('点「未打开」的会话 -> 请电脑网页切过去（OPEN_CONV）',
+check('点「未打开」的会话 -> 请电脑切过去（OPEN_CONV）',
     openSent.length === 1 && openSent[0].name.indexOf('玩家戊') !== -1, JSON.stringify(openSent));
-FakeWebSocket.sent.length = 0;
-const rowKnown = openRows.filter(r => r.dataset.opengid)[0];
-rowKnown && rowKnown._click();
-check('点已聊过的会话 -> 直接打开本地聊天，不再重复下发切会话',
-    FakeWebSocket.sent.filter(m => m.action === 'OPEN_CONV').length === 0
-    && els['chat-view'].classList.contains('active'));
-// ★ V8.0：手机端发送时会把会话名带上（这样中继不知道会话名时也能自动切会话）
-els['chat-input'].value = '你好呀';
-FakeWebSocket.sent.length = 0;
-sandbox.execCommand('SEND');
-const sendPkt = FakeWebSocket.sent.filter(m => m.action === 'SEND_REPLY');
-check('手机端代发带上 name（供中继自动切会话用）',
-    sendPkt.length === 1 && sendPkt[0].name === '玩家甲', JSON.stringify(sendPkt));
+// ★ 关键修复：切过去之后，探针上报里就有这条会话了 —— 手机必须**自动把聊天页打开**（客服原话："点不进卡片"）
+check('点击时不会假装已打开（如实提示"正在让电脑打开…"）',
+    !els['chat-view'].classList.contains('active')
+    && String(els['toast'].innerText).indexOf('正在让电脑打开') !== -1,
+    String(els['toast'].innerText));
+onmsg({
+    type: 'FULL_SYNC',
+    data: {
+        afk_mode: false, alarm_status: false,
+        conv_list: [
+            { name: '玩家甲', last: '甲的问题', time: '5分钟前', active: false },
+            { name: '玩家戊', last: '戊的问题', time: '刚刚', active: true }
+        ],
+        companies: { main: { conversations: {
+            'T-1': { name: '玩家甲', updatedAt: nowMs - 300000, msgs: [{ sender: 'player', text: '甲的问题', ts: nowMs - 300000 }] },
+            'P-9': { name: '玩家戊', updatedAt: nowMs, msgs: [{ sender: 'player', text: '戊的问题', ts: nowMs }] }
+        } } }
+    }
+});
+check('电脑切过去并上报后 -> 手机自动进聊天页（不用再点第二次）',
+    els['chat-view'].classList.contains('active')
+    && els['chat-player-name'].innerText === '玩家戊',
+    els['chat-player-name'].innerText + ' / active=' + els['chat-view'].classList.contains('active'));
 check('打开后返回列表', (function () { sandbox.popChat(); return els['list-view'].classList.contains('active'); })());
 
 console.log('\n[8] 布局与滚动（静态检查）');

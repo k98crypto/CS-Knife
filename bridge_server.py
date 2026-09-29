@@ -870,6 +870,22 @@ def _origin_is_test(origin):
         return False
 
 
+def _mobile_targets_for(is_test_origin):
+    """按"隔离类"挑手机端：测试来源只推测试手机端，真实来源只推真实手机端。
+
+    为什么：测试脚本造的会话/消息如果也推给客服的真机，会变成"手机上莫名弹出假消息"，
+    与 v7.9 那次"测试数据发进真实工单"属同一类污染的延伸（通知虽不改页面，但同样会打扰人）。
+    """
+    out = []
+    for m in list(active_clients["mobile"]):
+        try:
+            if (m in TEST_WS) == bool(is_test_origin):
+                out.append(m)
+        except Exception:
+            continue
+    return out
+
+
 def page_gid(origin=None):
     """电脑网页"此刻打开的那个工单"（由探针的 PLAYER_MESSAGE 上报）。真实/测试各记一份。"""
     if _origin_is_test(origin):
@@ -910,9 +926,11 @@ def _purge_test_convs():
     真实工单的 id 是"页面上真实工单号"或 P+hash，绝不会长成这些形状，所以不会被误删。
     """
     import re as _re
-    pat = _re.compile(r"^(F|AUTO|AUTO2|T-A|T-B|T-C|CLOSEFAIL)-\d{6,}$")
+    # ★ V8.0.1：把 NOTOPEN-…（历史版本给"不认识的会话"造的占位卡片）也算进测试脏数据
+    pat = _re.compile(r"^(F|AUTO|AUTO2|T-A|T-B|T-C|CLOSEFAIL|NOTOPEN)-\d{6,}$")
     convs = state["companies"]["main"]["conversations"]
-    gone = [k for k in list(convs.keys()) if pat.match(str(k))]
+    gone = [k for k in list(convs.keys()) if pat.match(str(k))
+            or (convs.get(k) or {}).get("placeholder")]
     for k in gone:
         convs.pop(k, None)
     if _LAST_ACTIVE.get("gid") in gone:
@@ -1266,6 +1284,8 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
+    // ★ V8.0.1：点过"未打开"的会话后，等它出现在中继会话列表里就自动打开聊天页（不用点第二次）
+    let pendingOpenName = '';
     let audioCtx = null; let sirenInterval = null;
     let wsAttempts = 0;
     let imStatusRequested = false;      // 已向电脑端索要过真实状态（4 秒内不重复要）
@@ -1855,14 +1875,32 @@ HTML_CONTENT = """<!DOCTYPE html>
         return tb - ta;
       });
       const countEl = document.getElementById('list-count');
-      if (countEl) countEl.innerText = keys.length ? (keys.length + ' 个进行中') : '';
+      if (countEl) {
+        const pr = Array.isArray(globalState.conv_list) ? globalState.conv_list : [];
+        countEl.innerText = pr.length ? (pr.length + ' 个（电脑网页）')
+                                      : (keys.length ? (keys.length + ' 个进行中') : '');
+      }
 
-      if (keys.length === 0) {
+      if (keys.length === 0 && !(Array.isArray(globalState.conv_list) && globalState.conv_list.length)) {
         container.innerHTML = '<div class="conv-empty">暂无会话<br>请在电脑端打开玩家工单</div>';
         return;
       }
 
-      container.innerHTML = keys.map(gid => {
+      // ★ V8.0.1：会话列表改成**一份**（以"电脑网页上的会话"为准）——
+      //   客服反馈："会话"和"电脑网页上的会话"两个分组互相重复，意义不明。
+      //   规则：网页列表里的每一行 -> 中继认识就渲染成完整卡片（点开聊天），
+      //         中继还不认识就标「未打开」（点一下 = 让电脑切过去，之后自动帮你打开）；
+      //         不在网页列表里的会话（旧会话/关单后残留）单独放最后一块，并写明"不在网页列表里"。
+      const pageRows = Array.isArray(globalState.conv_list) ? globalState.conv_list : [];
+      const gidByName = {};
+      keys.forEach(g => {
+        const n = String((convs[g] || {}).name || '').trim();
+        if (n) gidByName[n] = g;
+      });
+      const rendered = {};
+      const parts = [];
+
+      function convCardHtml(gid, pageActive) {
         const c = convs[gid] || {};
         const msgs = Array.isArray(c.msgs) ? c.msgs : [];
         const last = msgs.length > 0 ? (msgs[msgs.length - 1] || {}) : null;
@@ -1870,71 +1908,80 @@ HTML_CONTENT = """<!DOCTYPE html>
         const preview = (last && last.text) ? last.text : '（暂无消息）';
         const info = convInfo(c);
         const time = fmtTime((last && last.ts) || c.updatedAt);
-        // 未读标记：最后一条是玩家发的，且不是当前正在看的会话
         const unread = !!(last && last.sender === 'player' && gid !== activeGroupId);
-        // 置顶/需要人工标记（表格里没答案时会置顶）
         const pin = c.pinned ? '<span class="pin-badge">📌</span>' : '';
         const alertTag = c.alert ? '<span class="pin-badge">🙋</span>' : '';
-        // 关单中标记（V7.5：AI 已下发结束语，等页面点「回复并关单」确认；确认前不移除会话）
         const closingTag = c.closing ? '<span class="pin-badge">⏳</span>' : '';
-        // 全部走 esc() 转义；gid 改用 data-* 传递，避免内联 onclick 属性逃逸
-        return `<div class="conv-card" data-gid="${esc(gid)}">
+        // pageActive：这条会话就是电脑网页当前打开的那个（来自网页列表的 active 行）
+        const openTag = pageActive ? '<span class="pin-badge">🖥 当前</span>' : '';
+        return `<div class="conv-card${pageActive ? ' page-active' : ''}" data-gid="${esc(gid)}">
             <div class="avatar">${esc(String(name).charAt(0) || '玩')}</div>
             <div class="conv-body">
               <div class="conv-top">
-                <div class="conv-name">${esc(name)}${pin}${alertTag}${closingTag}${unread ? '<span class="unread-dot"></span>' : ''}</div>
+                <div class="conv-name">${esc(name)}${openTag}${pin}${alertTag}${closingTag}${unread ? '<span class="unread-dot"></span>' : ''}</div>
                 <div class="conv-time">${esc(time)}</div>
               </div>
               <div class="conv-lastmsg">${c.closing ? '⏳ 关单中…（等待页面确认）' : esc(preview)}</div>
               ${info ? '<div class="conv-info">' + esc(info) + '</div>' : ''}
             </div>
           </div>`;
-      }).join('');
+      }
+
+      function pageRowHtml(r) {
+        const nm = String(r.name || '');
+        const isOpen = !!r.active;
+        const known = gidByName[nm.trim()] || '';
+        if (known) {
+          rendered[known] = true;
+          return convCardHtml(known, isOpen);      // 认识：完整卡片（点开聊天）
+        }
+        return '<div class="conv-card' + (isOpen ? ' page-active' : '') + '" data-openname="' + esc(nm) + '"' +
+               ' data-openlast="' + esc(String(r.last || '')) + '">' +
+               '<div class="avatar">' + esc(nm.charAt(0) || '玩') + '</div>' +
+               '<div class="conv-body">' +
+                 '<div class="conv-top">' +
+                   '<div class="conv-name">' + esc(nm) +
+                     (isOpen ? '<span class="pin-badge">🖥 当前</span>' : '') +
+                     '<span class="pin-badge">未打开</span>' +
+                     (r.fresh ? '<span class="unread-dot"></span>' : '') +
+                   '</div>' +
+                   '<div class="conv-time">' + esc(String(r.time || '')) + '</div>' +
+                 '</div>' +
+                 '<div class="conv-lastmsg">' + esc(String(r.last || '')) + '</div>' +
+               '</div>' +
+             '</div>';
+      }
+
+      if (pageRows.length) {
+        parts.push('<div class="list-title" style="margin:8px 2px">电脑网页上的会话（' + pageRows.length + '）</div>');
+        pageRows.forEach(r => parts.push(pageRowHtml(r)));
+      }
+      const rest = keys.filter(g => !rendered[g]);
+      if (rest.length) {
+        parts.push('<div class="list-title" style="margin:8px 2px">' +
+                   (pageRows.length ? '其它会话（不在网页列表里）' : '会话') + '</div>');
+        rest.forEach(g => parts.push(convCardHtml(g)));
+      }
+      container.innerHTML = parts.join('');
 
       // 事件委托绑定（不再把数据拼进 onclick）
       container.querySelectorAll('.conv-card[data-gid]').forEach(el => {
         el.addEventListener('click', () => pushChat(el.dataset.gid));
       });
-
-      // ★ V8.0：电脑网页上的**全部会话**（探针扫 .session-item 上报）—— 手机主页也能看到每一个会话
-      const pageRows = Array.isArray(globalState.conv_list) ? globalState.conv_list : [];
-      const knownNames = {};
-      keys.forEach(g => { knownNames[String((convs[g] || {}).name || '')] = g; });
-      if (pageRows.length) {
-        container.insertAdjacentHTML('beforeend',
-          '<div class="list-title" style="margin:8px 2px">电脑网页上的会话（' + pageRows.length + '）</div>' +
-          pageRows.map(r => {
-            const nm = String(r.name || '');
-            const isOpen = !!r.active;
-            const known = knownNames[nm] || '';
-            return '<div class="conv-card' + (isOpen ? ' page-active' : '') + '" data-openname="' + esc(nm) + '"' +
-                   ' data-opengid="' + esc(known) + '" data-openlast="' + esc(String(r.last || '')) + '">' +
-                   '<div class="avatar">' + esc(nm.charAt(0) || '玩') + '</div>' +
-                   '<div class="conv-body">' +
-                     '<div class="conv-top">' +
-                       '<div class="conv-name">' + esc(nm) +
-                         (isOpen ? '<span class="pin-badge">🖥 当前</span>' : '') +
-                         (known ? '' : '<span class="pin-badge">未打开</span>') +
-                       '</div>' +
-                       '<div class="conv-time">' + esc(String(r.time || '')) + '</div>' +
-                     '</div>' +
-                     '<div class="conv-lastmsg">' + esc(String(r.last || '')) + '</div>' +
-                   '</div>' +
-                 '</div>';
-          }).join(''));
-      }
       container.querySelectorAll('[data-openname]').forEach(el => {
-        el.addEventListener('click', () => {
-          const nm = el.dataset.openname || '';
-          if (el.dataset.opengid) { pushChat(el.dataset.opengid); return; }
-          if (extensionOffline()) { toast('电脑端未连接，无法切换会话'); return; }
-          if (sendMsg({ action: 'OPEN_CONV', name: nm, lastText: el.dataset.openlast || '' })) {
-            toast('已请电脑网页切到「' + nm + '」');
-          } else {
-            toast('连接已断开，正在重连');
-          }
-        });
+        el.addEventListener('click', () => openPageConv(el.dataset.openname || '',
+                                                        el.dataset.openlast || ''));
       });
+      // ★ 点过的"未打开"会话，等它出现在中继会话列表里就自动打开聊天页（不用再点第二次）
+      if (pendingOpenName) {
+        const hit = keys.find(g => String((convs[g] || {}).name || '').trim() === pendingOpenName);
+        if (hit) {
+          const want = pendingOpenName;
+          pendingOpenName = '';
+          toast('已打开「' + want + '」');
+          pushChat(hit);
+        }
+      }
 
       if (activeGroupId && getConv(activeGroupId)) {
         const c = getConv(activeGroupId);
@@ -1943,6 +1990,29 @@ HTML_CONTENT = """<!DOCTYPE html>
       }
     }
 
+    // 点网页列表里的会话：让电脑切过去；中继认识的话同时打开聊天页
+    function openPageConv(name, lastText) {
+      if (!name) return;
+      const gid = (function () {
+        const convs = getConvs();
+        return Object.keys(convs).find(g => String((convs[g] || {}).name || '').trim() === name.trim()) || '';
+      })();
+      if (extensionOffline()) {
+        if (gid) { pushChat(gid); }
+        else { toast('电脑端未连接，无法切换会话'); }
+        return;
+      }
+      if (!sendMsg({ action: 'OPEN_CONV', name: name, lastText: lastText })) {
+        toast('连接已断开，正在重连');
+        return;
+      }
+      if (gid) {
+        pushChat(gid);                        // 本地已有这条会话：直接打开
+      } else {
+        pendingOpenName = name.trim();        // 还没有：等探针上报后自动打开
+        toast('正在让电脑打开「' + name + '」…');
+      }
+    }
     function pushChat(gid) {
       const conv = getConv(gid);
       if (!conv) return;
@@ -2768,6 +2838,30 @@ async def ws_ext_handler(request):
                     if rows:
                         # ★ 隔离：测试来源的会话列表只进诊断键，真实手机端不显示（和上次事故同一类问题）
                         is_test_ws = ws in TEST_WS
+                        # ★ V8.0.1：列表本身的**变化**就是"网页来新会话/新消息"的唯一线索 ——
+                        #   探针只在**当前打开的工单**里读聊天区，别的会话来消息（还没点开）根本不会
+                        #   走 PLAYER_MESSAGE，只靠那条链路注定漏通知（客服反馈：网页来新会话时不响）。
+                        _prev_rows = (state.get("conv_list_test") if is_test_ws else state.get("conv_list")) or []
+                        _prev = {str(x.get("name") or "").strip(): str(x.get("last") or "")
+                                 for x in _prev_rows if isinstance(x, dict)}
+                        _first_sight = not bool(_prev)      # 第一次拿到列表：只建立基线，不刷一屏通知
+                        fresh = []
+                        for r in rows:
+                            _nm = str(r.get("name") or "").strip()
+                            if not _nm:
+                                continue
+                            _last = str(r.get("last") or "")
+                            if r.get("active"):
+                                r.pop("fresh", None)        # 已经被打开（人手或我们切的）-> 不再是"新"
+                                continue
+                            if _first_sight:
+                                continue
+                            if _nm not in _prev:
+                                r["fresh"] = True
+                                fresh.append((_nm, _last, "new"))
+                            elif _prev.get(_nm) != _last:
+                                r["fresh"] = True
+                                fresh.append((_nm, _last, "msg"))
                         if is_test_ws:
                             state["conv_list_test"] = rows
                         else:
@@ -2790,6 +2884,19 @@ async def ws_ext_handler(request):
                         print(f"[会话列表] 已更新 {len(rows)} 个会话"
                               + ("（当前：" + str([r.get('name') for r in rows if r.get('active')][:1]) + "）"
                                  if any(r.get("active") for r in rows) else ""))
+                        # 通知（只推给同一隔离类的手机端：真实行只推真实手机，测试行只推测试手机）
+                        for _nm, _txt, _kind in fresh[:5]:
+                            _preview = " ".join(str(_txt).split())[:60]
+                            for m in _mobile_targets_for(is_test_ws):
+                                await safe_send(m, {"type": "NEW_MESSAGE", "groupID": "page:" + _nm,
+                                                    "name": _nm, "preview": _preview,
+                                                    "mode": "page", "ts": int(time.time() * 1000),
+                                                    "from_page_list": True, "kind": _kind})
+                            print(f"[新消息] 🖥 网页列表{'新会话' if _kind == 'new' else '有新内容'}："
+                                  f"{_nm} — {_preview[:30]}")
+                            if not is_test_ws and config.get("bark_on_new_message", True):
+                                push_bark(("🆕 新会话 " if _kind == "new" else "💬 ") + _nm,
+                                          _preview or "（网页会话列表有新内容）")
                     continue
 
                 # ★ V7.8：探针自报家门（PONG）—— 诊断"指令到底有没有到、浏览器里是哪版代码"
@@ -2908,13 +3015,13 @@ async def ws_ext_handler(request):
                             else:
                                 mode_now = "manual"
                             preview = " ".join(new_txt.split())[:60]
-                            for m in list(active_clients["mobile"]):
+                            for m in _mobile_targets_for(_is_test_origin):
                                 await safe_send(m, {"type": "NEW_MESSAGE", "groupID": gid, "name": name,
                                                     "preview": preview, "mode": mode_now, "ts": new_ts})
                             print(f"[新消息] {name}：{preview[:30]}（已即时提示手机端 · 模式 {mode_now}）")
                             # ★ ③ 同时推一条 Bark（手机锁屏/退后台也能收到；可在 config.json 用
                             #   "bark_on_new_message": false 关掉）。push_bark 内部走线程池，不阻塞事件循环。
-                            if config.get("bark_on_new_message", True):
+                            if config.get("bark_on_new_message", True) and not _is_test_origin:
                                 push_bark(f"💬 {name} 新消息", preview or "（玩家发来新消息）", gid)
                     except Exception as e:
                         print(f"[新消息] 通知失败（不影响主流程）：{e}")
@@ -3319,26 +3426,40 @@ async def ws_mobile_handler(request):
                     text = pkt.get("content")
                     if not gid or not text:
                         continue
+                    gid = str(gid)
+                    # ★ V8.0.1：不再给"中继不认识的会话"造占位卡片（名字=工单号）。
+                    #   那正是手机上出现 NOTOPEN-… / 长得像工单号的假会话的来源（客服看到就是垃圾）。
+                    #   不认识的会话直接拒绝，并告诉客服正确动作：先在手机主页点它一下（电脑会自动打开）。
+                    if not (state["companies"]["main"]["conversations"].get(gid) or {}):
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                                             "message": "这条会话还没在电脑网页上打开过 —— "
+                                                        "先在手机主页点它一下（电脑会自动切过去），再发消息"})
+                        continue
                     # ★ 安全闸：手机端代发的内容也会进玩家对话框（可能是从草稿复制来的）
                     text, left = safe_outbound(text, "手机端代发")
                     if not text.strip():
                         await safe_send(ws, {"type": "AI_STATUS", "status": "error",
                                              "message": "内容清洗后为空（只含内部提示），未发送"})
                         continue
-                    conv = state["companies"]["main"]["conversations"].setdefault(
-                        gid, {"name": gid, "msgs": [], "placeholder": True})
+                    conv = state["companies"]["main"]["conversations"][gid]
                     if not isinstance(conv.get("msgs"), list):
                         conv["msgs"] = []
+                    # 修复 BUG-011：过滤 action 字段，仅转发必要字段
+                    # ★ V8.0.1：先发（必要时中继会先自动切会话），**发送成功才把这条消息记进会话**，
+                    #   否则手机上会显示一条"其实没发出去"的假消息（诚实优先）。
+                    ok_sent = await send_to_player({"command": "SEND_REPLY", "groupID": gid,
+                                                    "content": text}, "手机端代发", origin=ws,
+                                                   require_page=True,
+                                                   page_name=str(pkt.get("name") or ""))
+                    if not ok_sent:
+                        continue                      # 拒发原因已由 send_to_player 推给手机端
                     conv["msgs"].append({"sender": "agent", "text": text,
                                          "time": datetime.now().strftime("%H:%M:%S"),
                                          "ts": int(time.time() * 1000)})
                     conv["updatedAt"] = int(time.time() * 1000)
                     _LAST_ACTIVE["gid"] = gid
-                    for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
-                    # 修复 BUG-011：过滤 action 字段，仅转发必要字段
-                    await send_to_player({"command": "SEND_REPLY", "groupID": gid,
-                                          "content": text}, "手机端代发", origin=ws, require_page=True,
-                                         page_name=str(pkt.get("name") or ""))
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "FULL_SYNC", "data": state})
     finally:
         active_clients["mobile"].discard(ws)
         TEST_WS.discard(ws)                  # ★ V7.9：断开就摘掉，别让计数/隔离判断留在脏数据上

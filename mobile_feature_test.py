@@ -561,10 +561,11 @@ async def main():
         await asyncio.sleep(0.5)
         snap_list = await fresh_state()
         rows = snap_list.get("conv_list_test") or []
+        names = [str(r.get("name")) for r in rows]
         check("测试来源的会话列表进入诊断键（可断言）",
-              len(rows) == 2 and rows[0].get("name") == "列表测试甲"
-              and rows[1].get("active") is False,
-              str(rows)[:140])
+              "列表测试甲" in names and "列表测试乙" in names
+              and any(r.get("name") == "列表测试乙" and r.get("active") is False for r in rows),
+              str(names)[:120])
         check("测试来源的会话列表绝不进真实手机端的列表（隔离，避免上次那种污染）",
               (snap_list.get("conv_list") or []) == []
               or all("列表测试" not in str(r.get("name") or "") for r in (snap_list.get("conv_list") or [])),
@@ -595,6 +596,61 @@ async def main():
               not any(m.get("command") == "OPEN_CONV" for m in real2_msgs),
               str([m.get("command") for m in real2_msgs][:5]))
         await real_ext2.close()
+
+        # ---------- 10. V8.0.1：网页列表变化即通知 + 不再造 NOTOPEN 垃圾会话 ----------
+        print("\n[10] 网页来新会话/新消息的通知（探针只读当前工单 -> 必须靠列表变化补上）")
+        ext6 = await s.ws_connect(BASE + "/ws/extension?test=1")
+        real_mob = await s.ws_connect(BASE + "/ws/mobile")      # 真实（非测试）手机端：不该被测试通知打扰
+        await asyncio.sleep(0.4)
+        await drain(ext6, 0.3, tries=3)
+        await drain(real_mob, 0.3, tries=3)
+
+        # ① 先给一份列表（这一份就是"已知基线"，后面的新名字才算新会话）
+        await ext6.send_json({"event": "CONV_LIST", "data": {"rows": [
+            {"name": "通知甲", "last": "你好", "time": "1小时前", "active": False}]}})
+        await asyncio.sleep(0.4)
+        await drain(mobile, 0.4, tries=8)
+
+        # ② 列表里冒出新会话 -> 立刻通知（这正是"网页来新会话不响"的修复）
+        await ext6.send_json({"event": "CONV_LIST", "data": {"rows": [
+            {"name": "通知甲", "last": "你好", "time": "1小时前", "active": False},
+            {"name": "通知乙", "last": "充值没到账", "time": "刚刚", "active": False}]}})
+        await asyncio.sleep(0.4)
+        _, m2 = await drain(mobile, 0.4, tries=10)      # 队列里可能有其它推送，多读几帧再断言
+        notif = [mm for mm in m2 if mm.get("type") == "NEW_MESSAGE" and mm.get("from_page_list")]
+        check("已有的会话不重复提醒（只认真正新出现/内容变了的）",
+              all(str(mm.get("name")) != "通知甲" for mm in notif),
+              str([mm.get("name") for mm in notif]))
+        check("网页列表里冒出新会话 -> 手机立刻收到通知（叮咚链路）",
+              bool(notif) and notif[-1].get("name") == "通知乙" and notif[-1].get("kind") == "new",
+              str(notif[-1] if notif else m2)[:160])
+        check("通知带预览文本（手机顶部提示能说清是谁说了什么）",
+              bool(notif) and "充值" in str(notif[-1].get("preview")),
+              str(notif[-1] if notif else "")[:120])
+        snap_fresh = await fresh_state()
+        rows_fresh = snap_fresh.get("conv_list_test") or []
+        check("新内容在列表里标了 fresh（手机显示未读点）",
+              any(r.get("name") == "通知乙" and r.get("fresh") for r in rows_fresh), str(rows_fresh)[:160])
+        _, rm_push = await drain(real_mob, 0.4, tries=8)
+        # 注意：真实探针自己也会推真机通知（真机本来该收到）—— 这里只核对"我们这两条测试会话"没漏过去
+        check("测试来源的通知不会打扰真实手机端（隔离）",
+              not any(mm.get("from_page_list") and str(mm.get("name")) in ("通知甲", "通知乙")
+                      for mm in rm_push),
+              str([(mm.get("name")) for mm in rm_push if mm.get("from_page_list")][:4]))
+        await real_mob.close()
+
+        # ③ 给"中继不认识的会话"代发 -> 拒绝，且**不再造垃圾卡片**（客服手机上曾出现 NOTOPEN-…）
+        junk = "NOTOPEN-" + RUN
+        await mobile.send_json({"action": "SEND_REPLY", "groupID": junk, "content": "这条不该出现"})
+        await asyncio.sleep(0.4)
+        _, m3 = await drain(mobile, 0.4, tries=3)
+        msgs3 = [str(mm.get("message")) for mm in m3 if mm.get("type") == "AI_STATUS"]
+        check("中继不认识的会话 -> 拒绝代发并告诉正确动作（先在主页点它一下）",
+              any("还没在电脑网页上打开过" in s for s in msgs3), str(msgs3[:1])[:160])
+        snap_junk = await fresh_state()
+        check("不再给不认识的会话造垃圾卡片（手机列表不会出现 NOTOPEN-…）",
+              junk not in convs(snap_junk), str([k for k in convs(snap_junk) if k.startswith("NOTOPEN")])[:100])
+        await ext6.close()
 
         # ---------- 收尾：把 IM 状态与告警复位，避免测试给真实使用留下"离线/忙碌" ----------
         if not mobile.closed:
