@@ -1131,4 +1131,56 @@ diag 30 · hud_layout 39 · rules_sync 18 · probe_smoke 79 · h5_security 84
 
 ---
 
+## 🧹 第十六轮（2026/9/29）：工程整理 —— 发布流程沉淀成 Skill + 根目录瘦身 + 启动方式明确
+
+### 1) 发布流程沉淀为可复用 Skill
+
+把第十五轮"仓库脱敏 + 历史清洗 + 推送核验"的完整流程写成 Cline Skill（三层：
+
+| 位置 | 用途 |
+|------|------|
+| `.cline/skills/repo-sanitize-publish/SKILL.md` | Cline 原生格式，本对话里可自动/斜杠调用（`/repo-sanitize-publish`） |
+| `repo-sanitize-publish.skill` | **单文件版**（内容含 SKILL.md + 两个脚本 + 坑位清单），方便拷贝/分享 |
+| `~/.cline/skills/repo-sanitize-publish/` | 全局安装，**任何项目**都能用 |
+
+随附两个可直接跑的脚本：
+- `scripts/scan_internal_words.py`：扫工作区入库文件 + **文件名** + 指定远端的敏感词命中（比 `git log -S` 可靠）；
+- `scripts/scrub_history.py`：同一张替换表既用于工作区批量替换，也可作为
+  `git filter-branch --tree-filter` 的执行体清洗全历史（含 GBK `.bat` 与点文件处理）。
+
+`docs/pitfalls.md` 记录 11 个实战坑：PowerShell 引号地狱、CRLF 混行导致编辑器匹配失败、
+扩展名白名单漏点文件、`git log -S` 不等于 tree 命中、`filter-branch` 会回写工作区（曾连带改坏探针域名）、
+测试"翻广播队列取最后一帧"必翻车、真实探针在线导致状态类断言偶发失败等。
+
+### 2) 根目录瘦身
+
+| 处理 | 对象 | 说明 |
+|------|------|------|
+| 删除 | `build/`、`dist/`、`__pycache__/` | 打包/编译中间产物，可重建 |
+| 移出仓库 | `launcher.spec` | PyInstaller 自动生成，`一键打包清理.bat` 本来就会删它 |
+| 移入 `_internal/` | 5 份内部文档（规章同步/ Git / 打包说明） | 根目录清爽，内容仍在本机（如需彻底删除可随时删） |
+| 改名 | `启动服务.vbs` → **`启动服务.vbs`** | ① 去掉品牌词（文件名也算泄漏面）；② 内容升级为**一次启动两个服务**（中继带窗口 + 悬浮窗静默） |
+| 保留 | `launcher.exe`、`launcher.bat`、`Ironman.ico/jpg`、`token_leak_test.py` | 都是仍在用的本机工具/测试 |
+
+### 3) 启动方式写入文档（README 4.1 改成四种方式）
+
+1. 双击 `launcher.exe`（最省事）
+2. 双击 `启动服务.vbs`（中继带窗口、悬浮窗静默）
+3. 双击 `launcher.bat`（本机自带、未入库）
+4. 命令行：`python launcher.py`，或分两步 `python bridge_server.py` + `pythonw semi_runner.pyw`
+
+> 说明：`launcher.bat` 是**未入库**的本机脚本，公开仓库的新用户按方式 4 走；`launcher.spec` 已不入库，
+> 打包命令统一为 `pyinstaller --onefile --icon="Ironman.ico" launcher.py`。
+
+### 4) 验证
+
+```
+python .cline/skills/repo-sanitize-publish/scripts/scan_internal_words.py
+  -> 入库文件数：27 · 工作区结论：CLEAN（文件名也无命中）
+9 套回归测试全绿：agent_core 16 / auto_reply 44 / mobile_feature 44 / multi_conv 通过 /
+diag 30 / hud_layout 39 / rules_sync 18 / probe_smoke 79 / h5_security 84（+ token_leak 无泄露）
+```
+
+---
+
 *此文档由 AI Bug 排查 Agent 自动生成*

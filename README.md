@@ -95,7 +95,10 @@
 | `bridge_server.py` | 中继服务，同时提供手机端网页 |
 | `agent_core.py` | 规章库匹配 + AI 决策 |
 | `semi_runner.pyw` | 桌面悬浮窗（热键、状态提示、结果核验） |
-| `launcher.py` / `launcher.bat` | 一键启动 |
+| `launcher.py` | 一键启动（中继 + 悬浮窗） |
+| `launcher.exe` | 打包好的一键启动器（双击即用，本机产物、未入库） |
+| `启动服务.vbs` | 双击启动两个服务（中继带窗口、悬浮窗静默） |
+| `一键打包清理.bat` | 重新打包 `launcher.exe` 并清理中间产物 |
 | `rules_sync.py` | 规章库自动同步工具 |
 | `config.json` | 所有配置（**含密钥，切勿外传**） |
 | `rules.xlsx` | 规章库文件 |
@@ -249,12 +252,25 @@ python rules_sync.py --info -v
 
 ### 4.1 启动
 
-**双击 `launcher.bat`** 即可（推荐），它会自动：
+**方式一：双击 `launcher.exe`（最省事，本机已打包好）**
+
+**方式二：双击 `启动服务.vbs`（无黑框干扰）** —— 中继在窗口里跑（方便看日志），悬浮窗静默启动。
+
+**方式三：双击 `launcher.bat`**（本机自带脚本，未入库；公开仓库里请用下面方式四），它会自动：
 
 1. 检查 Python 环境与必要文件
 2. 必要时自动安装依赖
 3. 启动中继服务（黑框窗口）
 4. 启动桌面悬浮窗
+
+**方式四：命令行两行**（仓库自带的 `launcher.py` 与手动启动等价）
+
+```bash
+python launcher.py             # 一键（等价于下面两条）
+# 或手动分两步：
+python bridge_server.py        # 中继服务（保留窗口看日志）
+pythonw semi_runner.pyw        # 桌面悬浮窗（无黑框）
+```
 
 启动成功会看到：
 
@@ -275,13 +291,6 @@ python rules_sync.py --info -v
 
 上面两行 `[探针]` 日志就是"油猴脚本已生效并连上来了"的铁证；
 如果只看到 `[探针] ⚠️ 已连接但未上报版本`，说明油猴里还是旧脚本，按 12.2 更新即可。
-
-也可以手动分两步启动：
-
-```bash
-python bridge_server.py        # 中继服务（保留窗口看日志）
-pythonw semi_runner.pyw        # 桌面悬浮窗（无黑框）
-```
 
 ### 4.2 首次启动的防火墙提示
 
@@ -305,7 +314,7 @@ Windows 可能弹窗询问是否允许 Python 访问网络 —— **必须勾选
 
 ### 4.4 开机自启（可选）
 
-把 `launcher.bat` 的快捷方式放进：
+把 `launcher.exe` 或 `启动服务.vbs` 的快捷方式放进：
 
 ```
 C:\Users\你的用户名\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup
