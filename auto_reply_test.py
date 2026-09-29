@@ -409,5 +409,30 @@ check("自检页/诊断能看到网页会话列表（page_list）",
 check("H5 主页有\"电脑网页上的会话\"分区（未打开的也能看到 + 可点切）",
       "电脑网页上的会话（" in SRC and 'action: \'OPEN_CONV\'' in SRC and "data-openname=" in SRC)
 
+print("\n[10.11] V8.1 自动发送硬闸 + 开场语收紧 + 防重复 + 出站审计")
+check("send_to_player 多了 auto 参数；「非 AFK 不许自动发送」是硬闸（客服：还是能自动给真实玩家发消息）",
+      'page_name=None, auto=False)' in SRC
+      and '_is_send_cmd = str(pkt.get("command") or "") in ("SEND_REPLY", "ACTION_REPLY_CLOSE")' in SRC
+      and 'if auto and _is_send_cmd and not state.get("afk_mode"):' in SRC)
+check("会场语收紧：只对「中继第一次见 + 玩家刚说话 + 还没客服发言」的会话处理（翻旧会话不再发）",
+      "not _was_known" in SRC and "_fresh = bool(_last_pl)" in SRC and "_no_agent_yet" in SRC)
+check("半自动开场语只起草（FILL_DRAFT + noOverwrite），AFK 才允许发送",
+      '"开场语(草稿)"' in SRC and '"noOverwrite": True' in SRC and '"开场语",' in SRC)
+check("安抚话术同理：半自动只起草，AFK 才发（旧版无条件直接发给玩家）",
+      '"安抚话术(草稿)"' in SRC and 'if state.get("afk_mode"):' in SRC)
+check("自动路径都显式标了 auto=True（便于审计与拦截）", SRC.count("auto=True") >= 5, str(SRC.count("auto=True")))
+check("同一条会话同样内容 6 秒内重复发送会被忽略（防两条一模一样）",
+      "_DEDUP_SENT" in SRC and "重复发送防抖" in SRC)
+check("出站审计：每次出站都留痕，并在 /api/diag 暴露 outbound_log",
+      "def _log_outbound(" in SRC and '"outbound_log"' in SRC)
+check("通知收紧：只有「本来就认识的会话 + 玩家消息真的更新」才提示（翻旧会话不弹）",
+      "_was_known and new_ts and new_ts > _prev_last_pl" in SRC)
+check("多工作台连接：只让「当前打开着目标会话」的那个探针执行（防同一条消息发两遍）",
+      '_PROBE_CONNS.get(e) or {}).get("page_gid")' in SRC and "多开工作台标签页" in SRC)
+check("手机页面自己带版本号（页面 vX 胶囊），排查\"刷新没生效\"一眼可查",
+      "const H5_VER" in SRC and "页面 v" in SRC)
+check("会话名归一化匹配（网页列表名 vs 聊天区名差空格/标点也能对上），点一下就能进会话",
+      "function nameKey" in SRC and "lastKnownGids" in SRC)
+
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

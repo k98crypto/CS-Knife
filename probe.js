@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V8.0 会话列表 + 远程切会话版)
+// @name         智能工单探针 (V8.1 不冲掉你正在写的字 + 切会话严谨确认版)
 // @namespace    http://tampermonkey.net/
-// @version      8.0
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）；V8.0 会话列表上报（手机端"全部会话"）+ 远程/自动切会话（OPEN_CONV，回复前先切对工单）
+// @version      8.1
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）；V8.0 会话列表上报（手机端"全部会话"）+ 远程/自动切会话（OPEN_CONV，回复前先切对工单）；V8.1 草稿不再冲掉客服正在写的字、切会话必须确认页面真的切过去才回执
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "8.0";
+    const PROBE_VERSION = "8.1";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -555,9 +555,23 @@
             });
             return true;
         },
-        fillReplyBox: function(text) {
+        fillReplyBox: function(text, allowOverwrite) {
             const inputBox = Operator.composerInput();
             if (!inputBox) return false;
+            // ★ V8.0.2：输入框里已经有内容（客服自己正在写的）时**绝不覆盖**。
+            //   以前 AI 草稿/开场语会把客服编辑到一半的文字直接冲掉，客服以为是"被拦截了"
+            //   （原话："好像还把我自己编辑的消息拦截了，我要再发一遍才能发出去"）。
+            if (!allowOverwrite) {
+                let cur = "";
+                try { cur = (inputBox.value !== undefined && inputBox.value !== null)
+                            ? inputBox.value : (inputBox.innerText || ""); } catch (e) {}
+                if (normText(String(cur)) && normText(String(cur)) !== normText(String(text))) {
+                    Operator._fillSkipped = "输入框里已有内容（未覆盖，避免冲掉你正在写的字）";
+                    console.log("🛑 [探针] 不覆盖输入框已有内容：" + normText(String(cur)).slice(0, 30));
+                    return false;
+                }
+            }
+            Operator._fillSkipped = "";
             if (inputBox.tagName === 'TEXTAREA' || inputBox.tagName === 'INPUT') {
                 inputBox.value = text;
                 inputBox.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1177,11 +1191,18 @@
             if (cmd.command === "RECOVERY_CONFIRMED") return;
 
             if (cmd.command === "FILL_DRAFT") {
-                if (cmd.content) Operator.fillReplyBox(cmd.content);
+                if (cmd.content) {
+                    // ★ V8.0.2：默认**不覆盖**客服已经写在输入框里的内容（除中继显式 overwrite:true）
+                    const filled = Operator.fillReplyBox(cmd.content, cmd.overwrite === true);
+                    if (!filled) {
+                        reportActionResult("FILL_DRAFT", false,
+                            (Operator._fillSkipped || Operator.editorFailureReason() || "草稿未填入"));
+                    }
+                }
                 if (cmd.category) Operator.selectCategory("一级分类", "二级分类", cmd.category, cmd.defaultCategory);
             }
             else if (cmd.command === "ACTION_REPLY_CLOSE") {
-                const filled = cmd.content ? Operator.fillReplyBox(cmd.content) : false;
+                const filled = cmd.content ? Operator.fillReplyBox(cmd.content, true) : false;
                 if (cmd.content && !filled) reportActionResult("ACTION_REPLY_CLOSE", false, Operator.editorFailureReason() + "，已停止关单");
                 if (!cmd.content) reportActionResult("ACTION_REPLY_CLOSE", true, "（无结束语，直接关单）");
                 const path = cmd.categoryPath || ["一级分类", "二级分类"];
@@ -1230,7 +1251,8 @@
                     labels.length ? ("页面按钮：" + labels.join(" / ")) : "没扫到任何操作按钮");
             }
             else if (cmd.command === "SEND_REPLY") {
-                const filled = Operator.fillReplyBox(cmd.content);
+                // 手机/中继明确要发这条内容 -> 允许覆盖（这段字是客服在手机上敲的）
+                const filled = Operator.fillReplyBox(cmd.content, true);
                 if (!filled) {
                     reportActionResult("SEND_REPLY", false, Operator.editorFailureReason() + "，消息没发出去");
                 } else {
@@ -1286,9 +1308,9 @@
                 }
                 fireClick(hit.el);
                 console.log("🖱️ [探针] 已点击会话：" + hit.name);
-                reportActionResult("OPEN_CONV", true, "已点击「" + hit.name + "」，正在切换…");
-                // ★ 回执要**确认页面真的切过去了**才说 ok（中继据此把"页面当前工单"绑到这个会话，
-                //   从而允许后续发送；点不动就如实说失败，中继会立刻拒发而不是干等超时）。
+                // ★ V8.0.2：这里**不再**立刻回一条 ok=true 的"已点击"回执 ——
+                //   中继会据此以为"页面已经切过去了"从而马上发送，可能把消息发进上一个会话（发错玩家）。
+                //   只有下面"确认页面真的切过去了"的回执才算数。
                 (function confirmSwitch(tries) {
                     setTimeout(() => {
                         const nowActive = scanConversationList().filter(r => r.active)[0];

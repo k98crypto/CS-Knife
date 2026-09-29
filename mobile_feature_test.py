@@ -403,15 +403,28 @@ async def main():
             "messages": [{"sender": "player", "text": "客服"}]}})
         await asyncio.sleep(0.6)
         _, ext3_msgs = await drain(ext3, 0.5, tries=4)
+        # ★ V8.1：半自动（默认）下开场语**只起草到输入框**，绝不自动发给玩家
+        #   （客服原话："你还是能自动给真实玩家发消息！拦截也不管用" —— 旧版这里就是直接 SEND_REPLY）
+        drafts = [m for m in ext3_msgs if m.get("command") == "FILL_DRAFT"]
         greets = [m for m in ext3_msgs if m.get("command") == "SEND_REPLY"]
-        check("玩家第一条消息 -> 立刻发开场语（来自表格）",
-              bool(greets) and ("亲" in str(greets[-1].get("content"))), str(greets[:1]))
+        check("玩家第一条消息 -> 半自动只**起草**开场语（FILL_DRAFT，来自表格），绝不自动发",
+              bool(drafts) and not greets, f"drafts={len(drafts)} sends={len(greets)}")
 
-        # ★ V7.5：玩家来新消息 -> 手机端必须**立刻**收到 NEW_MESSAGE（新消息通知：叮咚 + 提示 + 震动）
+        # ★ V8.1：新会话的"提示手机"由**会话列表变化**负责，PLAYER_MESSAGE 只对"已认识的会话"提示
+        #   （否则翻看旧工单/重启后重看都会误响 —— 客服明确要求"切换到其他旧的会话时不要弹"）
         _, mob_new = await drain(mobile, 0.5)
-        nm = [m for m in mob_new if m.get("type") == "NEW_MESSAGE"]
-        check("玩家来消息 -> 手机端立刻收到 NEW_MESSAGE（新消息通知）",
-              bool(nm) and nm[-1].get("groupID") == gid2, str(nm[:1]))
+        nm = [m for m in mob_new if m.get("type") == "NEW_MESSAGE" and m.get("groupID") == gid2]
+        check("第一次看到的新会话不靠 PLAYER_MESSAGE 误响（真正的新会话由列表变化提示）",
+              not nm, str(nm[:1]))
+        # 同一会话再来一条**新的**玩家消息 -> 这才是真"新消息"，必须提示（带名字/预览/模式）
+        await ext3.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gid2, "name": "节奏测试", "playerInfo": "节奏测试 | UID:7777",
+            "messages": [{"sender": "player", "text": "客服"}, {"sender": "player", "text": "在吗"}]}})
+        await asyncio.sleep(0.5)
+        _, mob_new2 = await drain(mobile, 0.5)
+        nm = [m for m in mob_new2 if m.get("type") == "NEW_MESSAGE" and m.get("groupID") == gid2]
+        check("已知会话来了新消息 -> 手机端立刻收到 NEW_MESSAGE（新消息通知）",
+              bool(nm), str(nm[:1]))
         check("NEW_MESSAGE 带 玩家名 / 预览 / 当前模式",
               bool(nm) and bool(nm[-1].get("name")) and "preview" in nm[-1]
               and nm[-1].get("mode") in ("manual", "semi", "afk"), str(nm[-1] if nm else None))
@@ -652,12 +665,113 @@ async def main():
               junk not in convs(snap_junk), str([k for k in convs(snap_junk) if k.startswith("NOTOPEN")])[:100])
         await ext6.close()
 
+        # ---------- 11. V8.1：绝不自动发消息 + 通知不误报 + 防重复发送 ----------
+        print("\n[11] 自动发送硬闸 / 翻旧会话不误报 / 防重复发送")
+        ext7 = await s.ws_connect(BASE + "/ws/extension?test=1")
+        await asyncio.sleep(0.4)
+        await drain(ext7, 0.3, tries=3)
+        await mobile.send_json({"action": "SET_MODE", "mode": "semi"})     # 半自动（只起草不发送）
+        await asyncio.sleep(0.4)
+        await drain(mobile, 0.4, tries=4)
+        gidA, gidB, gidC = "T-A-" + RUN, "T-B-" + RUN, "T-C-" + RUN
+
+        # ① 半自动 + 新会话第一句话 -> 只能起草，绝不许自动发给玩家（旧版这里会直接 SEND_REPLY）
+        await ext7.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gidA, "name": "开场测试甲", "playerInfo": "开场测试甲 | UID:1",
+            "messages": [{"sender": "player", "text": "你好"}]}})
+        await asyncio.sleep(1.2)
+        _, m_new = await drain(ext7, 0.5, tries=8)
+        cmds = [m.get("command") for m in m_new]
+        check("半自动：新会话开场语只「起草」（FILL_DRAFT），绝不自动发（无 SEND_REPLY）",
+              "FILL_DRAFT" in cmds and "SEND_REPLY" not in cmds, str(cmds))
+        async with s.get(BASE + "/api/diag") as r:
+            dg_audit = (await r.json()) or {}
+        olog = dg_audit.get("outbound_log") or []
+        check("出站审计里能看到这次「系统自动起草」（谁触发/什么模式/发没发）",
+              any(str(e.get("where") or "").startswith("开场语") and e.get("auto") for e in olog),
+              str(olog[:2])[:200])
+
+        # ② 建好一条"旧会话"，然后重看它（同样的历史消息）-> 不许响、不许再起草/发送
+        await ext7.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gidB, "name": "旧会话乙", "playerInfo": "旧会话乙 | UID:2",
+            "messages": [{"sender": "player", "text": "很久以前的问题"}]}})
+        await asyncio.sleep(1.0)
+        await drain(ext7, 0.4, tries=6)
+        await drain(mobile, 0.4, tries=6)
+        await ext7.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gidB, "name": "旧会话乙", "playerInfo": "旧会话乙 | UID:2",
+            "messages": [{"sender": "player", "text": "很久以前的问题"}]}})
+        await asyncio.sleep(0.8)
+        _, m_old = await drain(mobile, 0.4, tries=8)
+        check("翻看旧会话（同样的历史消息）不再弹「新消息」提示",
+              not any(mm.get("type") == "NEW_MESSAGE" and str(mm.get("groupID")) == gidB for mm in m_old),
+              str([(mm.get("type"), mm.get("groupID")) for mm in m_old][:6]))
+        _, e_old = await drain(ext7, 0.4, tries=6)
+        check("重看旧会话也不会再自动起草/发送（不会再给真实玩家发开场语）",
+              not any(m.get("command") in ("SEND_REPLY", "FILL_DRAFT") for m in e_old),
+              str([m.get("command") for m in e_old][:6]))
+
+        # ③ 但"当前会话真的来了新消息"仍然要提示（别修过头）
+        await ext7.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gidB, "name": "旧会话乙", "playerInfo": "旧会话乙 | UID:2",
+            "messages": [{"sender": "player", "text": "很久以前的问题"},
+                         {"sender": "agent", "text": "之前回过"},
+                         {"sender": "player", "text": "我又来了（新消息）"}]}})
+        await asyncio.sleep(0.8)
+        _, m_new2 = await drain(mobile, 0.4, tries=8)
+        check("已知会话真的来了新消息 -> 照常提示手机（没有修过头）",
+              any(mm.get("type") == "NEW_MESSAGE" and str(mm.get("groupID")) == gidB for mm in m_new2),
+              str([(mm.get("type"), mm.get("groupID")) for mm in m_new2][:6]))
+
+        # ④ 同一条会话、同样内容 6 秒内连发两次 -> 只发一次
+        await mobile.send_json({"action": "SEND_REPLY", "groupID": gidB, "content": "防重复测试"})
+        await asyncio.sleep(0.3)
+        await mobile.send_json({"action": "SEND_REPLY", "groupID": gidB, "content": "防重复测试"})
+        await asyncio.sleep(0.9)
+        _, dup_msgs = await drain(ext7, 0.4, tries=8)
+        twice = [m for m in dup_msgs if m.get("command") == "SEND_REPLY"]
+        check("同样内容 6 秒内重复发 -> 只发一次（防双击/防多标签页重复两条）",
+              len(twice) == 1, str([m.get("command") for m in dup_msgs][:8]))
+
+        # ⑤ 多个工作台连接时，只让"当前打开着这条会话"的那个执行（防同一条消息发两遍）
+        ext8 = await s.ws_connect(BASE + "/ws/extension?test=1")
+        await asyncio.sleep(0.3)
+        await drain(ext8, 0.3, tries=3)
+        await ext8.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gidC, "name": "多标签丙", "playerInfo": "多标签丙 | UID:3",
+            "messages": [{"sender": "player", "text": "在吗"}]}})
+        await asyncio.sleep(0.9)
+        await drain(ext7, 0.4, tries=6)
+        await drain(ext8, 0.4, tries=6)
+        await mobile.send_json({"action": "SEND_REPLY", "groupID": gidC, "content": "只该发一次"})
+        await asyncio.sleep(0.9)
+        _, e7m = await drain(ext7, 0.4, tries=6)
+        _, e8m = await drain(ext8, 0.4, tries=6)
+        check("多个工作台连接时，只让「当前打开着这条会话」的那个执行发送",
+              any(m.get("command") == "SEND_REPLY" for m in e8m)
+              and not any(m.get("command") == "SEND_REPLY" for m in e7m),
+              f"ext8={[m.get('command') for m in e8m][:4]} ext7={[m.get('command') for m in e7m][:4]}")
+        async with s.get(BASE + "/api/diag") as r:
+            dg_multi = (await r.json()) or {}
+        check("/api/diag 提示「多开标签页会导致重复发送」",
+              "多开" in str(dg_multi.get("warn") or ""), str(dg_multi.get("warn"))[:80])
+        await ext8.close()
+        await ext7.close()
+
         # ---------- 收尾：把 IM 状态与告警复位，避免测试给真实使用留下"离线/忙碌" ----------
         if not mobile.closed:
             await mobile.send_json({"action": "SET_IM_STATUS", "status": 1})
             await asyncio.sleep(0.4)
             await drain(mobile, 0.3, tries=2)
             await mobile.close()
+
+        # ★ V8.1：测试造的会话（T-A/T-B/T-C-…）收尾清掉，别让客服手机上多出一堆假会话
+        try:
+            async with s.get(BASE + "/api/purge_test_data") as r:
+                purged = await r.json() if r.status == 200 else {}
+            print(f"  [清理] 已移除测试会话 {purged.get('removed_count', 0)} 条")
+        except Exception as e:
+            print(f"  [清理] 跳过了（不影响结论）：{e}")
 
     print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
     return 0 if failed == 0 else 1

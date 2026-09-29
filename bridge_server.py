@@ -513,6 +513,7 @@ _PONG_WAITERS = []                   # ★ V7.8：/api/probe_ping 等探针 PONG
 #   而不是干等满超时（真机上会话名对不上时能 1 秒内就说清楚原因）。
 _OPEN_CONV_RESULT = {"ts": 0.0, "ok": None, "gid": "", "detail": "", "test": None}
 TEST_WS = set()                      # ★ V7.9：带 ?test=1 连上的"测试客户端"（测试脚本专用）
+_DEDUP_SENT = {}                     # ★ V8.0.2：重复发送防抖 {(gid, md5(text)): ts}
 
 
 def ext_targets(origin=None):
@@ -541,7 +542,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "8.0"
+SERVER_VER = "8.1"
 
 
 def _probe_refresh():
@@ -674,7 +675,36 @@ async def ensure_page_on(gid, name=None, origin=None, timeout=4.0):
                    f"或该会话在其它分组里）")
 
 
-async def send_to_player(payload, where="", origin=None, require_page=False, page_name=None):
+def _log_outbound(where, pkt, ok, note="", auto=False, targets=None):
+    """审计日志：任何"要进玩家对话框"的指令都记一笔（/diag 可查）。
+
+    ★ 为什么必须要有它：客服原话"你还是能自动给真实玩家发消息！拦截也不管用"。
+      口头保证没用 —— 这里把**每一次**出站（谁触发的、什么模式、发给几个探针、成不成）留痕，
+      客服自己就能在自检页看到"到底是谁发的、什么时候发的"。
+    """
+    try:
+        pkt = pkt or {}
+        entry = {
+            "ts": int(time.time()),
+            "where": str(where or ""),
+            "command": str(pkt.get("command") or ""),
+            "groupID": str(pkt.get("groupID") or ""),
+            "auto": bool(auto),
+            "mode": str(state.get("reply_mode") or state.get("mode") or ""),
+            "afk": bool(state.get("afk_mode")),
+            "targets": int(targets) if targets is not None else -1,
+            "ok": bool(ok),
+            "note": str(note or "")[:120],
+            "text": " ".join(str(pkt.get("content") or "").split())[:80],
+        }
+        log = state.setdefault("outbound_log", [])
+        log.insert(0, entry)
+        del log[40:]
+    except Exception as e:
+        print(f"[审计] 记录失败（不影响发送）：{e}")
+
+
+async def send_to_player(payload, where="", origin=None, require_page=False, page_name=None, auto=False):
     """把指令发给电脑端探针去执行前，先把"玩家可见文本"过一遍安全闸。
 
     payload 形如 {"command": "SEND_REPLY"|"FILL_DRAFT"|"ACTION_REPLY_CLOSE", "content": "..."}
@@ -685,14 +715,37 @@ async def send_to_player(payload, where="", origin=None, require_page=False, pag
                   对不上就拒绝（探针的发送永远作用于页面当前工单，错了就会发错玩家）。
     """
     pkt = dict(payload or {})
+    # ⓪-1 ★ V8.0.2 自动发送硬闸（本轮 P0）：
+    #   `auto=True` 表示"系统自己发起的"（开场语/安抚话术/AFK 自动回复/超时关单）。
+    #   铁律：**只有 AFK 模式允许系统自己"发送"**；半自动/手动模式下，自动文本一律只能起草。
+    #   （FILL_DRAFT = 起草，任何模式都允许 ✓ —— 半自动的 AI 草稿就是靠它）
+    #   客服原话："你还是能自动给真实玩家发消息！拦截也不管用" —— 旧版开场语在"半自动"下
+    #   也会直接 SEND_REPLY，而且换到旧会话时（重启后没有 greeted 标记）还会再发一次，就是它。
+    _is_send_cmd = str(pkt.get("command") or "") in ("SEND_REPLY", "ACTION_REPLY_CLOSE")
+    if auto and _is_send_cmd and not state.get("afk_mode"):
+        print(f"[自动发送] ⛔ 已拦截（当前模式 {state.get('reply_mode') or '?'}，非 AFK）：{where}")
+        _log_outbound(where, pkt, ok=False, note="非 AFK 模式：系统自动发送已拦截", auto=True)
+        return False
     # ⓪ 总开关（一键止血）
     if not outbound_enabled():
         print(f"[停发] outbound_enabled=false，已拦截（{where}）")
+        _log_outbound(where, pkt, ok=False, note="已开启停发总开关", auto=auto)
         for m in list(active_clients["mobile"]):
             await safe_send(m, {"type": "AI_STATUS", "status": "error",
                                 "message": "已开启「停发」：所有会进玩家对话框的内容都被拦住了"
                                            "（config.json → outbound_enabled=false）"})
         return False
+    # ⓪-2 ★ 重复发送防抖：同一条会话 + 同一段文本，6 秒内只发一次
+    #   （防双击、防手机重发、防"两个工作台标签页同时执行"造成的两条一模一样消息）
+    if pkt.get("groupID") and pkt.get("command") in ("SEND_REPLY", "ACTION_REPLY_CLOSE"):
+        import hashlib as _hl
+        _k = (str(pkt.get("groupID")), _hl.md5(str(pkt.get("content") or "").encode("utf-8")).hexdigest())
+        _now = time.time()
+        if _now - float(_DEDUP_SENT.get(_k) or 0) < 6.0:
+            print(f"[防重] 6 秒内同一条会话的同样内容已发过，忽略重复指令（{where}）")
+            _log_outbound(where, pkt, ok=False, note="重复指令（6 秒内同样内容）已忽略", auto=auto)
+            return False
+        _DEDUP_SENT[_k] = _now
     # ① 页面绑定核对（防"发错人"）：不对就**自动把网页切过去**，而不是让客服自己切
     if require_page:
         ok_page, note = page_binding_ok(pkt.get("groupID"), origin)
@@ -704,6 +757,7 @@ async def send_to_player(payload, where="", origin=None, require_page=False, pag
                 note = note + "；自动切换失败：" + sw_note
         if not ok_page:
             print(f"[页面绑定] 拒绝发送：{note}（{where}）")
+            _log_outbound(where, pkt, ok=False, note="页面绑定不符：" + note, auto=auto)
             for m in list(active_clients["mobile"]):
                 await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": note,
                                     "groupID": str(pkt.get("groupID") or "")})
@@ -713,11 +767,25 @@ async def send_to_player(payload, where="", origin=None, require_page=False, pag
         clean, left = safe_outbound(pkt["content"], where or str(pkt.get("command") or ""))
         if not clean:
             print(f"[安全闸] 内容清洗后为空，已拦截（{where}）")
+            _log_outbound(where, pkt, ok=False, note="清洗后为空，已拦截", auto=auto)
             return False
         pkt["content"] = clean
-    for ext in ext_targets(origin):
-        await safe_send(ext, pkt)
-    return True
+    _targets = ext_targets(origin)
+    # ★ V8.0.2：防"多个工作台页面同时执行"造成重复发送 ——
+    #   对"必须作用在某条会话上"的指令，只发给**当前真的打开着这条会话**的那个探针连接。
+    if require_page and pkt.get("groupID"):
+        _want = str(pkt["groupID"])
+        _only = [e for e in _targets
+                 if str((_PROBE_CONNS.get(e) or {}).get("page_gid") or "") == _want]
+        if _only:
+            _targets = _only
+    sent = 0
+    for ext in _targets:
+        if await safe_send(ext, pkt):
+            sent += 1
+    _log_outbound(where, pkt, ok=bool(sent), note=("已发出" if sent else "没有探针连接可执行"),
+                  auto=auto, targets=sent)
+    return bool(sent)
 
 
 def push_bark(title, body, group_id=""):
@@ -794,16 +862,22 @@ def _say_as_agent(group_id: str, text: str):
 
 async def send_hold_and_alert(group_id: str, conv: dict, history_str: str, reply: str = ""):
     """表格里查不到答案时：
-       ① 给玩家发安抚话术（客户指定的原话）
+       ① **半自动/手动**：只把安抚话术**起草**到输入框（绝不自动发给玩家）；AFK 才直接发
        ② 长报警（Bark + 手机端专属提示音 + 桌面 HUD 长鸣）——与"新消息提示音""掉线警报"都不同
        ③ 该会话置顶 + 把玩家信息和问题总结复制给客服（复制由桌面 HUD 完成）
     """
-    # ① 先安抚玩家（有电脑端在就连网页一起发，保证玩家真的收到）
-    #    ★ 安全闸：这句是"要进玩家对话框"的，必须零禁词（内部群/补偿/承诺…）
+    # ① 安抚话术：★ V8.0.2 —— 不再是"无条件直接发给玩家"（那正是"自动给真实玩家发消息"的来源之一）
     hold_text = safe_outbound(HOLD_TEXT, "安抚话术")[0] or HOLD_TEXT
-    await send_to_player({"command": "SEND_REPLY", "content": hold_text,
-                          "groupID": group_id}, "安抚话术")
-    _say_as_agent(group_id, hold_text)
+    if state.get("afk_mode"):
+        await send_to_player({"command": "SEND_REPLY", "content": hold_text,
+                              "groupID": group_id}, "安抚话术",
+                             origin=_auto_origin(group_id), require_page=True, auto=True)
+        _say_as_agent(group_id, hold_text)
+    else:
+        await send_to_player({"command": "FILL_DRAFT", "content": hold_text, "groupID": group_id,
+                              "noOverwrite": True}, "安抚话术(草稿)",
+                             origin=_auto_origin(group_id), require_page=True, auto=True)
+        print(f"[人工介入] 半自动：已把安抚话术起草到输入框（未发送），等客服确认：{group_id}")
 
     # ② 问题总结（给客服看的，不是给玩家的）
     try:
@@ -1011,16 +1085,17 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
                                       "categoryPath": (config.get("close_category_path") or ["一级分类", "二级分类"]),
                                       "defaultCategory": config.get("close_category_default", "其他"),
                                       "content": body, "groupID": group_id}, "超时关单",
-                                     origin=_auto_origin(group_id), require_page=True)
+                                     origin=_auto_origin(group_id), require_page=True, auto=True)
             else:
                 await send_to_player({"command": "SEND_REPLY", "content": body,
                                       "groupID": group_id}, "AFK 自动回复",
-                                     origin=_auto_origin(group_id), require_page=True)
+                                     origin=_auto_origin(group_id), require_page=True, auto=True)
         else:
             # 半自动模式：草稿推到网页与手机输入框（同样已过安全闸）
+            #   ★ V8.0.2：带 noOverwrite —— 输入框里如果已经有客服自己写的内容，**绝不覆盖**
             await send_to_player({"command": "FILL_DRAFT", "content": body, "category": "其他",
-                                  "groupID": group_id}, "半自动草稿",
-                                 origin=_auto_origin(group_id), require_page=True)
+                                  "groupID": group_id, "noOverwrite": True}, "半自动草稿",
+                                 origin=_auto_origin(group_id), require_page=True, auto=True)
             for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": body})
 
 
@@ -1284,8 +1359,12 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
+    // ★ V8.0.2：手机页面版本号（顶栏胶囊显示）——"刷新了没生效"时第一眼就能确认
+    const H5_VER = '8.1';
     // ★ V8.0.1：点过"未打开"的会话后，等它出现在中继会话列表里就自动打开聊天页（不用点第二次）
     let pendingOpenName = '';
+    let pendingOpenAt = 0;                 // 待打开的登记时间（25 秒后自动作废，避免乱开）
+    let lastKnownGids = {};                // 上一次渲染时已知的会话（用于"兜底自动打开"）
     let audioCtx = null; let sirenInterval = null;
     let wsAttempts = 0;
     let imStatusRequested = false;      // 已向电脑端索要过真实状态（4 秒内不重复要）
@@ -1295,6 +1374,15 @@ HTML_CONTENT = """<!DOCTYPE html>
         return String(s === null || s === undefined ? '' : s)
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // ★ V8.0.2：会话名归一化 —— 网页列表里的名字和聊天区里的名字可能差空格/大小写/标点，
+    //   不归一化就会出现"明明是同一个会话，手机却认为'未打开'、点了打不开"。
+    function nameKey(s) {
+        return String(s === null || s === undefined ? '' : s)
+            .replace(/[\\s\\u3000]+/g, '')
+            .replace(/[（）()【】\\[\\]·、:：;；"'`‘’“”]/g, '')
+            .toLowerCase();
     }
 
     // 安全发送：连接不可用时静默忽略，避免点击按钮抛 TypeError 导致按钮"失灵"
@@ -1760,7 +1848,9 @@ HTML_CONTENT = """<!DOCTYPE html>
         box.innerHTML =
             '<span class="chip"><span class="dot ' + (relayOn ? 'ok' : 'bad') + '"></span>中继 ' + (relayOn ? '已连接' : '断开') + '</span>' +
             '<span class="chip"><span class="dot ' + (probeOn ? 'ok' : 'bad') + '"></span>电脑探针 ' + (probeOn ? (ver ? 'v' + esc(ver) : '在线') : '未连接') + '</span>' +
-            '<span class="chip"><span class="dot ok"></span>' + esc(String(convCount)) + ' 个会话</span>';
+            '<span class="chip"><span class="dot ok"></span>' + esc(String(convCount)) + ' 个会话</span>' +
+            // ★ V8.0.2：把手机页面自己的版本显式标出来 —— 排查"改了没生效"第一眼就有据可查
+            '<span class="chip"><span class="dot ok"></span>页面 v' + esc(H5_VER) + '</span>';
         const sub = document.getElementById('brand-sub');
         if (sub) sub.innerText = probeOn ? '电脑端已连接 · 状态同步中' : (relayOn ? '等待电脑端探针连接…' : '中继断开，正在重连…');
     }
@@ -1894,7 +1984,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       const pageRows = Array.isArray(globalState.conv_list) ? globalState.conv_list : [];
       const gidByName = {};
       keys.forEach(g => {
-        const n = String((convs[g] || {}).name || '').trim();
+        const n = nameKey((convs[g] || {}).name);
         if (n) gidByName[n] = g;
       });
       const rendered = {};
@@ -1930,7 +2020,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       function pageRowHtml(r) {
         const nm = String(r.name || '');
         const isOpen = !!r.active;
-        const known = gidByName[nm.trim()] || '';
+        const known = gidByName[nameKey(nm)] || '';
         if (known) {
           rendered[known] = true;
           return convCardHtml(known, isOpen);      // 认识：完整卡片（点开聊天）
@@ -1954,13 +2044,20 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       if (pageRows.length) {
         parts.push('<div class="list-title" style="margin:8px 2px">电脑网页上的会话（' + pageRows.length + '）</div>');
-        pageRows.forEach(r => parts.push(pageRowHtml(r)));
+        // 单行渲染失败不许连累整张列表（渲染中断 = 后面的点击都没绑定 = "点不进卡片"）
+        pageRows.forEach(r => {
+          try { parts.push(pageRowHtml(r)); }
+          catch (e) { console.warn('[H5] 渲染网页会话行失败（已跳过）', r, e); }
+        });
       }
       const rest = keys.filter(g => !rendered[g]);
       if (rest.length) {
         parts.push('<div class="list-title" style="margin:8px 2px">' +
                    (pageRows.length ? '其它会话（不在网页列表里）' : '会话') + '</div>');
-        rest.forEach(g => parts.push(convCardHtml(g)));
+        rest.forEach(g => {
+          try { parts.push(convCardHtml(g)); }
+          catch (e) { console.warn('[H5] 渲染会话卡片失败（已跳过）', g, e); }
+        });
       }
       container.innerHTML = parts.join('');
 
@@ -1974,14 +2071,25 @@ HTML_CONTENT = """<!DOCTYPE html>
       });
       // ★ 点过的"未打开"会话，等它出现在中继会话列表里就自动打开聊天页（不用再点第二次）
       if (pendingOpenName) {
-        const hit = keys.find(g => String((convs[g] || {}).name || '').trim() === pendingOpenName);
-        if (hit) {
-          const want = pendingOpenName;
-          pendingOpenName = '';
-          toast('已打开「' + want + '」');
-          pushChat(hit);
+        if (Date.now() - pendingOpenAt > 25000) {
+          pendingOpenName = '';                 // 25 秒还没出现就别再挂着（免得以后乱开）
+        } else {
+          let hit = keys.find(g => nameKey((convs[g] || {}).name) === pendingOpenName);
+          if (!hit) {
+            // 名字对不上时给一次"兜底"：如果就冒出来一条**以前没见过**的会话，那就是它
+            const fresh = keys.filter(g => !lastKnownGids[g]);
+            if (fresh.length === 1) hit = fresh[0];
+          }
+          if (hit) {
+            const want = pendingOpenName;
+            pendingOpenName = '';
+            toast('已打开「' + ((convs[hit] || {}).name || want) + '」');
+            pushChat(hit);
+          }
         }
       }
+      lastKnownGids = {};
+      keys.forEach(g => { lastKnownGids[g] = true; });
 
       if (activeGroupId && getConv(activeGroupId)) {
         const c = getConv(activeGroupId);
@@ -1993,25 +2101,26 @@ HTML_CONTENT = """<!DOCTYPE html>
     // 点网页列表里的会话：让电脑切过去；中继认识的话同时打开聊天页
     function openPageConv(name, lastText) {
       if (!name) return;
+      const key = nameKey(name);
       const gid = (function () {
         const convs = getConvs();
-        return Object.keys(convs).find(g => String((convs[g] || {}).name || '').trim() === name.trim()) || '';
+        return Object.keys(convs).find(g => nameKey((convs[g] || {}).name) === key) || '';
       })();
-      if (extensionOffline()) {
-        if (gid) { pushChat(gid); }
-        else { toast('电脑端未连接，无法切换会话'); }
+      // 本地已经认识这条会话：直接打开聊天页（能开就别让客服多点一次）
+      if (gid) {
+        pushChat(gid);
+        if (extensionOffline() || !ws || ws.readyState !== WebSocket.OPEN) return;
+        sendMsg({ action: 'OPEN_CONV', name: name, lastText: lastText });   // 顺手让电脑也切过去
         return;
       }
+      if (extensionOffline()) { toast('电脑端未连接，无法切换会话'); return; }
       if (!sendMsg({ action: 'OPEN_CONV', name: name, lastText: lastText })) {
         toast('连接已断开，正在重连');
         return;
       }
-      if (gid) {
-        pushChat(gid);                        // 本地已有这条会话：直接打开
-      } else {
-        pendingOpenName = name.trim();        // 还没有：等探针上报后自动打开
-        toast('正在让电脑打开「' + name + '」…');
-      }
+      pendingOpenName = key;                  // 还没有这条会话：等探针上报后自动打开
+      pendingOpenAt = Date.now();
+      toast('正在让电脑打开「' + name + '」…');
     }
     function pushChat(gid) {
       const conv = getConv(gid);
@@ -2421,6 +2530,12 @@ async def api_diag(request):
             "outbound_enabled": outbound_enabled(),
         },
         "hint": "probe.online=false => 油猴脚本没跑起来；probe.version 落后 => TM 里是旧脚本",
+        # ★ V8.0.2：出站审计 —— 最近 10 次"要进玩家对话框"的指令（谁触发、什么模式、发给几个探针、成不成）
+        #   客服可以据此确认"到底是不是系统自己发的"
+        "outbound_log": (state.get("outbound_log") or [])[:10],
+        "warn": (f"检测到 {len(active_clients['extension'])} 个电脑端探针连接 —— "
+                 f"多开工作台标签页会导致同一条消息被发两遍，建议只留一个"
+                 if len(active_clients["extension"]) > 1 else ""),
     })
 
 
@@ -2739,6 +2854,11 @@ async def ws_ext_handler(request):
                                 _LAST_TEST_PAGE_GID["gid"] = _cvgid
                             else:
                                 _LAST_PAGE_GID["gid"] = _cvgid
+                            # 按连接记：执行切换的这个探针，此刻打开的就是目标会话
+                            try:
+                                _PROBE_CONNS.setdefault(ws, {})["page_gid"] = _cvgid
+                            except Exception:
+                                pass
                     # ★ V7.7：最近一次动作请求与结果留存（/diag 可查，便于定位"点了没反应"）
                     state["last_action"] = {"command": cmd_name, "action": label, "ok": ok,
                                             "detail": detail, "ts": int(time.time()),
@@ -2877,6 +2997,10 @@ async def ws_ext_handler(request):
                                         _LAST_TEST_PAGE_GID["gid"] = str(_gid)
                                     else:
                                         _LAST_PAGE_GID["gid"] = str(_gid)
+                                    try:
+                                        _PROBE_CONNS.setdefault(ws, {})["page_gid"] = str(_gid)
+                                    except Exception:
+                                        pass
                                     break
                             break
                         for m in list(active_clients["mobile"]):
@@ -2948,8 +3072,22 @@ async def ws_ext_handler(request):
                             _LAST_TEST_PAGE_GID["gid"] = str(gid)
                         else:
                             _LAST_PAGE_GID["gid"] = str(gid)
+                        # ★ V8.0.2：按连接记"这个探针此刻打开的是哪条会话" ——
+                        #   多开工作台标签页时，只让"真的打开着目标会话"的那个执行发送（防重复发送）
+                        try:
+                            _PROBE_CONNS.setdefault(ws, {})["page_gid"] = str(gid)
+                        except Exception:
+                            pass
                     
                     target = state["companies"]["main"]
+                    # ★ V8.0.2：这条会话对中继来说是不是"第一次见"（决定要不要开场语/要不要提示手机）
+                    _was_known = gid in target["conversations"]
+                    _prev_msgs = list((target["conversations"].get(gid) or {}).get("msgs") or [])
+                    _prev_last_pl = 0
+                    for _pm in reversed(_prev_msgs):
+                        if isinstance(_pm, dict) and _pm.get("sender") == "player":
+                            _prev_last_pl = int(_pm.get("ts") or 0)
+                            break
                     # 会话上限 50，超出时淘汰"最久没有新消息"的那个（而不是最早创建的），避免误删活跃工单
                     if len(target["conversations"]) >= 50:
                         oldest_gid = min(target["conversations"],
@@ -2995,10 +3133,11 @@ async def ws_ext_handler(request):
                     c["updatedAt"] = now_ms
                     _LAST_ACTIVE["gid"] = gid
 
-                    # ★★ 新消息即时通知（V7.5）★★
-                    # 旧行为：手机端只有"手动模式"会在 1~3 分钟延迟后收到一句提示，半自动/AFK 完全静默。
-                    #   现在：只要末尾多了**玩家**新消息，立刻推 NEW_MESSAGE 给手机
-                    #   （手机响"叮咚"双音 + 顶部提示 + 轻震动；手机不在线时什么都不做）。
+                    # ★★ 新消息即时通知（V7.5 / V8.0.2 收紧）★★
+                    # 旧行为：只要"末尾有玩家消息且 ts 比上次提示的新"就提示 —— 于是**翻看旧会话**
+                    #   或重启后重看老工单也会叮咚（客服反馈："电脑切换到其他旧的会话时，手机不要弹消息提示"）。
+                    # 现在：只提示"中继本来就认识这条会话、且玩家消息时间戳真的往后走了"的情况。
+                    #   真正的新会话/新消息由"会话列表变化"那条链路负责（CONV_LIST 的 diff）。
                     try:
                         new_ts, new_txt = 0, ""
                         for pm in reversed(c.get("msgs") or []):
@@ -3006,7 +3145,8 @@ async def ws_ext_handler(request):
                                 new_ts = int(pm.get("ts") or 0)
                                 new_txt = str(pm.get("text") or "")
                                 break
-                        if new_ts and new_ts > int(_LAST_NOTIFIED.get(gid) or 0):
+                        if (_was_known and new_ts and new_ts > _prev_last_pl
+                                and new_ts > int(_LAST_NOTIFIED.get(gid) or 0)):
                             _LAST_NOTIFIED[gid] = new_ts
                             if state.get("afk_mode"):
                                 mode_now = "afk"
@@ -3026,24 +3166,41 @@ async def ws_ext_handler(request):
                     except Exception as e:
                         print(f"[新消息] 通知失败（不影响主流程）：{e}")
 
-                    # ★★ 自动回复节奏（V7.4）★★
-                    # ① 玩家**第一次**发来消息 -> 立刻发一条开场语（严格取表格话术）
-                    # ② 之后不秒回：等 1~3 分钟（随机），期间再来消息就重新计时，确认不说了才回复
-                    # ⚠️ V7.4 修复：只有"快照里确实有玩家发言"时才发开场语。
-                    #    探针可能只推送一次空快照/状态同步（messages 为空），
-                    #    若不加这道护栏就会出现"玩家一句话没说，却先收到开场语"的诡异现象。
+                    # ★★ 开场语（V8.0.2 收紧：只对"真正的新会话"、且半自动只起草不发送）★★
+                    # 旧版漏洞（客服反馈"你还是能自动给真实玩家发消息"）：
+                    #   ① 只要"会话里有玩家消息且没 greeted 过"就发 —— 换到旧会话、或中继重启后重看老工单
+                    #      （greeted 标记丢了）都会**真的给玩家发一条开场语**；
+                    #   ② 半自动模式也在 `or state.get("auto_draft", True)` 下直接 SEND_REPLY；
+                    #   ③ 没有页面绑定（require_page），页面停在别的工单时也会打到当前工单里。
+                    # 现在：只有"这条会话对中继是全新的 + 玩家刚说话（≤3 分钟）+ 还没有客服发过言"才处理；
+                    #   AFK 才发送，半自动只**起草**到输入框（并提示手机），手动模式什么都不做。
                     has_player_msg = any(m.get("sender") == "player" for m in (c.get("msgs") or []))
-                    if has_player_msg and not c.get("greeted"):
+                    _last_pl = last_player_ts(c)
+                    _fresh = bool(_last_pl) and (now_ms - _last_pl) <= 180000
+                    _no_agent_yet = not any(m.get("sender") == "agent" for m in (c.get("msgs") or []))
+                    if (has_player_msg and not c.get("greeted") and not _was_known
+                            and _fresh and _no_agent_yet and config.get("auto_send_greeting", True)):
                         c["greeted"] = True
-                        if config.get("auto_send_greeting", True) and (
-                                state.get("afk_mode") or state.get("auto_draft", True)):
-                            # 开场语来自表格，同样要过安全闸（表格里万一写了禁词也不会漏给玩家）
-                            greet = safe_outbound(pick_greeting(), "开场语")[0]
-                            if greet:
-                                await send_to_player({"command": "SEND_REPLY", "content": greet,
-                                                      "groupID": gid}, "开场语")
-                                _say_as_agent(gid, greet)
-                                print(f"[开场] 已按表格发送开场语给 {name}：{greet[:40]}")
+                        greet = safe_outbound(pick_greeting(), "开场语")[0]
+                        if greet:
+                            if state.get("afk_mode"):
+                                _sent = await send_to_player(
+                                    {"command": "SEND_REPLY", "content": greet, "groupID": gid}, "开场语",
+                                    origin=ws, require_page=True, page_name=name, auto=True)
+                                if _sent:
+                                    _say_as_agent(gid, greet)
+                                    print(f"[开场] AFK：已按表格发送开场语给 {name}：{greet[:40]}")
+                            elif state.get("auto_draft", True):
+                                # 半自动：只起草（绝不自动发给玩家）
+                                await send_to_player(
+                                    {"command": "FILL_DRAFT", "content": greet, "groupID": gid,
+                                     "noOverwrite": True}, "开场语(草稿)",
+                                    origin=ws, require_page=True, page_name=name, auto=True)
+                                for m in _mobile_targets_for(_is_test_origin):
+                                    await safe_send(m, {"type": "AI_STATUS", "status": "ok",
+                                                        "groupID": gid,
+                                                        "message": f"已为「{name}」起草开场语（半自动：等你确认发送）"})
+                                print(f"[开场] 半自动：已起草开场语（未发送）给 {name}")
                     schedule_auto_reply(gid)
 
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})

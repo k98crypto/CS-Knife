@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '8.0';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '8.1';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -911,8 +911,9 @@ function check(name, ok, extra) {
     wsConv.onmessage({ data: JSON.stringify({ command: 'OPEN_CONV', name: '莉莉安我' }) });
     check('OPEN_CONV 点到目标会话行', clickedLabels.length === 1 && clickedLabels[0] === 'CONV:莉莉安我',
         JSON.stringify(clickedLabels));
-    check('OPEN_CONV 有动作回执',
-        sent.some(s => s.event === 'ACTION_RESULT' && s.data.command === 'OPEN_CONV'),
+    // ★ V8.1：点完**不允许**立刻回 ok=true（中继会据此以为页面已切过去而马上发送 -> 可能发错玩家）
+    check('切会话不给"提前成功"的假回执（等确认页面真的切过去）',
+        sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'OPEN_CONV').length === 0,
         JSON.stringify(sent.filter(s => s.event === 'ACTION_RESULT').slice(-1)));
     // 再跑一下 900ms 后的"确认回执"：探针确认页面真的切过去了才说 ok（中继据此允许后续发送）
     timeouts.filter(t => t.ms === 900).forEach(t => { try { t.fn(); } catch (e) {} });
@@ -929,6 +930,30 @@ function check(name, ok, extra) {
         && String(openFail[0].data.detail).indexOf('o超级大河马o') !== -1,
         JSON.stringify(openFail));
     sessionItems = [];
+
+    console.log('\n[8.13] V8.1 草稿不冲掉客服正在写的字 + 切会话确认后才回执');
+    composerInput = { tagName: 'TEXTAREA', value: '我正在写的字', dispatchEvent: () => true };
+    composerStub = {
+        tagName: 'DIV', getAttribute: () => null, parentElement: null,
+        querySelector: sel => (sel === 'textarea' ? composerInput : null),
+        querySelectorAll: () => []
+    };
+    composerStub.parentElement = composerStub;
+    sent.length = 0;
+    wsConv.onmessage({ data: JSON.stringify({ command: 'FILL_DRAFT', content: 'AI 草稿内容', groupID: 'T-EDIT' }) });
+    await new Promise(r => setTimeout(r, 5));
+    const fillRes = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'FILL_DRAFT');
+    check('输入框里已有客服写的字 -> 草稿绝不覆盖，并如实回报原因',
+        composerInput.value === '我正在写的字' && fillRes.length === 1 && fillRes[0].data.ok === false
+        && String(fillRes[0].data.detail).indexOf('已有内容') !== -1,
+        'value=' + composerInput.value + ' ' + JSON.stringify(fillRes.slice(-1)));
+    sent.length = 0;
+    wsConv.onmessage({ data: JSON.stringify({ command: 'FILL_DRAFT', content: 'AI 草稿内容',
+                                             groupID: 'T-EDIT', overwrite: true }) });
+    await new Promise(r => setTimeout(r, 5));
+    check('显式 overwrite:true 时才允许覆盖（关单/发送这类明确动作）',
+        composerInput.value === 'AI 草稿内容', composerInput.value);
+    composerInput.value = '';
 
     console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
     const chip = (documentStub.body._children || []).find(n => n.tagName === 'DIV');
