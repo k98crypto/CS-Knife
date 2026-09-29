@@ -149,3 +149,7 @@ patch_rules.local.txt
 *_SETUP_GUIDE.md
 GIT_*.md
 LAUNCHER_*.md
+
+# 中继调试日志（不入库）
+_srv.log
+_srv.err

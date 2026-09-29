@@ -25,6 +25,9 @@
 
   "im_proxy_enabled": true,
 
+  "_说明_workbench": "工单工作台域名（油猴脚本 @match 用）。仓库里的 probe.js 只放占位域名，中继 /probe.js 会按这里注入你的真实域名（可多个）",
+  "workbench_domains": ["ticket.example.com"],
+
   "_说明_brand": "品牌/称谓（可选）。仓库源码里只有通用默认词，把你自己的公司名/游戏名/玩家尊称写在这里即可，代码运行时自动替换。",
   "brand": {
     "company": "示例公司",

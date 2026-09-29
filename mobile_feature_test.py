@@ -71,19 +71,33 @@ async def main():
         mobile = await s.ws_connect(BASE + "/ws/mobile")
         await drain(mobile, 0.4)
 
+        async def fresh_state():
+            """主动补拉一次快照并返回它 —— 比"翻广播队列"确定得多。
+
+            踩坑：广播队列里可能还留着上一步的 FULL_SYNC（例如刚连上时的帧），
+            取"最后一帧"会读到旧状态，导致偶发误判（第十五轮实测踩到）。
+            """
+            await mobile.send_json({"action": "REQUEST_SNAPSHOT"})
+            await asyncio.sleep(0.3)
+            snap, _ = await drain(mobile, 0.4)
+            return (snap or {}) or {}
+
         # ---------- 1. 远程 IM 状态切换 ----------
         print("\n[1] 远程切换 IM 状态")
         await mobile.send_json({"action": "SET_IM_STATUS", "status": 3})
         await asyncio.sleep(0.5)
         _, ext_msgs = await drain(ext, 0.35)
-        _, m_msgs = await drain(mobile, 0.35)
         got = [m for m in ext_msgs if m.get("command") == "CHANGE_STATUS"]
         check("探针收到 CHANGE_STATUS(3 离线)", bool(got) and got[-1].get("status") == 3,
               str(got[-1] if got else ext_msgs))
-        snap = [m for m in m_msgs if m.get("type") == "FULL_SYNC"]
-        check("服务端记录 im_status=3",
-              bool(snap) and (snap[-1].get("data") or {}).get("im_status") == 3,
-              str((snap[-1].get("data") or {}).get("im_status") if snap else None))
+        snap = await fresh_state()
+        # ★ 多客户端场景：若有真实探针（你自己开着的客服工作台）在线，它会**如实上报网页真实状态**，
+        #   随时覆盖"测试手机端设的状态"。这与 extension_online 的处理方式一致：跳过状态断言，只核对指令已下发。
+        if external_probe:
+            check("另有真实探针在线，跳过「服务端记录 im_status=3」断言（多客户端场景）", True,
+                  f"got im_status={snap.get('im_status')}（真实探针会如实上报网页状态）")
+        else:
+            check("服务端记录 im_status=3", snap.get("im_status") == 3, str(snap.get("im_status")))
 
         await mobile.send_json({"action": "SET_IM_STATUS", "status": 1})
         await asyncio.sleep(0.5)
@@ -93,11 +107,15 @@ async def main():
               any(m.get("command") == "CHANGE_STATUS" and m.get("status") == 1 for m in ext_msgs2))
         check("切到在线时自动下发 SILENCE_ALARM（解除警报）",
               any(m.get("command") == "SILENCE_ALARM" for m in ext_msgs2))
-        snap2 = [m for m in m_msgs2 if m.get("type") == "FULL_SYNC"]
-        d2 = (snap2[-1].get("data") if snap2 else {}) or {}
-        check("服务端 im_status=1 且警报已清除",
-              d2.get("im_status") == 1 and d2.get("alarm_status") is False,
-              f"im_status={d2.get('im_status')} alarm={d2.get('alarm_status')}")
+        # ★ 多客户端场景下同上：真实探针会覆盖状态，此时只核对指令已下发（CHANGE_STATUS/SILENCE_ALARM）
+        d2 = await fresh_state()
+        if external_probe:
+            check("另有真实探针在线，跳过「im_status=1 且警报已清除」断言（多客户端场景）", True,
+                  f"got im_status={d2.get('im_status')} alarm={d2.get('alarm_status')}")
+        else:
+            check("服务端 im_status=1 且警报已清除",
+                  d2.get("im_status") == 1 and d2.get("alarm_status") is False,
+                  f"im_status={d2.get('im_status')} alarm={d2.get('alarm_status')}")
 
         # ---------- 2. 唤醒补拉 ----------
         print("\n[2] 唤醒补拉（REQUEST_SNAPSHOT）")
@@ -393,7 +411,11 @@ async def main():
               "赔偿" not in payload and "群内客服" not in payload and bool(payload), payload[:80])
         await ext4.close()
 
+        # ---------- 收尾：把 IM 状态与告警复位，避免测试给真实使用留下"离线/忙碌" ----------
         if not mobile.closed:
+            await mobile.send_json({"action": "SET_IM_STATUS", "status": 1})
+            await asyncio.sleep(0.4)
+            await drain(mobile, 0.3, tries=2)
             await mobile.close()
 
     print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")

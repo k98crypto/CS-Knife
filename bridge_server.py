@@ -1609,16 +1609,59 @@ async def api_diag(request):
     })
 
 
+# ==================== 探针命中域名注入（仓库里只放占位域名） ====================
+# ★ 为什么需要它：油猴脚本的 @match 必须是**精确的工作台域名**才能注入页面；
+#   但仓库是公开的，不该写内部域名。于是：
+#     · probe.js（入库）里放占位域名 `*://ticket.example.com/*`
+#     · 真实域名写在本地 config.json 的 workbench_domains
+#     · 中继在 /probe.js 响应时把占位行替换成真实域名 —— 你从
+#       http://127.0.0.1:8765/probe.js 复制出来的一定是能用的版本。
+PLACEHOLDER_HOST = "ticket.example.com"
+
+
+def _workbench_domains():
+    d = config.get("workbench_domains")
+    if isinstance(d, str):
+        d = [d]
+    out = []
+    for x in (d or []):
+        x = str(x).strip().lstrip("/").rstrip("/")
+        if x and x not in out:
+            out.append(x)
+    if not out:
+        x = str(config.get("workbench_domain") or "").strip()
+        if x:
+            out.append(x)
+    return out
+
+
+def render_probe_js(body: str) -> str:
+    """把脚本里的占位 @match 域名替换成本机配置的真实域名（没有配置就原样返回）。"""
+    hosts = _workbench_domains()
+    if not hosts or PLACEHOLDER_HOST not in body:
+        return body
+    lines = []
+    for line in body.split("\n"):
+        if ("@match" in line or "@include" in line) and PLACEHOLDER_HOST in line:
+            lines.append(line.replace(PLACEHOLDER_HOST, hosts[0]))
+            for h in hosts[1:]:
+                lines.append(line.replace(PLACEHOLDER_HOST, h))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 async def probe_js_handler(request):
     """把项目里最新的探针脚本直接发给浏览器。
 
     用途：打开 `http://IP:8765/probe.js` 即可核对油猴里那版是不是最新；
     加 `?download=1` 直接下载。省去"脚本从哪拷"的沟通成本。
+    ★ 会把 @match 里的占位域名替换成 config.json → workbench_domains 配置的真实域名。
     """
     path = os.path.join(BASE_DIR, "probe.js")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            body = f.read()
+            body = render_probe_js(f.read())
     except Exception:
         return web.json_response({"ok": False, "error": "probe.js 不存在于项目目录"}, status=404)
     headers = {"Cache-Control": "no-store"}

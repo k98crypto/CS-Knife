@@ -3,7 +3,9 @@
 // @namespace    http://tampermonkey.net/
 // @version      7.4
 // @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选
-// @match        *://ticket.example.com/*
+// ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
+//    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
+//    请务必从该地址复制脚本，不要直接从这个文件复制。
 // @match        *://ticket.example.com/*
 // @run-at       document-idle
 // @noframes
