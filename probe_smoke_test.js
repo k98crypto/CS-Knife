@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '7.4';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '7.5';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -57,6 +57,8 @@ function FakeAudioContext() {
 // ---------- Fake DOM ----------
 let actionButtons = [];                      // 模拟页面上的操作按钮（挂起/恢复/关单）
 let clickedLabels = [];
+let composerStub = null;                     // 模拟网页回复框容器（V7.5 发送闭环用例）
+let composerInput = null;                    // 模拟回复框本体（textarea）
 function makeEl(text, classes) {
     return {
         innerText: text,
@@ -95,6 +97,7 @@ const documentStub = {
     addEventListener: (ev, fn) => { docListeners[ev] = fn; },
     createElement: tag => makeNode(tag),
     querySelector: sel => {
+        if (sel === '.editor-composer') return composerStub;
         if (sel === '.ws-right-panel') return { innerText: playerInfoText };
         if (sel === '[data-ticket-id]') {
             return ticketIdAttr
@@ -518,6 +521,100 @@ function check(name, ok, extra) {
     // 分类不盲选：源码里不允许再有"取第一项兜底"
     check('分类选不中时不再盲选第一项（改回报候选）',
         code.indexOf('兜底：取第一项') === -1 && code.indexOf('宁可不选') !== -1);
+
+    console.log('\n[8.9.1] V7.5 挂起/恢复自动重试（按钮懒渲染 or 收在「更多」里）');
+    timeouts.filter(t => t.ms === 400).forEach(t => t.fn());   // 先清掉上一用例遗留的重试计时器
+    actionButtons = [];                       // 第一次扫不到按钮
+    clickedLabels = [];
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'ACTION_HANGUP', groupID: 'T-RETRY' }) });
+    let retryRes = sent.filter(s => s.event === 'ACTION_RESULT');
+    check('首次未找到 -> 立刻如实回报并说明会自动重试',
+        retryRes.length === 1 && retryRes[0].data.ok === false
+        && String(retryRes[0].data.detail).indexOf('重试') !== -1,
+        retryRes.length ? retryRes[0].data.detail : 'none');
+
+    sent.length = 0;
+    actionButtons = [makeEl('挂起', ['im-action-btn'])];   // 重试期间按钮渲染出来了
+    timeouts.filter(t => t.ms === 400).forEach(t => t.fn());
+    const retryOk = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.ok === true);
+    check('重试后真的点到「挂起」并回报成功',
+        retryOk.length >= 1 && clickedLabels.indexOf('挂起') !== -1,
+        JSON.stringify(clickedLabels) + ' ' + JSON.stringify(retryOk.slice(-1)));
+
+    console.log('\n[8.9.2] V7.5 动作回执带工单号（中继据此定位会话）');
+    check('ACTION_RESULT 携带 groupID',
+        sent.some(s => s.event === 'ACTION_RESULT' && s.data.groupID === 'T-RETRY'),
+        JSON.stringify(sent.filter(s => s.event === 'ACTION_RESULT').slice(-1)));
+
+    console.log('\n[8.9.3] V7.5 发送闭环（发送按钮 / 回车兜底 / 发后复验输入框）');
+    // 场景 A：回复框旁有「发送」按钮 -> 点它，输入框被清空
+    composerInput = { tagName: 'TEXTAREA', value: '', dispatchEvent: () => true };
+    const sendBtnStub = makeEl('发送', []);
+    sendBtnStub.click = function () { clickedLabels.push('发送'); composerInput.value = ''; };
+    composerStub = {
+        tagName: 'DIV', getAttribute: () => null, parentElement: null,
+        querySelector: sel => (sel === 'textarea' ? composerInput : null),
+        querySelectorAll: () => [sendBtnStub]
+    };
+    composerStub.parentElement = composerStub;
+    clickedLabels = [];
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'SEND_REPLY', content: '您好', groupID: 'T-SEND' }) });
+    await new Promise(r => setTimeout(r, 5));
+    timeouts.filter(t => t.ms === 500).forEach(t => t.fn());
+    timeouts.filter(t => t.ms === 500).forEach(t => t.fn());
+    let sendRes = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'SEND_REPLY');
+    check('有发送按钮 -> 点到「发送」并回报成功',
+        sendRes.length >= 1 && sendRes[sendRes.length - 1].data.ok === true && clickedLabels.indexOf('发送') !== -1,
+        JSON.stringify(sendRes.slice(-1)) + ' ' + JSON.stringify(clickedLabels));
+
+    // 场景 B：没有发送按钮（图标/纯回车）-> 回车兜底，输入框清空 -> 仍算成功
+    // 注意：沙箱里 Event/KeyboardEvent 是桩，type 取不到；真浏览器里 type=keydown 且 key=Enter
+    let enterFired = 0;
+    composerInput = { tagName: 'TEXTAREA', value: '', dispatchEvent: ev => {
+        if (ev && (ev.type === 'keydown' || ev.key === 'Enter')) { enterFired++; composerInput.value = ''; }
+        return true;
+    } };
+    composerStub = {
+        tagName: 'DIV', getAttribute: () => null, parentElement: null,
+        querySelector: sel => (sel === 'textarea' ? composerInput : null),
+        querySelectorAll: () => []
+    };
+    composerStub.parentElement = composerStub;
+    clickedLabels = [];
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'SEND_REPLY', content: '您好', groupID: 'T-SEND2' }) });
+    await new Promise(r => setTimeout(r, 5));
+    timeouts.filter(t => t.ms === 500).forEach(t => t.fn());
+    timeouts.filter(t => t.ms === 500).forEach(t => t.fn());
+    sendRes = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'SEND_REPLY');
+    check('没有发送按钮 -> 自动用回车发送并回报成功',
+        enterFired > 0 && sendRes.length >= 1 && sendRes[sendRes.length - 1].data.ok === true,
+        '回车=' + enterFired + ' ' + JSON.stringify(sendRes.slice(-1)));
+
+    // 场景 C：既没按钮、回车也不生效（输入框仍有内容）-> 如实回报失败，提示手动发送
+    composerInput = { tagName: 'TEXTAREA', value: '还没发出去', dispatchEvent: () => true };
+    composerStub = {
+        tagName: 'DIV', getAttribute: () => null, parentElement: null,
+        querySelector: sel => (sel === 'textarea' ? composerInput : null),
+        querySelectorAll: () => []
+    };
+    composerStub.parentElement = composerStub;
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'SEND_REPLY', content: '您好', groupID: 'T-SEND3' }) });
+    await new Promise(r => setTimeout(r, 5));
+    timeouts.filter(t => t.ms === 500).forEach(t => t.fn());
+    timeouts.filter(t => t.ms === 500).forEach(t => t.fn());
+    sendRes = sent.filter(s => s.event === 'ACTION_RESULT' && s.data.command === 'SEND_REPLY');
+    check('发送不成时如实回报失败并提示手动发送',
+        sendRes.length >= 1 && sendRes[sendRes.length - 1].data.ok === false
+        && String(sendRes[sendRes.length - 1].data.detail).indexOf('手动') !== -1,
+        JSON.stringify(sendRes.slice(-1)));
+
+    // 收尾：还原回复框为空（后续用例不受影响）
+    composerStub = null;
+    composerInput = null;
 
     console.log('\n[8.10] 玩家名与工单标识（V7.4：不再全叫"玩家信息"、不再重复卡片）');
     documentStub.body.innerText = 'IM工作台';

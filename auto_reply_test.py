@@ -172,5 +172,38 @@ check("find_forbidden 能抓到禁词（自检有效）", B.core.find_forbidden(
 check("纯内部提示会被清空 -> 调用方据此拦截", B.safe_outbound("【规章库未收录，请上报内部群核实】", "测试")[0] == "",
       repr(B.safe_outbound("【规章库未收录，请上报内部群核实】", "测试")[0]))
 
+print("\n[8] AI 关单确认：探针回执前不删会话（V7.5 防误删）")
+G1, G2, G3 = "CLOSE-T-A", "CLOSE-T-B", "CLOSE-T-C"
+for g in (G1, G2, G3):
+    B.state["companies"]["main"]["conversations"][g] = {"name": "关单测试" + g[-1], "msgs": []}
+
+check("关单有超时保护常量（页面不回报也不会永远挂着）",
+      isinstance(getattr(B, "CLOSE_CONFIRM_TIMEOUT", None), (int, float))
+      and B.CLOSE_CONFIRM_TIMEOUT > 0, str(getattr(B, "CLOSE_CONFIRM_TIMEOUT", None)))
+
+check("标记关单中：会话仍在列表且带 closing 标记",
+      B.mark_close_pending(G1, "其他") is True
+      and G1 in B.state["companies"]["main"]["conversations"]
+      and B.state["companies"]["main"]["conversations"][G1].get("closing") is True,
+      str(B.state["companies"]["main"]["conversations"][G1]))
+
+removed, note = B.resolve_close(G1, True, "已点击「回复并关单」")
+check("探针回执成功 -> 才把会话从列表移除",
+      removed is True and G1 not in B.state["companies"]["main"]["conversations"], note)
+
+B.mark_close_pending(G2, "其他")
+removed2, note2 = B.resolve_close(G2, False, "未找到「回复并关单」按钮")
+check("探针回执失败 -> 会话保留（绝不误删）",
+      removed2 is False and G2 in B.state["companies"]["main"]["conversations"]
+      and not B.state["companies"]["main"]["conversations"][G2].get("closing"),
+      f"{note2} closing={B.state['companies']['main']['conversations'][G2].get('closing')}")
+
+removed3, note3 = B.resolve_close("NO-SUCH-PENDING", True, "")
+check("没有待确认记录时安全返回（不误删任何会话）", removed3 is False, note3)
+
+for g in (G2, G3):
+    B.state["companies"]["main"]["conversations"].pop(g, None)
+B._PENDING_CLOSE.clear()
+
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

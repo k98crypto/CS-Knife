@@ -329,7 +329,7 @@ _LAST_ACTIVE = {"gid": None}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "7.4"
+SERVER_VER = "7.5"
 
 
 def _probe_refresh():
@@ -735,12 +735,22 @@ HTML_CONTENT = """<!DOCTYPE html>
     .msg-time{margin-top:4px;font-size:10px;color:var(--text-3);font-variant-numeric:tabular-nums}
     .input-bar{flex:0 0 auto;display:flex;align-items:center;gap:9px;padding:10px 12px calc(var(--safe-bottom) + 10px);
                border-top:1px solid var(--line-soft);background:var(--bg-soft)}
-    .chat-text-input{flex:1 1 auto;min-width:0;height:40px;border-radius:999px;padding:0 16px;font-size:15px;
-                     color:var(--text);background:var(--card);border:1px solid var(--line);outline:none}
+    .chat-text-input{flex:1 1 auto;min-width:0;min-height:40px;max-height:38vh;border-radius:18px;
+                     padding:9px 16px;font-size:15px;line-height:1.45;font-family:inherit;resize:none;
+                     color:var(--text);background:var(--card);border:1px solid var(--line);outline:none;
+                     overflow-y:hidden;display:block;box-sizing:border-box}
     .chat-text-input:focus{border-color:rgba(124,196,255,.5)}
     .send-btn{flex:0 0 auto;width:40px;height:40px;border-radius:50%;border:none;font-size:17px;font-weight:700;
+              align-self:flex-end;
               color:#0B0C0E;background:linear-gradient(145deg,#7CC4FF,#4EC9B0)}
     .send-btn:active{opacity:.8}
+    /* 失败原因常驻条：toast 一闪而过看不清/复制不了，这里保留到手动关闭 */
+    .err-bar{position:fixed;left:10px;right:10px;bottom:calc(var(--safe-bottom) + 76px);z-index:70;display:none;
+             background:#3A1D1F;border:1px solid #8B3A3A;color:#FFD9D9;border-radius:12px;padding:9px 12px;
+             font-size:13px;line-height:1.45;max-height:32vh;overflow-y:auto;-webkit-overflow-scrolling:touch;
+             white-space:pre-wrap;word-break:break-all;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+    .err-bar.show{display:block}
+    .err-bar b{float:right;margin-left:8px;opacity:.75}
 
     /* ==================== 轻提示 / 警报 ==================== */
     #toast{position:fixed;left:0;right:0;margin:0 auto;width:max-content;max-width:84%;
@@ -801,6 +811,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       <div class="sheet-cancel" onclick="closeSheet()">取消</div>
     </div>
     <div id="toast"></div>
+    <div class="err-bar" id="err-bar" onclick="hideErr()"><b>✕</b><span id="err-text"></span></div>
 
     <div class="view-container">
       <div class="view active" id="list-view">
@@ -832,7 +843,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <div class="chat-stream" id="chat-stream"></div>
         <div class="player-card" id="player-card" onclick="togglePlayerCard()"></div>
         <div class="input-bar">
-          <input type="text" class="chat-text-input" id="chat-input" placeholder="输入回复内容…">
+          <textarea class="chat-text-input" id="chat-input" rows="1" placeholder="输入回复内容…"></textarea>
           <button class="send-btn" onclick="execCommand('SEND')">↑</button>
         </div>
       </div>
@@ -1099,6 +1110,40 @@ HTML_CONTENT = """<!DOCTYPE html>
         toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
     }
 
+    // 失败原因常驻条（toast 一闪而过看不清、也没法复制）
+    function showErr(msg) {
+        const bar = document.getElementById('err-bar');
+        const txt = document.getElementById('err-text');
+        if (!bar || !txt) return;
+        try { txt.innerText = String(msg || ''); } catch (e) { txt.innerHTML = String(msg || ''); }
+        bar.classList.add('show');
+    }
+    function hideErr() {
+        const bar = document.getElementById('err-bar');
+        if (bar) bar.classList.remove('show');
+    }
+
+    // ==================== 输入框自动长高（有上限，超出滚动） ====================
+    // 需求：草稿/长文本要能看全；但高度要有上限，超过上限就滚动翻阅。
+    function inputMaxHeight() {
+        try {
+            const h = (window.innerHeight || 700) * 0.34;
+            return Math.max(72, Math.min(h, 240));
+        } catch (e) { return 160; }
+    }
+    function autoGrowInput() {
+        const el = document.getElementById('chat-input');
+        if (!el || !el.style) return;                 // 老浏览器/测试沙箱没有 style 就直接跳过
+        try {
+            const max = inputMaxHeight();
+            el.style.height = 'auto';
+            const full = el.scrollHeight || 0;
+            const h = Math.min(full, max);
+            el.style.height = h + 'px';
+            el.style.overflowY = (full > max) ? 'auto' : 'hidden';   // 超过上限 -> 可滚动翻阅
+        } catch (e) {}
+    }
+
     // ==================== iOS 锁屏 / 退后台恢复后主动补拉 ====================
     function resyncNow() {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1261,9 +1306,17 @@ HTML_CONTENT = """<!DOCTYPE html>
         else if (payload.type === 'FILL_DRAFT') {
             const input = document.getElementById('chat-input');
             if (input) input.value = payload.content || '';
+            autoGrowInput();                       // 草稿可能很长：自动长高到看得全（有上限，超出滚动）
+            if (input && input.focus) { try { input.focus(); } catch (e) {} }
         }
         else if (payload.type === 'AI_STATUS') {
             if (payload.message) toast(payload.message);   // 关单结果 / AI 状态提示
+            // ★ 失败原因不要一闪而过：常驻显示，可复制（含页面真实按钮名）
+            if (payload.status === 'error') {
+                showErr((payload.groupID ? '[' + payload.groupID + '] ' : '') + (payload.message || '操作失败'));
+            } else {
+                hideErr();
+            }
         }
       };
       ws.onerror = () => { /* 出错后浏览器会触发 onclose，由 onclose 统一调度重连 */ };
@@ -1314,15 +1367,17 @@ HTML_CONTENT = """<!DOCTYPE html>
         // 置顶/需要人工标记（表格里没答案时会置顶）
         const pin = c.pinned ? '<span class="pin-badge">📌</span>' : '';
         const alertTag = c.alert ? '<span class="pin-badge">🙋</span>' : '';
+        // 关单中标记（V7.5：AI 已下发结束语，等页面点「回复并关单」确认；确认前不移除会话）
+        const closingTag = c.closing ? '<span class="pin-badge">⏳</span>' : '';
         // 全部走 esc() 转义；gid 改用 data-* 传递，避免内联 onclick 属性逃逸
         return `<div class="conv-card" data-gid="${esc(gid)}">
             <div class="avatar">${esc(String(name).charAt(0) || '玩')}</div>
             <div class="conv-body">
               <div class="conv-top">
-                <div class="conv-name">${esc(name)}${pin}${alertTag}${unread ? '<span class="unread-dot"></span>' : ''}</div>
+                <div class="conv-name">${esc(name)}${pin}${alertTag}${closingTag}${unread ? '<span class="unread-dot"></span>' : ''}</div>
                 <div class="conv-time">${esc(time)}</div>
               </div>
-              <div class="conv-lastmsg">${esc(preview)}</div>
+              <div class="conv-lastmsg">${c.closing ? '⏳ 关单中…（等待页面确认）' : esc(preview)}</div>
               ${info ? '<div class="conv-info">' + esc(info) + '</div>' : ''}
             </div>
           </div>`;
@@ -1413,10 +1468,21 @@ HTML_CONTENT = """<!DOCTYPE html>
               sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text });
           }
           if (input) input.value = '';
+          autoGrowInput();                       // 清空后把高度收回去
       }
     }
 
     // ==================== 启动 ====================
+    // 输入框：输入/聚焦时自动长高（有上限，超出滚动翻阅）；草稿被填进来时也会自动长高
+    (function bindInputGrow() {
+        const el = document.getElementById('chat-input');
+        if (!el || !el.addEventListener) return;
+        ['input', 'focus', 'change'].forEach(ev => el.addEventListener(ev, autoGrowInput));
+        el.addEventListener('keydown', function (e) {           // 回车换行后重新量高度
+            setTimeout(autoGrowInput, 0);
+        });
+        autoGrowInput();
+    })();
     renderIMStatus();      // 先渲染成"连接中…"，等拿到电脑网页的真实状态再显示
     renderAFK();
     renderChips();
@@ -1854,9 +1920,22 @@ async def ws_ext_handler(request):
                     }.get(cmd_name, cmd_name or "操作")
                     print(f"[动作] {'✅' if ok else '❌'} {label}：{detail}")
                     msg = (f"{label}成功 · {detail}" if ok else f"{label}失败 · {detail}")
+                    # ★ AI 关单：只有探针回报"真的点到关单按钮"才把会话从列表移除（否则保留，绝不误删）
+                    if cmd_name == "ACTION_REPLY_CLOSE":
+                        gid = str(data.get("groupID") or "")
+                        if not gid and len(_PENDING_CLOSE) == 1:
+                            gid = next(iter(_PENDING_CLOSE))       # 兼容老探针（回执不带工单号）
+                        if gid:
+                            removed, note = resolve_close(gid, ok, detail)
+                            if ok and removed:
+                                msg = f"已回复并关单 · {detail}"
+                            elif not ok:
+                                msg = f"关单未完成（会话已保留）· {detail}"
+                            for m in list(active_clients["mobile"]):
+                                await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     for m in list(active_clients["mobile"]):
                         await safe_send(m, {"type": "AI_STATUS", "status": "ok" if ok else "error",
-                                            "message": msg[:300]})
+                                            "message": msg[:300], "groupID": data.get("groupID") or ""})
                     continue
 
                 # 探针回报的问题分类（用于手机端 AI 自动选分类关单）
@@ -1985,7 +2064,7 @@ async def ws_ext_handler(request):
 
 
 async def _probe_hello_watchdog(ws, delay=8.0):
-    """连接 8 秒仍未上报版本 => 说明 Tampermonkey 里是旧脚本（< v7.4）。
+    """连接 8 秒仍未上报版本 => 说明 Tampermonkey 里是旧脚本（低于期望版本）。
 
     这正是"脚本到底加载了没"最容易误判的场景：连接正常（所以看起来一切 OK），
     但新功能（自检胶囊 / 状态上报 / 问题分类）统统没有。
@@ -1998,10 +2077,67 @@ async def _probe_hello_watchdog(ws, delay=8.0):
         return
     if (_PROBE_CONNS.get(ws) or {}).get("version"):
         return
-    print("[探针] ⚠️ 已连接但未上报版本 => Tampermonkey 里仍是旧脚本（< v7.4）")
+    print(f"[探针] ⚠️ 已连接但未上报版本 => Tampermonkey 里仍是旧脚本（< v{SERVER_VER}）")
     print(f"[探针] ⚠️ 请打开 http://127.0.0.1:{PORT}/probe.js 取最新脚本，整段覆盖粘贴后 Ctrl+S 保存")
     for m in list(active_clients["mobile"]):
         await safe_send(m, {"type": "FULL_SYNC", "data": state})
+
+# ==================== AI 关单确认（防止"页面没点成功，卡片却消失了"） ====================
+# 旧实现：AI 生成结束语后**立刻**把会话从列表移除 —— 但探针点「回复并关单」可能失败，
+# 结果手机端卡片没了、工单其实还挂着（客服以为已关单）。
+# 现在：先标记 pending -> 等探针 ACTION_RESULT 回执 -> 成功才移除；失败/超时一律保留会话。
+CLOSE_CONFIRM_TIMEOUT = 20.0          # 秒：等探针回执的最长时间
+_PENDING_CLOSE = {}                   # gid -> {"category":..., "name":..., "ts":...}
+
+
+def mark_close_pending(gid: str, category: str) -> bool:
+    """把会话标记为"关单中"（不删除），并记住待确认信息。"""
+    conv = state["companies"]["main"]["conversations"].get(gid)
+    if not isinstance(conv, dict):
+        return False
+    conv["closing"] = True
+    _PENDING_CLOSE[gid] = {"category": category, "name": conv.get("name") or gid, "ts": time.time()}
+    return True
+
+
+def resolve_close(gid: str, ok: bool, detail: str = ""):
+    """探针回执处理：成功才真正把会话从列表移除；失败则保留（返回 (是否移除, 说明)）。"""
+    convs = state["companies"]["main"]["conversations"]
+    conv = convs.get(gid)
+    if isinstance(conv, dict):
+        conv.pop("closing", None)
+    info = _PENDING_CLOSE.pop(gid, None)
+    if info is None:
+        return False, "没有待确认的关单（可能已处理或已超时）"
+    name = info.get("name") or gid
+    if ok:
+        convs.pop(gid, None)
+        if _LAST_ACTIVE.get("gid") == gid:
+            _LAST_ACTIVE["gid"] = None
+        push_bark("已回复并关单", f"{name}　分类：{info.get('category')}　{(detail or '')[:40]}", gid)
+        print(f"[关单] ✅ {name} -> 分类「{info.get('category')}」（页面确认：{detail}）")
+        return True, "已关单"
+    print(f"[关单] ❌ {name} 未关单，已保留会话：{detail}")
+    return False, (detail or "页面未确认关单")
+
+
+async def _close_confirm_watchdog(gid: str):
+    """超时保护：页面迟迟不回报就保留会话并明确告诉手机端（绝不静默消失）。"""
+    await asyncio.sleep(CLOSE_CONFIRM_TIMEOUT)
+    if gid not in _PENDING_CLOSE:
+        return
+    info = _PENDING_CLOSE.pop(gid, None)
+    conv = state["companies"]["main"]["conversations"].get(gid)
+    if isinstance(conv, dict):
+        conv.pop("closing", None)
+    msg = ("页面未回报「回复并关单」结果，已保留该会话（未确认成功不会移除）；"
+           "请在电脑上确认工单状态")
+    print(f"[关单] ⚠️ {info.get('name') if info else gid}：{msg}")
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "AI_STATUS", "groupID": gid, "status": "error", "message": msg})
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "FULL_SYNC", "data": state})
+
 
 async def handle_ai_close(group_id: str):
     """手机端「AI 回复并关单」。
@@ -2043,16 +2179,15 @@ async def handle_ai_close(group_id: str):
     }
     await send_to_player(payload, "关单结束语")
 
-    # 关单后从列表移除（对应需求：关单之后消息从列表消失）
+    # ★ 关键改动：不再立刻移除会话 —— 先标记"关单中"，等探针回执确认成功后才移除。
+    #   （旧实现删早了：页面点失败会导致"卡片消失但工单还挂着"）
     name = conv.get("name") or group_id
-    state["companies"]["main"]["conversations"].pop(group_id, None)
-    if _LAST_ACTIVE.get("gid") == group_id:
-        _LAST_ACTIVE["gid"] = None
+    mark_close_pending(group_id, category)
+    asyncio.create_task(_close_confirm_watchdog(group_id))
     for m in list(active_clients["mobile"]):
         await safe_send(m, {"type": "FULL_SYNC", "data": state})
 
-    push_bark("已回复并关单", f"{name}　分类：{category}　{content[:40]}", group_id)
-    print(f"[关单] {name} -> 分类「{category}」")
+    print(f"[关单] ⏳ {name} 已下发结束语（分类「{category}」），等待页面确认…")
     return True, category
 
 
@@ -2061,10 +2196,10 @@ async def _ai_close_and_notify(gid: str):
         ok, info = await handle_ai_close(gid)
     except Exception as e:
         ok, info = False, f"关单异常: {e}"
-    msg = (f"已回复并关单 · 分类：{info}") if ok else str(info)
+    msg = (f"结束语已下发，等待页面执行「回复并关单」（分类：{info}）" if ok else str(info))
     for m in list(active_clients["mobile"]):
         await safe_send(m, {"type": "AI_STATUS", "groupID": gid,
-                            "status": "closed" if ok else "error", "message": msg})
+                            "status": "closing" if ok else "error", "message": msg})
 
 
 async def ws_mobile_handler(request):
@@ -2194,6 +2329,15 @@ async def ws_mobile_handler(request):
                             await safe_send(ws, {"type": "AI_STATUS", "status": "error",
                                                  "message": "内容清洗后为空（只含内部提示），已拦截"})
                             continue
+                    # ★ 手机端「✅ 关单」= 同一条 ACTION_REPLY_CLOSE 链路：先标记待确认，
+                    #   等探针回执成功才移除会话（避免"卡片没了、工单还挂着"）
+                    if str(fwd.get("command") or "") == "ACTION_REPLY_CLOSE":
+                        _cgid = str(fwd.get("groupID") or "")
+                        if _cgid and state["companies"]["main"]["conversations"].get(_cgid):
+                            mark_close_pending(_cgid, str(fwd.get("category") or "其他"))
+                            asyncio.create_task(_close_confirm_watchdog(_cgid))
+                            for m in list(active_clients["mobile"]):
+                                await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     for ext in list(active_clients["extension"]):
                         await safe_send(ext, fwd)
                 elif act == "SEND_REPLY":

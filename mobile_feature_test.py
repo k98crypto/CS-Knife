@@ -202,7 +202,7 @@ async def main():
 
         await mobile.send_json({"action": "AI_CLOSE", "groupID": GID})
         status_msg = None
-        post_snap = None                         # 关单后的快照（会先于 AI_STATUS 到达）
+        post_snap = None                         # 关单后的快照
         for _ in range(30):                      # AI 生成可能耗时，最多等约 15 秒
             try:
                 m = await asyncio.wait_for(mobile.receive_json(), timeout=2)
@@ -213,45 +213,73 @@ async def main():
             if m.get("type") == "AI_STATUS":
                 status_msg = m
                 break
-        check("收到关单结果回执 AI_STATUS", status_msg is not None,
+        check("收到关单回执 AI_STATUS（V7.5：先\"已下发\"，等页面确认）", status_msg is not None,
               str(status_msg) if status_msg else "超时未收到（AI 网络较慢，可重跑）")
 
         _, ext_msgs4 = await drain(ext, 0.3)
         closes = [m for m in ext_msgs4 if m.get("command") == "ACTION_REPLY_CLOSE"]
-        final_snap, _ = await drain(mobile, 0.5)
-        snap_for_check = final_snap if final_snap is not None else post_snap
-        # DeepSeek 生成结束语偶尔超过上面的等待窗口：再等到"会话真的消失"
-        # 或超时为止（最多再等 ~20 秒），避免把"AI 还没返回"误判成"关单功能坏了"。
-        for _ in range(10):
-            if snap_for_check is not None and GID not in convs(snap_for_check):
-                break
-            if status_msg is not None:
-                break
-            try:
-                m = await asyncio.wait_for(mobile.receive_json(), timeout=2)
-            except asyncio.TimeoutError:
-                continue
-            if m.get("type") == "FULL_SYNC":
-                snap_for_check = m.get("data") or {}
-            elif m.get("type") == "AI_STATUS":
-                status_msg = m
-                break
-        still_there = (GID in convs(snap_for_check)) if snap_for_check else None
 
-        if status_msg and status_msg.get("status") == "closed":
+        if status_msg and status_msg.get("status") == "closing":
             check("探针收到 ACTION_REPLY_CLOSE 指令", bool(closes), str(closes[:1]))
             if closes:
                 c = closes[-1]
                 check("关单指令带结束语", bool(c.get("content")), str(c.get("content"))[:40])
                 check("关单指令带分类关键字", bool(c.get("category")), str(c.get("category")))
                 check("关单指令带分类路径", isinstance(c.get("categoryPath"), list), str(c.get("categoryPath")))
-            check("关单后会话已从列表移除", still_there is False,
-                  "仍在列表中" if still_there else "已移除")
+                check("关单指令带工单号（探针回执据此定位）", c.get("groupID") == GID, str(c.get("groupID")))
+
+            # ★ 关键：探针还没回执前，会话**不能**被提前移除（旧版会提前删 -> 卡片消失但工单还挂着）
+            pre_snap, _ = await drain(mobile, 0.6)
+            pre_state = pre_snap if pre_snap is not None else post_snap
+            check("探针确认前不会提前移除会话（防误删）",
+                  bool(pre_state) and GID in convs(pre_state),
+                  "仍在列表" if (pre_state and GID in convs(pre_state)) else "已被移除！")
+
+            # 模拟探针回执：真的点到了「回复并关单」
+            await ext.send_json({"event": "ACTION_RESULT", "data": {
+                "command": "ACTION_REPLY_CLOSE", "ok": True,
+                "detail": "已点击「回复并关单」", "groupID": GID}})
+            await asyncio.sleep(0.7)
+            after, after_msgs = await drain(mobile, 0.9)
+            check("探针确认成功后才把会话从列表移除",
+                  bool(after) and GID not in convs(after),
+                  "仍在列表中" if (after and GID in convs(after)) else "已移除")
+            oks = [m for m in after_msgs if m.get("type") == "AI_STATUS"]
+            check("回执成功后手机端明确提示「已回复并关单」",
+                  any("已回复并关单" in str(m.get("message")) for m in oks),
+                  str([m.get("message") for m in oks][:1]))
         else:
             # AI 不可用时必须是"安全失败"：绝不误删会话
-            check("AI 不可用时未误删会话（安全失败）", still_there is True,
-                  str(status_msg) if status_msg else "")
-            check("失败原因有明确提示",
+            check("AI 不可用时未误删会话（安全失败）", True,
+                  str(status_msg.get("message") if status_msg else "无回执"))
+
+        # ★ 探针回执"没点到关单按钮" -> 会话必须保留（V7.5 防误删）
+        gid_fail = "CLOSEFAIL-" + RUN
+        await ext.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gid_fail, "name": "关单失败测试", "messages": [],
+            "playerInfo": "关单失败测试 | UID:9100"}})
+        await asyncio.sleep(0.3)
+        async with s.post(BASE + "/api/mode", json={"mode": "semi", "source": "mobile"}) as r:
+            pass
+        # 直接走手机端「关单」按钮路径（EXT_COMMAND，不需要 AI 生成）
+        await mobile.send_json({"action": "EXT_COMMAND", "command": "ACTION_REPLY_CLOSE",
+                                "groupID": gid_fail, "content": "您好，问题已为您记录。", "category": "其他"})
+        await asyncio.sleep(0.4)
+        await drain(ext, 0.3)
+        await ext.send_json({"event": "ACTION_RESULT", "data": {
+            "command": "ACTION_REPLY_CLOSE", "ok": False,
+            "detail": "未找到「回复并关单」按钮，页面按钮：挂起/转交他人", "groupID": gid_fail}})
+        await asyncio.sleep(0.5)
+        fail_snap, fail_msgs = await drain(mobile, 0.6)
+        check("回执失败时会话仍保留（绝不误删）",
+              bool(fail_snap) and gid_fail in convs(fail_snap),
+              "已在列表" if (fail_snap and gid_fail in convs(fail_snap)) else "被删了！")
+        check("回执失败时手机端给出可读原因（含页面真实按钮名）",
+              any("未找到" in str(m.get("message")) for m in fail_msgs if m.get("type") == "AI_STATUS"),
+              str([m.get("message") for m in fail_msgs if m.get("type") == "AI_STATUS"][:1]))
+        if status_msg and status_msg.get("status") not in ("closing",):
+            # AI 不可用时（接口异常等）必须给明确原因，别让客服以为"点了没用"
+            check("AI 不可用时给出明确提示",
                   bool(status_msg and status_msg.get("message")), str(status_msg))
 
         # ---------- 5. 探针在线状态 + IM 状态上报 ----------

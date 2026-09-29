@@ -366,6 +366,41 @@ onmsg({ type: 'AI_STATUS', status: 'error',
         message: '挂起失败 · 未找到「挂起」按钮，页面上的按钮：转交他人/结束会话' });
 check('探针回报失败原因 -> 手机端弹出具体原因（含页面真实按钮名）',
     (els['toast'].innerText || '').indexOf('未找到') !== -1, els['toast'].innerText);
+check('失败原因还常驻显示（toast 一闪而过看不清/复制不了）',
+    els['err-bar'] && els['err-bar'].classList.contains('show')
+    && (els['err-text'].innerText || '').indexOf('未找到') !== -1,
+    (els['err-text'] || {}).innerText);
+onmsg({ type: 'AI_STATUS', status: 'ok', message: '挂起成功 · 已点击「挂起」' });
+check('成功后常驻条自动收起', !els['err-bar'].classList.contains('show'));
+
+console.log('\n[12.1] V7.5 手机输入框：自动长高 + 有上限 + 超出滚动');
+check('输入框是多行 textarea（长草稿能换行看全）',
+    py.indexOf('<textarea class="chat-text-input" id="chat-input"') !== -1);
+check('样式里有高度上限与滚动',
+    py.indexOf('max-height:38vh') !== -1 && py.indexOf('overflow-y:hidden') !== -1
+    && py.indexOf('.err-bar{position:fixed') !== -1);
+check('有自动长高实现（按内容 + 上限 + 超出可滚）',
+    h5code.indexOf('function autoGrowInput') !== -1 && h5code.indexOf('inputMaxHeight') !== -1
+    && h5code.indexOf("el.style.overflowY = (full > max) ? 'auto' : 'hidden'") !== -1);
+check('收到草稿（FILL_DRAFT）时会自动长高',
+    h5code.indexOf('payload.type === \'FILL_DRAFT\'') !== -1
+    && h5code.indexOf('autoGrowInput();                       // 草稿可能很长') !== -1);
+check('输入/聚焦时绑定自动长高', h5code.indexOf('bindInputGrow') !== -1);
+
+console.log('\n[12.2] V7.5 关单中标记（确认前不移除会话）');
+check('会话卡片有关单中标记与文案',
+    h5code.indexOf('closingTag') !== -1 && h5code.indexOf('关单中…（等待页面确认）') !== -1);
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true, im_status: 1, im_status_known: true,
+    human_alerts: [],
+    companies: { main: { conversations: {
+        'T-CLOSING': { name: '关单中玩家', updatedAt: nowMs, closing: true,
+                       msgs: [{ sender: 'player', text: '帮我关单', ts: nowMs }] }
+    } } }
+} });
+const closeHtml = els['conv-container'].innerHTML;
+check('关单中的会话在列表里显示 ⏳ 与"关单中…"',
+    closeHtml.indexOf('⏳') !== -1 && closeHtml.indexOf('关单中…') !== -1, closeHtml.slice(0, 140));
 
 console.log('\n[14] 需要人工介入（V7.4：表格没答案 -> 横幅 + 专属提示音 + 置顶）');
 check('有"需要人工"横幅与"知道了"按钮',

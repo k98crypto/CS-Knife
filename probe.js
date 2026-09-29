@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V7.4 免框选与动作回执版)
+// @name         智能工单探针 (V7.5 发送与挂起加固版)
 // @namespace    http://tampermonkey.net/
-// @version      7.4
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选
+// @version      7.5
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "7.4";
+    const PROBE_VERSION = "7.5";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -399,18 +399,52 @@
     // 手机端点挂起/关单/发送后，探针把"到底点到没有、页面按钮叫什么"回传，
     // 由中继转成手机上的提示，避免"没反应"变成无从排查。
     function reportActionResult(command, ok, detail) {
-        sendToBrain({ event: "ACTION_RESULT", data: { command: command, ok: !!ok, detail: detail || "" } });
+        sendToBrain({ event: "ACTION_RESULT", data: { command: command, ok: !!ok, detail: detail || "",
+                                                     groupID: lastCmdGroupID || "" } });
         console.log((ok ? "✅ [探针] " : "❌ [探针] ") + command + " -> " + (detail || (ok ? "成功" : "失败")));
     }
 
     // ==================== DOM 操作器 ====================
+    // ---- V7.5：按钮识别的公共小工具（图标按钮 / aria / title / class 都要认） ----
+    let lastCmdGroupID = "";                 // 最近一次"带工单号"的下行指令，动作回执要带回去
+
+    function elTextsOf(el) {                 // 元素的所有"可读标签"
+        const out = [];
+        const push = v => { const t = normText(v || ""); if (t) out.push(t); };
+        try { push(el.innerText); push(el.textContent); } catch (e) {}
+        ['aria-label', 'title', 'data-title', 'alt', 'placeholder', 'name'].forEach(a => {
+            try { push(el.getAttribute && el.getAttribute(a)); } catch (e) {}
+        });
+        return out;
+    }
+    function elClassOf(el) {                 // 类名（图标按钮常常只有类名线索，如 el-icon-send）
+        let s = "";
+        try {
+            s = (typeof el.className === 'string' ? el.className : "")
+                || (el.getAttribute && el.getAttribute('class')) || "";
+        } catch (e) {}
+        return String(s).toLowerCase();
+    }
+    function fireClick(el) {                 // 只触发"一次"点击：部分框架不认 .click()，补一组鼠标事件
+        ['pointerdown', 'mousedown', 'mouseup'].forEach(t => {
+            try { if (typeof Event === 'function') el.dispatchEvent(new Event(t, { bubbles: true })); } catch (e) {}
+        });
+        try { if (typeof el.click === 'function') { el.click(); return true; } } catch (e) {}
+        try { if (typeof Event === 'function') { el.dispatchEvent(new Event('click', { bubbles: true })); return true; } } catch (e) {}
+        return false;
+    }
+
     const Operator = {
-        fillReplyBox: function(text) {
+        composerInput: function() {          // 回复输入框（textarea / input / contenteditable）
             const composer = document.querySelector('.editor-composer');
-            if (!composer) return false;
-            const inputBox = composer.querySelector('textarea')
-                || composer.querySelector('input')
-                || (composer.getAttribute('contenteditable') ? composer : null);
+            if (!composer) return null;
+            let el = null;
+            try { el = composer.querySelector('textarea') || composer.querySelector('input'); } catch (e) {}
+            if (!el && composer.getAttribute && composer.getAttribute('contenteditable')) el = composer;
+            return el;
+        },
+        fillReplyBox: function(text) {
+            const inputBox = Operator.composerInput();
             if (!inputBox) return false;
             if (inputBox.tagName === 'TEXTAREA' || inputBox.tagName === 'INPUT') {
                 inputBox.value = text;
@@ -523,39 +557,166 @@
         },
         // 列出当前页面上的操作按钮（排障用：手机点"挂起"没反应时，一眼看出页面按钮叫什么）
         listActionButtons: function() {
-            return Array.from(document.querySelectorAll('.im-action-btn, button, .el-button, [role="button"]'))
+            const out = [];
+            Array.from(document.querySelectorAll('.im-action-btn, button, .el-button, [role="button"]'))
                 .filter(isVisibleEl)
-                .map(el => normText(el.innerText || el.textContent || ""))
-                .filter(t => t && t.length <= 8)
-                .filter((t, i, arr) => arr.indexOf(t) === i)
-                .slice(0, 30);
+                .forEach(el => {
+                    elTextsOf(el).forEach(t => { if (t.length <= 12 && out.indexOf(t) === -1) out.push(t); });
+                });
+            return out.slice(0, 30);
         },
-        // 点击页面上的操作按钮：关键字匹配（完全相等优先、其次包含），
-        // 优先点真正的按钮类元素，其次才退到 span/div；只点短标签，避免误点整块容器。
-        // 返回 true/false —— 找不到就如实回报，绝不静默。
-        safeClickActionBtn: function(keywords) {
-            const kws = (Array.isArray(keywords) ? keywords : [keywords]).map(normText).filter(Boolean);
-            if (!kws.length) return false;
+        // 收集候选元素（按钮类优先，其次 span/div/a/i/svg）
+        _candidates: function() {
             const collect = sel => Array.from(document.querySelectorAll(sel))
                 .filter(isVisibleEl)
-                .map(el => ({ el: el, text: normText(el.innerText || el.textContent || "") }))
-                .filter(o => o.text && o.text.length <= 8);
-            const groups = [
-                collect('.im-action-btn, button, .el-button, [role="button"]'),
-                collect('span, div, a')
-            ];
+                .map(el => ({ el: el, texts: elTextsOf(el), cls: elClassOf(el) }));
+            return [collect('.im-action-btn, button, .el-button, [role="button"]'),
+                    collect('span, div, a, i, svg')];
+        },
+        // 点击页面上的操作按钮（V7.5 强化）：
+        //   ① 文本完全相等 ② 文本包含（限短标签） ③ 图标类名命中（el-icon-send 之类）
+        // 返回 true/false；找不到时调用方负责如实回报（绝不静默）。
+        safeClickActionBtn: function(keywords, opts) {
+            const kws = (Array.isArray(keywords) ? keywords : [keywords]).map(normText).filter(Boolean);
+            if (!kws.length) return false;
+            const iconHints = ((opts && opts.iconHints) || []).map(s => String(s).toLowerCase());
+            const groups = Operator._candidates();
             for (let g = 0; g < groups.length; g++) {
                 const list = groups[g];
                 if (!list.length) continue;
                 for (let k = 0; k < kws.length; k++) {
-                    for (let i = list.length - 1; i >= 0; i--) {      // 从后往前：更可能是叶子节点
-                        if (list[i].text === kws[k]) { list[i].el.click(); return true; }
+                    const kw = kws[k];
+                    for (let i = list.length - 1; i >= 0; i--) {          // 从后往前：更可能是叶子节点
+                        if (list[i].texts.some(t => t === kw)) { fireClick(list[i].el); return true; }
                     }
                     for (let i = list.length - 1; i >= 0; i--) {
-                        if (list[i].text.indexOf(kws[k]) !== -1) { list[i].el.click(); return true; }
+                        if (list[i].texts.some(t => t.length <= 12 && t.indexOf(kw) !== -1)) {
+                            fireClick(list[i].el); return true;
+                        }
+                    }
+                }
+                if (iconHints.length) {
+                    for (let i = list.length - 1; i >= 0; i--) {
+                        if (iconHints.some(h => list[i].cls.indexOf(h) !== -1)) { fireClick(list[i].el); return true; }
                     }
                 }
             }
+            return false;
+        },
+        // 点开「更多 / ⋯」菜单（有些工作台把挂起/恢复收在二级菜单里）
+        openMoreMenu: function() {
+            return Operator.safeClickActionBtn(['更多', '更多操作', '操作', '⋯', '...', '···'],
+                { iconHints: ['more', 'ellipsis'] });
+        },
+        // 找"发送"按钮：先在回复框所在容器里按文字/aria/图标找，再退回整页的精确文字
+        clickSendButton: function() {
+            const strict = ['发送', '发送消息', 'send'];
+            const loose = ['发送', '发送消息', '回复', '提交', 'send'];
+            const iconHints = ['send', 'submit', 'send-btn', 'icon-send', 'sendbtn'];
+            const scopes = [];
+            try {
+                const c = document.querySelector('.editor-composer');
+                if (c) { scopes.push(c); if (c.parentElement) scopes.push(c.parentElement); }
+            } catch (e) {}
+            for (let s = 0; s < scopes.length; s++) {
+                const list = Array.from(scopes[s].querySelectorAll('button, [role="button"], .el-button, a, i, svg, span, div'))
+                    .filter(isVisibleEl)
+                    .map(el => ({ el: el, texts: elTextsOf(el), cls: elClassOf(el) }));
+                for (let k = 0; k < loose.length; k++) {
+                    for (let i = list.length - 1; i >= 0; i--) {          // 从右往左：发送键通常在右侧
+                        if (list[i].texts.some(t => t === loose[k] || (t.length <= 8 && t.indexOf(loose[k]) !== -1))) {
+                            fireClick(list[i].el); return true;
+                        }
+                    }
+                }
+                for (let i = list.length - 1; i >= 0; i--) {
+                    if (iconHints.some(h => list[i].cls.indexOf(h) !== -1)) { fireClick(list[i].el); return true; }
+                }
+            }
+            // 整页兜底：只认"精确的发送字样"，避免误点"回复并关单"之类的操作按钮
+            for (let k = 0; k < strict.length; k++) {
+                for (let g = 0; g < 2; g++) {
+                    const list = Operator._candidates()[g];
+                    for (let i = list.length - 1; i >= 0; i--) {
+                        if (list[i].texts.some(t => t === strict[k])) { fireClick(list[i].el); return true; }
+                    }
+                }
+            }
+            return false;
+        },
+        // 在回复框里敲回车（很多 IM 就是"回车发送"）
+        pressEnterInComposer: function() {
+            const el = Operator.composerInput();
+            if (!el) return false;
+            const mk = type => {
+                let ev = null;
+                try {
+                    if (typeof KeyboardEvent === 'function') {
+                        ev = new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                                                       bubbles: true, cancelable: true });
+                    }
+                } catch (e) {}
+                if (!ev) { try { ev = new Event(type, { bubbles: true, cancelable: true }); } catch (e) {} }
+                if (ev) { try { ev.key = 'Enter'; ev.keyCode = 13; ev.which = 13; } catch (e) {} }
+                return ev;
+            };
+            let fired = false;
+            ['keydown', 'keypress', 'keyup'].forEach(t => {
+                const ev = mk(t);
+                if (!ev) return;
+                try { el.dispatchEvent(ev); fired = true; } catch (e) {}
+            });
+            return fired;
+        },
+        // 回复框是否已清空（发送成功的强信号）；找不到回复框返回 null（未知，不当成成功）
+        isComposerEmpty: function() {
+            const el = Operator.composerInput();
+            if (!el) return null;
+            let v = "";
+            try { v = (el.value !== undefined && el.value !== null) ? el.value : (el.innerText || ""); } catch (e) {}
+            return normText(String(v)).length === 0;
+        },
+        // 填完内容后的"发送闭环"：点发送按钮 -> 没找到就回车 -> 再复验输入框是否清空
+        sendFilledReply: function() {
+            setTimeout(() => {
+                const clicked = Operator.clickSendButton();
+                if (!clicked) Operator.pressEnterInComposer();
+                setTimeout(() => {
+                    const empty = Operator.isComposerEmpty();
+                    if (clicked || empty === true) {
+                        reportActionResult("SEND_REPLY", true,
+                            (clicked ? "已点击发送按钮" : "已用回车发送") + (empty === true ? "，输入框已清空" : ""));
+                    } else {
+                        reportActionResult("SEND_REPLY", false,
+                            "已填入内容，但没找到发送按钮、回车也没生效 —— 请在电脑上手动点发送/按回车");
+                    }
+                }, 500);
+            }, 500);
+        },
+        // 行内按钮点击 + 自动重试（按钮可能是懒渲染，或收在「更多」菜单里）
+        clickActionWithRetry: function(keywords, command, okText, opts) {
+            if (Operator.safeClickActionBtn(keywords, opts)) {
+                reportActionResult(command, true, okText || "已点击");
+                return true;
+            }
+            reportActionResult(command, false,
+                "首次尝试未找到「" + keywords[0] + "」（可能还没渲染或在「更多」里），已自动重试… 当前按钮："
+                + Operator.listActionButtons().join("/"));
+            let left = 5;
+            const tick = () => {
+                if (Operator.safeClickActionBtn(keywords, opts)
+                    || (Operator.openMoreMenu() && Operator.safeClickActionBtn(keywords, opts))) {
+                    reportActionResult(command, true, (okText || "已点击") + "（第 " + (6 - left) + " 次尝试成功）");
+                    return;
+                }
+                if (--left <= 0) {
+                    reportActionResult(command, false,
+                        "重试 5 次仍未找到「" + keywords[0] + "」；页面按钮：" + Operator.listActionButtons().join("/"));
+                    return;
+                }
+                setTimeout(tick, 400);
+            };
+            setTimeout(tick, 400);
             return false;
         },
         switchIMStatus: function(targetStatus) {
@@ -715,6 +876,7 @@
                 return;
             }
             if (!cmd || !cmd.command) return;
+            if (cmd.groupID) lastCmdGroupID = cmd.groupID;   // 动作回执要带工单号（中继据此定位会话）
 
             // 警报确认回执
             if (cmd.command === "ALARM_CONFIRMED") {
@@ -736,15 +898,15 @@
                     Operator.selectCategory(path[0], path[1], cmd.category, cmd.defaultCategory);
                     // 留足级联下钻时间，避免分类还没选完就点了"回复并关单"
                     setTimeout(() => {
-                        const ok = Operator.safeClickActionBtn(['回复并关单', '回复并关闭', '回复关闭', '关单']);
-                        reportActionResult("ACTION_REPLY_CLOSE", ok,
-                            ok ? "已点击「回复并关单」" : ("未找到「回复并关单」按钮，页面按钮：" + Operator.listActionButtons().join("/")));
+                        Operator.clickActionWithRetry(['回复并关单', '回复并关闭', '回复关闭', '回复并结束', '关单'],
+                            "ACTION_REPLY_CLOSE", "已点击「回复并关单」",
+                            { iconHints: ['close-ticket', 'reply-close'] });
                     }, 2200);
                 } else {
                     setTimeout(() => {
-                        const ok = Operator.safeClickActionBtn(['回复并关单', '回复并关闭', '回复关闭', '关单']);
-                        reportActionResult("ACTION_REPLY_CLOSE", ok,
-                            ok ? "已点击「回复并关单」" : ("未找到关单按钮，页面按钮：" + Operator.listActionButtons().join("/")));
+                        Operator.clickActionWithRetry(['回复并关单', '回复并关闭', '回复关闭', '回复并结束', '关单'],
+                            "ACTION_REPLY_CLOSE", "已点击「回复并关单」",
+                            { iconHints: ['close-ticket', 'reply-close'] });
                     }, 800);
                 }
             }
@@ -759,14 +921,16 @@
                 });
             }
             else if (cmd.command === "ACTION_HANGUP") {
-                const ok = Operator.safeClickActionBtn(['挂起', '暂挂', '挂起工单', '暂停会话', '暂停']);
-                reportActionResult("ACTION_HANGUP", ok,
-                    ok ? "已点击「挂起」" : ("未找到「挂起」按钮，页面上的按钮：" + Operator.listActionButtons().join("/")));
+                Operator.clickActionWithRetry(
+                    ['挂起', '挂起工单', '暂挂', '暂停会话', '暂停服务', '暂停', '搁置', '休眠'],
+                    "ACTION_HANGUP", "已点击「挂起」",
+                    { iconHints: ['hangup', 'hang-up', 'suspend', 'pause'] });
             }
             else if (cmd.command === "ACTION_RESUME") {
-                const ok = Operator.safeClickActionBtn(['恢复', '恢复会话', '继续', '重新接入', '接单', '接入']);
-                reportActionResult("ACTION_RESUME", ok,
-                    ok ? "已点击「恢复」" : ("未找到「恢复」按钮，页面上的按钮：" + Operator.listActionButtons().join("/")));
+                Operator.clickActionWithRetry(
+                    ['恢复', '恢复会话', '重新接入', '重新接待', '继续会话', '继续', '接单', '接入', '激活'],
+                    "ACTION_RESUME", "已点击「恢复」",
+                    { iconHints: ['resume', 'reopen', 'restore', 'activate'] });
             }
             else if (cmd.command === "LIST_ACTIONS") {
                 // 排障：把页面上的按钮清单回报给手机/中继
@@ -779,11 +943,8 @@
                 if (!filled) {
                     reportActionResult("SEND_REPLY", false, "未找到回复输入框(.editor-composer)，消息没发出去");
                 } else {
-                    setTimeout(() => {
-                        const ok = Operator.safeClickActionBtn(['发送', '回复', '发送消息']);
-                        reportActionResult("SEND_REPLY", ok,
-                            ok ? "已填入并点击发送" : "已填入，但没找到「发送」按钮，请手动按回车");
-                    }, 500);
+                    // V7.5：发送闭环（点发送按钮 -> 没找到就回车 -> 复验输入框是否清空）
+                    Operator.sendFilledReply();
                 }
             }
             else if (cmd.command === "CHANGE_STATUS") {
