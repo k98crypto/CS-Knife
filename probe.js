@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V7.7 实机靶点校准版)
+// @name         智能工单探针 (V7.8 实机靶点校准 + 指令自检版)
 // @namespace    http://tampermonkey.net/
-// @version      7.7
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报
+// @version      7.8
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "7.7";
+    const PROBE_VERSION = "7.8";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -834,14 +834,38 @@
             setTimeout(tick, 400);
             return false;
         },
-        // 收集"可见的状态菜单项"（Element 下拉/级联/原生 li 都认；菜单常是懒渲染）
-        statusMenuItems: function() {
-            const sel = '.el-dropdown-menu__item, .el-select-dropdown__item, [role="menuitem"], li';
-            let nodes = [];
-            try { nodes = Array.from(document.querySelectorAll(sel)); } catch (e) { nodes = []; }
+        // ★ V7.8：页面上所有"文本恰好是 在线/忙碌/离线"的可见元素
+        //   用途：点开下拉前后做**差集** —— 新出现的那些就是菜单项。
+        //   这样即使工作台换了类名也能点到正确选项（仍然只认"文本严格等于状态"的可见节点，
+        //   不是猜类名，红线②依然守得住）。
+        visibleStatusNodes: function() {
             const out = [];
-            for (let i = 0; i < nodes.length; i++) {
-                const el = nodes[i];
+            try {
+                Array.from(document.querySelectorAll('div, span, button, li, a, p')).forEach(el => {
+                    const t = statusTextOf(el) || normStatus(el.innerText);
+                    if (!t || !isVisibleEl(el)) return;
+                    const txt = normText(el.innerText);
+                    if (!txt || txt.length > 12) return;              // 只认短标签（大容器排除）
+                    out.push({ el: el, text: txt, cls: elClassOf(el), tag: el.tagName });
+                });
+            } catch (e) {}
+            return out;
+        },
+        // 收集"可见的状态菜单项"：① 已知实机靶点（Element 下拉/级联/原生 li）
+        //   ② V7.8 兜底：点开下拉后"新出现"的状态文本节点（exclude = 点开前已有的元素）
+        statusMenuItems: function(exclude) {
+            const sel = '.el-dropdown-menu__item, .el-select-dropdown__item, [role="menuitem"], li';
+            const raw = [];
+            try { Array.from(document.querySelectorAll(sel)).forEach(el => raw.push(el)); } catch (e) {}
+            const ex = exclude || [];
+            try {
+                Operator.visibleStatusNodes().forEach(o => {
+                    if (ex.indexOf(o.el) === -1 && raw.indexOf(o.el) === -1) raw.push(o.el);
+                });
+            } catch (e) {}
+            const out = [];
+            for (let i = 0; i < raw.length; i++) {
+                const el = raw[i];
                 if (!isVisibleEl(el)) continue;                  // 隐藏项绝不算（V7.3 的教训）
                 const t = normText(el.innerText);
                 if (!t || t.length > 12) continue;               // 只认短标签，避免误点容器
@@ -851,10 +875,10 @@
             return out;
         },
         // 轮询等下拉渲染出来（★ V7.7：Element 下拉有过渡/懒渲染，旧版固定 200ms 经常空手）
-        waitForMenu: function(done, deadlineMs, pollMs) {
+        waitForMenu: function(done, deadlineMs, pollMs, exclude) {
             const t0 = Date.now();
             const step = () => {
-                const items = Operator.statusMenuItems();
+                const items = Operator.statusMenuItems(exclude);
                 if (items.length || (Date.now() - t0) >= deadlineMs) { done(items); return; }
                 setTimeout(step, pollMs);
             };
@@ -878,6 +902,7 @@
                         "未找到「可见」的 IM 状态显示区（页面结构可能变了），状态没切");
                     return;
                 }
+                const beforeNodes = Operator.visibleStatusNodes().map(o => o.el);   // ★ V7.8：点开前已有的元素（差集用）
                 fireClick(statusTrigger);
 
                 Operator.waitForMenu(function(items) {
@@ -891,6 +916,7 @@
                             "点了 " + attempt + " 次都没找到可见的状态选项「" + targetStatus + "」；页面候选："
                             + (cand.join("/") || "（下拉里没有任何可见选项）")
                             + "；完整清单见页面控制台 __probe.dumpStatus()");
+                        Operator.dumpStatusMenu();      // ★ V7.7：失败自动回报"真实可见选项"，让中继能据此校准
                         return;
                     }
                     fireClick(target.el);
@@ -908,23 +934,43 @@
                         }
                         setTimeout(doAttempt, 400);              // 回读不一致 -> 换个时机再试
                     }, 400);
-                }, 1800, 150);
+                }, 1800, 150, beforeNodes);
             };
             doAttempt();
         },
-        // 排障：把状态下拉"全部可见选项"原样回报（tag/class/文本），用于实机校准，绝不靠猜标签
+        // 排障/实机校准：把"状态显示区 + 下拉全部可见选项"原样回报（tag/class/文本），绝不靠猜标签
         dumpStatusMenu: function() {
             const trigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
                 const t = statusTextOf(el);
                 return !!t && !isMenuOption(el) && isVisibleEl(el);
             });
+            // ① 页面上"文字像状态"的全部可见节点（有它说明状态区在，且能看出真实写法与类名）
+            const nodes = [];
+            try {
+                Array.from(document.querySelectorAll('div, span, button')).forEach(el => {
+                    if (nodes.length >= 12) return;
+                    const t = normStatus(el.innerText);
+                    if (!t || !isVisibleEl(el)) return;
+                    nodes.push({ tag: el.tagName, cls: elClassOf(el).slice(0, 60), text: t,
+                                 isMenu: isMenuOption(el) });
+                });
+            } catch (e) {}
+            const triggerInfo = trigger
+                ? { clicked: true, tag: trigger.tagName, cls: elClassOf(trigger).slice(0, 60),
+                    text: normText(trigger.innerText) }
+                : { clicked: false };
+            const beforeNodes = Operator.visibleStatusNodes().map(o => o.el);   // ★ V7.8：点开前已有的（差集用）
+            const beforeInfo = Operator.visibleStatusNodes().map(o => o.tag + ':' + o.cls);
             if (trigger) fireClick(trigger);
             Operator.waitForMenu(function(items) {
                 const rows = items.map(o => ({ tag: o.tag, cls: o.cls, text: o.text }));
-                sendToBrain({ event: "STATUS_MENU_DUMP", data: { current: findIMStatusText(), items: rows } });
-                console.log("🧭 [探针] 状态下拉可见选项：", rows);
+                sendToBrain({ event: "STATUS_MENU_DUMP", data: { current: findIMStatusText(), items: rows,
+                                                                 trigger: triggerInfo, visible_status_nodes: nodes,
+                                                                 before_open_nodes: beforeInfo } });
+                console.log("🧭 [探针] 状态显示区 / 下拉可见选项：",
+                            { trigger: triggerInfo, beforeOpen: beforeInfo, visible: nodes, menuItems: rows });
                 try { if (trigger) fireClick(trigger); } catch (e) {}    // 收起下拉
-            }, 1500, 150);
+            }, 1500, 150, beforeNodes);
         }
     };
 
@@ -1062,7 +1108,8 @@
         };
 
         ws.onmessage = (event) => {
-            let cmd;
+          try {                                    // ★ V7.7：整段兜底（红线：探针监听必须静默保护，
+            let cmd;                               //   同时把错误回报给中继，别再"点了没反应还查不到原因"）
             try {
                 cmd = JSON.parse(event.data);
             } catch (err) {
@@ -1164,6 +1211,35 @@
                 // 排障（★ V7.7）：把状态下拉的可见选项清单回报给中继/手机，用于实机校准匹配
                 Operator.dumpStatusMenu();
             }
+            else if (cmd.command === "PING") {
+                // ★ V7.8 自报家门（只读诊断）：同时证明两件事 ——
+                //   ① "中继发的指令我收到了"；② "浏览器里跑的到底是哪一版代码"（typeof 逐个查）。
+                let composerInfo = "n/a";
+                try {
+                    const ce = Operator.composerInput();
+                    composerInfo = ce ? (String(ce.tagName || "") + "." + String(ce.className || "").slice(0, 40))
+                                      : "none";
+                } catch (err) { composerInfo = "err:" + ((err && err.message) || err); }
+                sendToBrain({ event: "PONG", data: {
+                    version: PROBE_VERSION,
+                    hasDump: typeof Operator.dumpStatusMenu === "function",
+                    hasWaitForMenu: typeof Operator.waitForMenu === "function",
+                    hasEditorFn: typeof Operator.editorFailureReason === "function",
+                    hasReplyBtnTarget: String(Operator.clickSendButton).indexOf("reply-btn") !== -1,
+                    composer: composerInfo,
+                    imStatus: findIMStatusText(),
+                    manualByUser: manualByUser,
+                    manualViaRelay: manualViaRelay,
+                    editorReadonly: (function () {
+                        try { const ro = document.querySelector('.editor-readonly'); return !!(ro && isVisibleEl(ro)); }
+                        catch (e) { return null; }
+                    })(),
+                    wsState: ws ? ws.readyState : -1,
+                    nodes: (function () { try { return document.querySelectorAll('div, span, button').length; } catch (e) { return -1; } })(),
+                    url: (function () { try { return location.href; } catch (e) { return ""; } })()
+                } });
+                console.log("🏓 [探针] PONG：已向中继自报家门");
+            }
             else if (cmd.command === "POLICY") {
                 if (cmd.keepManualOffline !== undefined) PROBE_CONFIG.keepManualOffline = !!cmd.keepManualOffline;
                 console.log("⚙️ [探针] 策略同步：手动离线守护 = " + (PROBE_CONFIG.keepManualOffline ? "开启" : "关闭"));
@@ -1171,6 +1247,13 @@
             else if (cmd.command === "SILENCE_ALARM") {
                 stopSiren();
             }
+          } catch (err) {
+            try {
+                sendToBrain({ event: "PROBE_ERROR", data: { where: "onmessage:" + ((cmd && cmd.command) || "?"),
+                                                            error: String((err && err.message) || err) } });
+            } catch (e2) {}
+            console.warn("⚠️ [探针] 处理指令出错：", err);
+          }
         };
     }
 

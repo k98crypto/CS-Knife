@@ -81,6 +81,15 @@ state = {
     "im_status_tries": 0,           # 已把"人工意图"重新下发给探针几次
     "im_status_conflict": "",       # "意图:网页" 不一致组合（内部去重用）
     "im_status_notified": "",       # 已经提示过手机的冲突组合（避免刷屏）
+    # ★ V7.7：把"上次状态切换的请求/回执"和"网页下拉的实测选项"留在内存里 —— 中继跑在隐藏窗口时
+    #   日志看不见，这些能在 /diag 与 /api/diag 里直接查（"改了没生效"必须有据可依）
+    "im_last_request": {},          # {status, ts, source}
+    "last_action": {},              # {command, action, ok, detail, ts}
+    "status_menu_dump": {},         # {current, items:[{tag,cls,text}], ts}
+    "ext_cmd_debug": {},            # 最近一次"下发给探针"的命令：{cmd, conns, sent, ts}
+    "event_counts": {},             # 各类探针事件累计次数（V7.7 排障）
+    "probe_pong": {},               # 探针最近一次 PONG 自报（V7.8 诊断：/api/probe_ping）
+    "im_via_relay": {"count": 0, "last_ts": 0},   # 探针"确认收到指令"的次数（V7.8 硬证据）
     "extension_online": False,      # 电脑端探针是否在线（决定手机端能否远程操作）
     "probe_version": "",            # 探针（油猴脚本）版本号，来自 PROBE_HELLO/PROBE_HEARTBEAT
     "probe_last_seen": 0,           # 探针最近一次心跳时间戳（秒），手机端可据此判断新鲜度
@@ -196,6 +205,8 @@ async def _reassert_im_status(target_code):
     """重试把人工意图切上去；连续多次仍不生效 -> 如实告诉手机（绝不假装成功）。"""
     tries = int(state.get("im_status_tries") or 0) + 1
     state["im_status_tries"] = tries
+    state["im_last_request"] = {"status": int(target_code), "status_text": _im_txt(target_code),
+                                "source": f"自动重试 #{tries}", "ts": int(time.time())}
     for ext in list(active_clients["extension"]):
         await safe_send(ext, {"command": "CHANGE_STATUS", "status": int(target_code)})
     want = _im_txt(target_code)
@@ -488,6 +499,7 @@ _IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，�
 _LAST_ACTIVE = {"gid": None}
 # ★ 分类候选的"按需等待者"（ensure_category_options 用）
 _CATEGORY_WAITERS = []
+_PONG_WAITERS = []                   # ★ V7.8：/api/probe_ping 等探针 PONG 的地方（诊断用）
 # ★ 玩家新消息"已提示到手机"的水位线：gid -> 最新已提示的玩家消息 ts
 #   用途：只对**新增**的玩家消息提示一次（避免 FULL_SYNC 反复刷新时重复响铃）
 _LAST_NOTIFIED = {}
@@ -499,7 +511,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "7.7"
+SERVER_VER = "7.8"
 
 
 def _probe_refresh():
@@ -524,12 +536,15 @@ async def safe_send(client, payload):
     """向单个客户端发送；失败（对端已断开）时静默忽略并剔除该连接。
 
     避免一个失效连接抛异常打断整个广播循环，导致其他客户端收不到更新。
+    ★ V7.7：返回 True/False（"到底发出去了没有"要能查 —— 排查"点了没反应"时这是关键证据）。
     """
     try:
         await client.send_json(payload)
+        return True
     except Exception:
         for _group in active_clients.values():
             _group.discard(client)
+        return False
 
 
 # ==================== ★ 出站安全闸（所有"可能发给玩家"的文本的唯一出口） ====================
@@ -1779,7 +1794,10 @@ async def api_current_ticket(request):
     return web.json_response(conversations[gid])
 
 async def index_handler(request):
-    return web.Response(text=HTML_CONTENT, content_type="text/html")
+    # ★ V7.7：手机页面必须 no-store —— 否则 iOS 会把旧版 H5 缓存下来，
+    #   新加的按钮/提示（如「以网页为准」「网页仍在线」）在手机上根本看不到。
+    return web.Response(text=HTML_CONTENT, content_type="text/html",
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 async def api_categories(request):
@@ -1902,6 +1920,35 @@ async def api_im_reset(request):
                               "note": "已重置为跟随网页真实现状（手动锁已清除）"})
 
 
+async def api_probe_ping(request):
+    """🏓 诊断：给电脑端探针发一条 PING，等它"自报家门"后原样返回（只读，不改任何状态）。
+
+    能一次性回答两个问题：
+      ① 中继发的指令**到底有没有到探针**（3 秒内没有 PONG = 探针没处理指令）；
+      ② 浏览器里跑的**到底是哪一版代码**（逐个 typeof 检查 v7.7/v7.8 的新函数）。
+    用法：浏览器打开 http://127.0.0.1:8765/api/probe_ping
+    """
+    conns = list(active_clients["extension"])
+    if not conns:
+        return web.json_response({"ok": False, "error": "电脑端探针未连接（工作台页面没开/脚本没跑）"}, status=503)
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _PONG_WAITERS.append(fut)
+    sent = 0
+    for ext in conns:
+        if await safe_send(ext, {"command": "PING"}):
+            sent += 1
+    state["ext_cmd_debug"] = {"cmd": "PING", "conns": len(conns), "sent": sent, "ts": int(time.time())}
+    try:
+        data = await asyncio.wait_for(fut, timeout=3.0)
+    except asyncio.TimeoutError:
+        return web.json_response({"ok": False, "conns": len(conns), "sent": sent,
+                                  "error": "探针 3 秒内没回 PONG：说明它没处理这条指令 —— "
+                                           "请确认工作台页面里是**最新脚本**（左下角胶囊显示 v7.8），"
+                                           "或看页面 Console 有没有报错"})
+    return web.json_response({"ok": True, "conns": len(conns), "sent": sent, "pong": data})
+
+
 async def api_diag(request):
     # 顺手刷新一次三个开关（配置文件被改过也能反映出来）
     state["features"] = feature_flags()
@@ -1924,6 +1971,12 @@ async def api_diag(request):
             "online": bool(active_clients["extension"]),
             "version": _PROBE_META.get("version") or "",
             "version_reported": bool(_PROBE_META.get("version")),
+            # ★ V7.7："探针连接数" —— 排查"指令发不出去 / 发了没反应"的第一现场
+            "connections": len(active_clients["extension"]),
+            # ★ V7.7：各类探针事件的累计次数（判断"探针到底发没发"用）
+            "events": state.get("event_counts") or {},
+            # ★ V7.8：探针最近一次"自报家门"（GET /api/probe_ping 触发）
+            "pong": state.get("probe_pong") or {},
             "page": _PROBE_META.get("page") or "",
             "last_seen_sec": (int(now - last_seen) if last_seen else None),
             "hello_count": _PROBE_META.get("hello_count", 0),
@@ -1955,6 +2008,12 @@ async def api_diag(request):
             "conflict": bool(state.get("im_status_page")
                              and int(state.get("im_status_page")) != int(state.get("im_status") or 1)),
             "tries": int(state.get("im_status_tries") or 0),
+            "last_request": state.get("im_last_request") or {},
+            "last_action": state.get("last_action") or {},
+            "status_menu_dump": state.get("status_menu_dump") or {},
+            "ext_cmd_debug": state.get("ext_cmd_debug") or {},
+            # ★ V7.8：探针"确认收到指令"的次数（= 指令确实到达并被处理过的硬证据）
+            "via_relay_confirm": state.get("im_via_relay") or {"count": 0, "last_ts": 0},
             "reset_url": "/api/im_reset",
             "state_file": os.path.basename(IM_STATE_PATH),
             "hint": "known=false 表示本进程还没从电脑网页核实过状态（手机端会显示\"正在获取…\"，不会假装在线）；"
@@ -2099,6 +2158,12 @@ async def diag_page_handler(request):
                  row("连接状态", _diag_dot(probe_online and not probe_old, probe_line)) +
                  row("最近心跳", ("%d 秒前" % int(now - last_seen)) if last_seen else "无") +
                  row("当前页面", _PROBE_META.get("page") or "-") +
+                 row("探针连接数", len(active_clients["extension"])) +
+                 row("指令自检（🏓）", (lambda _p: (
+                     ("收到指令 ✅ · 自报 v%s · 连接 %s 个" % (_p.get("version") or "?", len(active_clients["extension"])))
+                     if _p else
+                     '<a href="/api/probe_ping">点这里测一发</a>（3 秒内回 PONG = 探针在正常收指令）'
+                 ))(state.get("probe_pong") or {})) +
                  row("脚本版本", "%s（期望 v%s）" % (("v" + probe_v) if probe_v else "未上报", SERVER_VER)) +
                  '</div>')
 
@@ -2136,6 +2201,34 @@ async def diag_page_handler(request):
                  row("离线守护", "开启（网页自己跳回在线会被改回）"
                                 if config.get("keep_manual_offline", True) else "关闭") +
                  row("状态卡住时", '<a href="/api/im_reset">以网页为准重置</a>（清掉手动锁，跟随网页真实状态）') +
+                 row("上次切换请求", (("切到「%s」· %s · %s"
+                                      % (_im_txt((state.get("im_last_request") or {}).get("status")),
+                                         (state.get("im_last_request") or {}).get("source", ""),
+                                         time.strftime("%H:%M:%S",
+                                                       time.localtime((state.get("im_last_request") or {}).get("ts") or 0))))
+                                     if state.get("im_last_request") else "无")) +
+                 row("上次动作回执", (("✅ " if (state.get("last_action") or {}).get("ok") else "❌ ")
+                                      + str((state.get("last_action") or {}).get("action") or "") + " · "
+                                      + str((state.get("last_action") or {}).get("detail") or "")
+                                      + " · "
+                                      + time.strftime("%H:%M:%S",
+                                                      time.localtime((state.get("last_action") or {}).get("ts") or 0)))
+                                     if state.get("last_action") else "无") +
+                 row("网页下拉实测", (("当前 %s；可见选项：%s"
+                                       % ((state.get("status_menu_dump") or {}).get("current") or "-",
+                                          " / ".join([str(i.get("tag", "")) + ":" + str(i.get("text", ""))
+                                                      for i in ((state.get("status_menu_dump") or {}).get("items") or [])])
+                                          or "（一个都没读到）"))
+                                      if state.get("status_menu_dump") else
+                                      "还没读过（手机状态面板点「🧭 读一下网页的状态选项」）")) +
+                 row("探针连接数", len(active_clients["extension"])) +
+                 row("最近一次下发", (("%s · 连接 %s 个 · 成功 %s 个 · %s"
+                                      % ((state.get("ext_cmd_debug") or {}).get("cmd", "-"),
+                                         (state.get("ext_cmd_debug") or {}).get("conns", 0),
+                                         (state.get("ext_cmd_debug") or {}).get("sent", 0),
+                                         time.strftime("%H:%M:%S",
+                                                       time.localtime((state.get("ext_cmd_debug") or {}).get("ts") or 0))))
+                                     if state.get("ext_cmd_debug") else "无（还没下发过指令）")) +
                  '</div>')
 
     cards.append('<div class="card"><div class="k">工单与知识库</div>' +
@@ -2182,6 +2275,11 @@ async def ws_ext_handler(request):
                 if not isinstance(pkt, dict):
                     continue
                 ev = pkt.get("event")
+                # ★ V7.7：事件计数（/api/diag 可查）—— 判断"探针到底发没发这条事件"的硬证据
+                #   （排查"指令发了没反应"：到底是发给探针失败、探针没处理、还是中继丢了事件）
+                if ev:
+                    _cnt = state.setdefault("event_counts", {})
+                    _cnt[str(ev)] = int(_cnt.get(str(ev)) or 0) + 1
                 # 处理 HEADERS_SYNC 事件（探针注入认证头）
                 if ev == "HEADERS_SYNC":
                     headers_data = pkt.get("data", {})
@@ -2231,6 +2329,10 @@ async def ws_ext_handler(request):
                         "LIST_ACTIONS": "按钮清单",
                     }.get(cmd_name, cmd_name or "操作")
                     print(f"[动作] {'✅' if ok else '❌'} {label}：{detail}")
+                    # ★ V7.7：最近一次动作请求与结果留存（/diag 可查，便于定位"点了没反应"）
+                    state["last_action"] = {"command": cmd_name, "action": label, "ok": ok,
+                                            "detail": detail, "ts": int(time.time()),
+                                            "groupID": str(data.get("groupID") or "")}
                     msg = (f"{label}成功 · {detail}" if ok else f"{label}失败 · {detail}")
                     # ★ AI 关单：只有探针回报"真的点到关单按钮"才把会话从列表移除（否则保留，绝不误删）
                     if cmd_name == "ACTION_REPLY_CLOSE":
@@ -2273,6 +2375,13 @@ async def ws_ext_handler(request):
                     #   于是探针自己就把中继的手动锁绕过了（网页真实状态反过来盖掉客服的选择）。
                     manual = bool(data.get("manual", False))
                     via_relay = bool(data.get("via_relay", False))
+                    if via_relay:
+                        # ★ V7.8：收到"中继指令触发的上报" = 硬证据：探针确实处理了下行指令
+                        _vr = state.setdefault("im_via_relay", {"count": 0, "last_ts": 0})
+                        _vr["count"] = int(_vr.get("count") or 0) + 1
+                        _vr["last_ts"] = int(time.time())
+                        print(f"[状态] 📲 探针确认收到指令并回读：{_im_txt(st)}"
+                              f"（累计 {_vr['count']} 次）")
                     _want = int(state.get("im_status") or 1)
                     apply_im_status(st, manual=manual, source="探针上报", from_probe=True)
                     if data.get("guarded"):
@@ -2292,8 +2401,38 @@ async def ws_ext_handler(request):
                     msg = ("网页状态下拉选项：" + (" / ".join(lines) if lines else "（没读到可见选项）")
                            + f"（当前显示：{data.get('current') or '未知'}）")
                     print("[状态] 🧭 " + msg)
+                    state["status_menu_dump"] = {"current": data.get("current") or "",
+                                                 "items": [it for it in items if isinstance(it, dict)][:20],
+                                                 "trigger": data.get("trigger") or {},
+                                                 "visible_status_nodes": data.get("visible_status_nodes") or [],
+                                                 "ts": int(time.time())}
                     for m in list(active_clients["mobile"]):
                         await safe_send(m, {"type": "AI_STATUS", "status": "ok", "message": msg})
+                    continue
+
+                # ★ V7.7：探针处理指令出错（整段 onmessage 已加兜底）—— 让"点了没反应"不再无声无息
+                if ev == "PROBE_ERROR":
+                    data = pkt.get("data") or {}
+                    emsg = f"探针处理指令出错（{data.get('where') or '?'}）：{data.get('error') or ''}"
+                    print("[探针] ⚠️ " + emsg)
+                    state["last_action"] = {"command": "PROBE_ERROR", "action": "探针错误", "ok": False,
+                                            "detail": emsg, "ts": int(time.time())}
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": emsg})
+                    continue
+
+                # ★ V7.8：探针自报家门（PONG）—— 诊断"指令到底有没有到、浏览器里是哪版代码"
+                if ev == "PONG":
+                    data = pkt.get("data") or {}
+                    print("[探针] 🏓 PONG：" + json.dumps(data, ensure_ascii=False)[:400])
+                    state["probe_pong"] = dict(data)
+                    while _PONG_WAITERS:
+                        _fut = _PONG_WAITERS.pop()
+                        if not _fut.done():
+                            try:
+                                _fut.set_result(data)
+                            except Exception:
+                                pass
                     continue
 
                 if ev == "ABNORMAL_OFFLINE":
@@ -2616,10 +2755,23 @@ async def ws_mobile_handler(request):
                     # ★ 手动切到 离线/忙碌 -> 记 manual（网页若自己跳回在线，探针会按守护改回来；
                     #   中继侧 apply_im_status 也会拦住"自动上线"）
                     apply_im_status(st, manual=(st in (2, 3)), source="手机/小窗手动")
-                    for ext in list(active_clients["extension"]):
-                        await safe_send(ext, {"command": "CHANGE_STATUS", "status": st})
+                    state["im_last_request"] = {"status": st, "status_text": _im_txt(st),
+                                                "source": "手机/小窗手动", "ts": int(time.time())}
+                    _conns = list(active_clients["extension"])
+                    _sent = 0
+                    for ext in _conns:
+                        if await safe_send(ext, {"command": "CHANGE_STATUS", "status": st}):
+                            _sent += 1
                         if st == 1:
                             await safe_send(ext, {"command": "SILENCE_ALARM"})
+                    # ★ V7.7：把"下发给了几个探针连接、成功几个"记下来（/diag 可查）
+                    state["ext_cmd_debug"] = {"cmd": f"CHANGE_STATUS({st}/{_im_txt(st)})",
+                                              "conns": len(_conns), "sent": _sent,
+                                              "ts": int(time.time())}
+                    if _sent == 0:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                                             "message": "切换指令没能发到电脑网页（探针连接数 0）——"
+                                                        "请确认工作台页面开着、油猴脚本在跑"})
                     for m in list(active_clients["mobile"]):
                         await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     continue
@@ -2635,14 +2787,19 @@ async def ws_mobile_handler(request):
 
                 # 🧭 请探针把"状态下拉的可见选项"回报过来（实机校准用，只读诊断）
                 if act == "DUMP_STATUS":
-                    for ext in list(active_clients["extension"]):
-                        await safe_send(ext, {"command": "DUMP_STATUS_MENU"})
-                    if not active_clients["extension"]:
+                    _dconns = list(active_clients["extension"])
+                    _dsent = 0
+                    for ext in _dconns:
+                        if await safe_send(ext, {"command": "DUMP_STATUS_MENU"}):
+                            _dsent += 1
+                    state["ext_cmd_debug"] = {"cmd": "DUMP_STATUS_MENU", "conns": len(_dconns),
+                                              "sent": _dsent, "ts": int(time.time())}
+                    if not _dconns:
                         await safe_send(ws, {"type": "AI_STATUS", "status": "error",
                                              "message": "电脑端探针未连接，读不到状态下拉选项"})
                     else:
                         await safe_send(ws, {"type": "AI_STATUS", "status": "ok",
-                                             "message": "已请电脑网页回报状态下拉选项（马上返回）"})
+                                             "message": f"已请电脑网页回报状态下拉选项（探针连接 {_dsent}/{len(_dconns)}，马上返回）"})
                     continue
 
                 # AI 一键回复并关单（AI 选问题分类 + 生成结束语，关单后会话从列表消失）
@@ -2817,6 +2974,7 @@ app.router.add_post("/api/alerts/ack", api_alerts_ack)
 app.router.add_post("/api/mode", api_mode)
 app.router.add_get("/api/diag", api_diag)
 app.router.add_get("/api/im_reset", api_im_reset)
+app.router.add_get("/api/probe_ping", api_probe_ping)
 app.router.add_get("/ws/extension", ws_ext_handler)
 app.router.add_get("/ws/mobile", ws_mobile_handler)
 

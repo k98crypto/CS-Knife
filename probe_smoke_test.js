@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '7.7';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '7.8';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -546,6 +546,8 @@ function check(name, ok, extra) {
         && code.indexOf('}, 200);') === -1);
     check('失败时回报候选（带 tag/class/文本，便于实机校准）',
         code.indexOf("o.tag + ':' + o.text") !== -1 && code.indexOf('dumpStatusMenu') !== -1);
+    check('切换失败会自动回报"网页真实可见选项"（不用人工再跑一次）',
+        code.indexOf('Operator.dumpStatusMenu();') !== -1 && code.indexOf('visible_status_nodes') !== -1);
     check('切完立刻回读并回报（不再"显示成功其实没变"）',
         code.indexOf('点完立刻回读真实状态并回报') !== -1
         && code.indexOf('reportActionResult("CHANGE_STATUS"') !== -1);
@@ -595,7 +597,47 @@ function check(name, ok, extra) {
     check('失败原因里带上"重试次数/候选"便于定位',
         failRes.length > 0 && String(failRes[failRes.length - 1].data.detail).indexOf('页面候选') !== -1,
         failRes.length ? failRes[failRes.length - 1].data.detail : 'none');
+    check('下拉兜底：点开前后做差集（工作台换类名也能点到）',
+        code.indexOf('visibleStatusNodes: function()') !== -1
+        && code.indexOf('Operator.visibleStatusNodes().map(o => o.el)') !== -1
+        && code.indexOf('1800, 150, beforeNodes') !== -1);
+
+    // 8.9.0c：老靶点（el-dropdown-menu__item 等）一个都匹配不到时，靠"点开后新出现的状态文本"也能点到
+    const realQSA = documentStub.querySelectorAll;
+    const realClickListener = docListeners.click;
+    docListeners.click = null;                        // 避免"点状态"被当成人工点击而干扰
+    let diffNewNodes = [];
+    statusTriggerNodes = [makeEl('IM在线')];
+    statusTriggerNodes[0].click = function () { clickedLabels.push('IM在线'); diffNewNodes = [makeEl('忙碌')]; };
+    documentStub.querySelectorAll = sel => {
+        if (sel === '.el-dropdown-menu__item, .el-select-dropdown__item, [role="menuitem"], li') return [];
+        if (sel.indexOf('.el-dropdown-menu__item') === 0) return statusText ? [makeEl(statusText)] : [];
+        if (sel === 'div, span, button' || sel === 'div, span, button, li, a, p') {
+            return statusTriggerNodes.concat(diffNewNodes);
+        }
+        if (sel.indexOf('.im-action-btn') === 0) return actionButtons;
+        if (sel === '.chat-bubble-row') return bubbles;
+        return [];
+    };
+    clickedLabels = [];
+    sent.length = 0;
+    statusText = 'IM在线';
+    wsStat.onmessage({ data: JSON.stringify({ command: 'CHANGE_STATUS', status: 2 }) });
+    await new Promise(r => setTimeout(r, 5));
+    flushMs([0]);
+    await new Promise(r => setTimeout(r, 5));
+    check('老靶点全失效 -> 仍能点到"差集"里新出现的「忙碌」',
+        clickedLabels.indexOf('忙碌') !== -1, JSON.stringify(clickedLabels));
+    statusText = 'IM忙碌';
+    flushMs([400]);
+    await new Promise(r => setTimeout(r, 5));
+    check('切完回读一致 -> 回报成功（不再假失败）',
+        sent.some(s => s.event === 'ACTION_RESULT' && s.data.command === 'CHANGE_STATUS' && s.data.ok === true),
+        JSON.stringify(sent.filter(s => s.event === 'ACTION_RESULT').slice(-1)));
+    documentStub.querySelectorAll = realQSA;
+    docListeners.click = realClickListener;
     statusTriggerNodes = [];
+    diffNewNodes = [];
     statusText = 'IM在线';
 
     console.log('\n[8.9.1] V7.5 挂起/恢复自动重试（按钮懒渲染 or 收在「更多」里）');
@@ -698,6 +740,27 @@ function check(name, ok, extra) {
         && code.indexOf('请先在左侧会话列表接入') !== -1);
     check('新增 __probe.editor() / __probe.dumpStatus() 排障入口',
         code.indexOf('editor: function ()') !== -1 && code.indexOf('dumpStatus: function ()') !== -1);
+
+    console.log('\n[8.9.5] V7.8 指令自检（PING/PONG 自报家门 + 指令出错不再静默）');
+    check('探针能回 PING（证明"指令收到没"）',
+        code.indexOf('cmd.command === "PING"') !== -1 && code.indexOf('event: "PONG"') !== -1);
+    check('PONG 会自报"代码里到底有没有这些函数"（typeof 逐个查）',
+        code.indexOf('hasDump: typeof Operator.dumpStatusMenu') !== -1
+        && code.indexOf('hasReplyBtnTarget: String(Operator.clickSendButton).indexOf("reply-btn")') !== -1
+        && code.indexOf('editorReadonly:') !== -1);
+    check('onmessage 整段 try/catch，出错回报 PROBE_ERROR（不再"点了没反应还查不到"）',
+        code.indexOf('event: "PROBE_ERROR"') !== -1 && code.indexOf('处理指令出错') !== -1);
+
+    // 行为：收到 PING 必须回一条 PONG，且带上版本与函数存在性
+    sent.length = 0;
+    wsAct.onmessage({ data: JSON.stringify({ command: 'PING' }) });
+    const pongs = sent.filter(s => s.event === 'PONG');
+    check('收到 PING -> 回 PONG', pongs.length === 1, JSON.stringify(sent));
+    check('PONG 带版本号与函数自检结果',
+        pongs.length === 1 && pongs[0].data.version === EXPECT_VER
+        && pongs[0].data.hasDump === true && pongs[0].data.hasWaitForMenu === true
+        && pongs[0].data.hasReplyBtnTarget === true,
+        pongs.length ? JSON.stringify(pongs[0].data) : 'none');
 
     // 行为：.editor-composer 里既有普通 input（分类框）又有 .ql-editor -> 必须写进 .ql-editor
     const qlStub = { tagName: 'DIV', className: 'ql-editor ql-blank', innerText: '', textContent: '',

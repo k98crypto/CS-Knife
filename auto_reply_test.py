@@ -293,6 +293,28 @@ check("新增逃生舱 reset_im_state + /api/im_reset + RESET_IM_STATE/RESET 动
       and 'act == "RESET_IM_STATE"' in SRC)
 check("H5 会把「网页实际状态 X」如实带给客服看",
       "im_status_page" in SRC and "（网页仍" in SRC)
+print("\n[10.6] 中继侧诊断可见性（中继跑在隐藏窗口时，/diag 也能看到现场）")
+check("留存「上次切换请求」（切到哪个状态、谁发的、几点）",
+      '"im_last_request"' in SRC and 'state["im_last_request"] =' in SRC)
+check("留存「上次动作回执」（点了没反应时能查到原因）",
+      'state["last_action"] =' in SRC and '"last_action": state.get("last_action")' in SRC)
+check("留存「网页下拉实测选项」（含触发元素与可见状态节点）",
+      'state["status_menu_dump"] =' in SRC and '"visible_status_nodes"' in SRC
+      and '"status_menu_dump": state.get("status_menu_dump")' in SRC)
+check("自检页把这三项渲染出来（不用看控制台）",
+      'row("上次切换请求"' in SRC and 'row("上次动作回执"' in SRC and 'row("网页下拉实测"' in SRC)
+check("手机页面禁缓存（否则 iOS 一直用旧版 H5，看不到新按钮）",
+      'Cache-Control": "no-store, no-cache, must-revalidate"' in SRC)
+print("\n[10.7] 指令自检（V7.8：先确认'指令到底有没有到探针'，再谈干活）")
+check("新增 GET /api/probe_ping（发 PING 等 PONG，3 秒超时直说）",
+      "def api_probe_ping" in SRC and '"/api/probe_ping"' in SRC and "timeout=3.0" in SRC)
+check("探针 PONG 自报会留存并暴露到 /api/diag", 'state["probe_pong"] =' in SRC and '"pong": state.get("probe_pong")' in SRC)
+check("safe_send 返回成败（'指令发出去没有'要能查）",
+      "return True" in SRC and "return False" in SRC and "探针连接数 0" in SRC)
+check("下发命令记录 conns/sent（发给几个、成功几个）",
+      '"conns": len(_conns), "sent": _sent' in SRC)
+check("事件计数（判断'探针到底发没发这条事件'）",
+      'state.setdefault("event_counts", {})' in SRC and '"events": state.get("event_counts")' in SRC)
 
 print("\n[11] 三个 AI 动作的独立开关（服务端）")
 SRC2 = SRC
