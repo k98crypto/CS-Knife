@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V8.1 不冲掉你正在写的字 + 切会话严谨确认版)
+// @name         智能工单探针 (V8.2 重连即重新上报 + 不冲掉你正在写的字)
 // @namespace    http://tampermonkey.net/
-// @version      8.1
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）；V8.0 会话列表上报（手机端"全部会话"）+ 远程/自动切会话（OPEN_CONV，回复前先切对工单）；V8.1 草稿不再冲掉客服正在写的字、切会话必须确认页面真的切过去才回执
+// @version      8.2
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）；V8.0 会话列表上报（手机端"全部会话"）+ 远程/自动切会话（OPEN_CONV，回复前先切对工单）；V8.1 草稿不再冲掉客服正在写的字、切会话必须确认页面真的切过去才回执；V8.2 重连后重新上报会话列表与聊天（中继重启不再显示空白）
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "8.1";
+    const PROBE_VERSION = "8.2";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -1143,6 +1143,12 @@
             console.log("✅ [探针] WebSocket 连接成功");
             reconnectAttempts = 0;   // 连接成功后才重置重连计数
             lastIMStatus = null;     // 重连后强制把当前 IM 状态重新同步一次
+            // ★ V8.2：重连后清掉"上次上报过的指纹" ——
+            //   中继重启后它内存里的会话/聊天全没了，可探针还以为"内容没变、不用再报"，
+            //   于是手机端一直空白，直到页面内容恰好变化（客服每次重启中继都会踩这个坑）。
+            window._lastConvListHash = "";
+            window._lastChatState = null;
+            window._lastChatHash = "";
             setChip('connected', "");
             // 握手：把"油猴脚本到底跑了没、跑的哪一版"变成后端可查的事实（GET /api/diag）
             const pageUrl = (function () { try { return location.href; } catch (e) { return ""; } })();

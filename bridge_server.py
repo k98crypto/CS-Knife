@@ -551,7 +551,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "8.1"
+SERVER_VER = "8.2"
 
 
 def _probe_refresh():

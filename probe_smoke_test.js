@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '8.1';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '8.2';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -955,7 +955,23 @@ function check(name, ok, extra) {
         composerInput.value === 'AI 草稿内容', composerInput.value);
     composerInput.value = '';
 
-    console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
+    console.log('\n[8.14] V8.2 重连后重新上报（中继重启不再空白）');
+check('重连时会清掉"会话列表已上报"的指纹（中继重启后手机不再空白）',
+    code.indexOf('window._lastConvListHash = ""') !== -1);
+check('重连时会清掉聊天指纹（重建会话数据）',
+    code.indexOf('window._lastChatState = null') !== -1 && code.indexOf('window._lastChatHash = ""') !== -1);
+// 行为：连上 -> 清指纹 -> 下一次扫描就会重新上报
+sessionItems = [makeSessionRow('重连甲', '你好', '1分钟前', false)];
+sent.length = 0;
+const wsRe = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+try { wsRe.readyState = FakeWebSocket.OPEN; wsRe.onopen && wsRe.onopen(); } catch (e) {}
+intervals[3]();
+check('重连后立刻能重新上报会话列表（不再等页面变化）',
+    sent.filter(s => s.event === 'CONV_LIST').length === 1,
+    JSON.stringify(sent.filter(s => s.event === 'CONV_LIST').slice(-1))[0] ? 'OK' : '无');
+sessionItems = [];
+
+console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
     const chip = (documentStub.body._children || []).find(n => n.tagName === 'DIV');
     const chipTextOf = n => (n && n._text && n._text.textContent) || '';
     check('已挂载页面内状态胶囊（不再只能靠控制台判断）', !!chip);
