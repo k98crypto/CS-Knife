@@ -246,6 +246,13 @@ def main():
     check("清空走队列更新 UI（线程安全，不跨线程操作 Tk）",
           "def clear_staged" in src and "self._apply_ui(" in src and "self._staged_text" in src)
 
+    # ---------- V7.6：三个 AI 开关（小窗热键据此拒绝执行） ----------
+    print("[N2] 独立开关：桌面 F10 AI 润色可关")
+    check("小窗有 FEATURES 开关表（来自中继 /api/diag.features）",
+          "FEATURES = {}" in src and 'info.get("features")' in src)
+    check("F10 关闭时拒绝执行（只提示，不动回复框）",
+          'FEATURES.get("f10_polish") is False' in src and "enable_f10_polish" in src)
+
     print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
     return 0 if failed == 0 else 1
 

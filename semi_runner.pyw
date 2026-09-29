@@ -162,6 +162,10 @@ def long_human_alarm():
     except Exception:
         pass
 
+# ==================== 功能开关（三个 AI 动作可独立关闭） ====================
+# 值来自中继 /api/diag.features（config.json → enable_ai_close / enable_auto_draft / enable_f10_polish）
+FEATURES = {}
+
 # ==================== ESC：清空小窗"暂存内容" ====================
 # 「暂存内容」= 小窗中"最近提炼 / 框选预览 / F9·F10 结果"那一块（双击可复制）。
 # ESC 一键清空它，并**无条件**把剪贴板也清掉（客服要求：防止玩家信息/草稿留在剪贴板里）。
@@ -538,6 +542,10 @@ class HUDOverlay:
         try:
             relay_ok = isinstance(info, dict)
             legacy = bool(relay_ok and info.get("legacy"))
+            # ★ 三个 AI 动作的开关（来自中继 /api/diag.features）：本地热键据此拒绝执行
+            if relay_ok and isinstance(info.get("features"), dict):
+                FEATURES.clear()
+                FEATURES.update(info["features"])
             probe = (info or {}).get("probe") or {}
             probe_ok = bool(relay_ok and not legacy and probe.get("online"))
             probe_v = probe.get("version") or ""
@@ -816,6 +824,13 @@ def on_f9():
         if hud: hud.update_ui(status=f"❌ 处理异常: {str(e)[:25]}", status_color="#F44747"); beep_error()
 
 def on_f10():
+    # ★ 独立开关③：enable_f10_polish=false 时 F10 不再调用 AI 润色（只提示，不动你的回复框）
+    if FEATURES and FEATURES.get("f10_polish") is False:
+        if hud:
+            hud.update_ui(status="⛔「AI 润色」已在设置里关闭（enable_f10_polish=false）",
+                          status_color="#E5C07B")
+        beep_error()
+        return
     text = safe_capture_selection()
     if not text: return
     beep_start()

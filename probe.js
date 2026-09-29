@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         智能工单探针 (V7.5 发送与挂起加固版)
+// @name         智能工单探针 (V7.6 状态守护与靶点兼容版)
 // @namespace    http://tampermonkey.net/
-// @version      7.5
+// @version      7.6
 // @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "7.5";
+    const PROBE_VERSION = "7.6";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -31,6 +31,9 @@
     let audioCtx = null;
     let sirenInterval = null;
     let isManualOffline = false;
+    // ★ V7.5：手动"离开"状态（离线或忙碌）——客服铁律：离线/忙碌都不许被网页自动改成在线
+    let isManualAway = false;
+    let manualAwayStatus = null;      // 'IM离线' | 'IM忙碌' | null（手动设的目标状态）
     let lastIMStatus = null;          // 上一次上报过的 IM 状态，用于变化检测
     let lastUserStatusClickAt = 0;    // 用户最近一次自己点状态的时间（区分"人点的" vs "网页自己跳的"）
     let lastGuardAt = 0;              // 上次离线守护动作时间
@@ -67,10 +70,34 @@
         return true;                                       // 既无 offsetParent 也无尺寸信息 -> 不拦
     }
 
+    // 状态文本归一化：兼容 "IM在线" 与 "在线" 两种写法（页面不同位置写法不一样）
+    //   返回 'IM在线' / 'IM忙碌' / 'IM离线' / null
+    function normStatus(raw) {
+        const t = normText(raw);
+        if (!t) return null;
+        const bare = t.replace(/^IM/, '');
+        if (t === 'IM离线' || bare === '离线') return 'IM离线';
+        if (t === 'IM在线' || bare === '在线') return 'IM在线';
+        if (t === 'IM忙碌' || bare === '忙碌') return 'IM忙碌';
+        return null;
+    }
+
     function statusTextOf(el) {
         if (!el) return null;
-        const t = normText(el.innerText);
-        return (t === 'IM离线' || t === 'IM在线' || t === 'IM忙碌') ? t : null;
+        const byText = normStatus(el.innerText);
+        if (byText) return byText;
+        // ★ 兜底：只看类名（本工作台状态胶囊是 .status-trigger.is-im-online / is-im-busy / is-im-offline）
+        const cls = String(el.className || '');
+        if (cls.indexOf('is-im-offline') !== -1) return 'IM离线';
+        if (cls.indexOf('is-im-busy') !== -1) return 'IM忙碌';
+        if (cls.indexOf('is-im-online') !== -1) return 'IM在线';
+        return null;
+    }
+
+    // 状态选项的"同类"判定：菜单项可能写"在线"，目标可能是"IM在线"
+    function sameStatus(a, b) {
+        const x = normStatus(a), y = normStatus(b);
+        return !!x && x === y;
     }
 
     function isMenuOption(el) {
@@ -367,12 +394,21 @@
     document.addEventListener('click', (e) => {
         initAudio();
         if (e.target && e.target.innerText) {
-            const text = normText(e.target.innerText);
+            const text = normStatus(e.target.innerText);
             if (text === 'IM离线') {
                 isManualOffline = true;
+                isManualAway = true;
+                manualAwayStatus = 'IM离线';
                 lastUserStatusClickAt = Date.now();
-            } else if (text === 'IM在线' || text === 'IM忙碌') {
+            } else if (text === 'IM忙碌') {
                 isManualOffline = false;
+                isManualAway = true;
+                manualAwayStatus = 'IM忙碌';
+                lastUserStatusClickAt = Date.now();
+            } else if (text === 'IM在线') {
+                isManualOffline = false;
+                isManualAway = false;
+                manualAwayStatus = null;
                 lastUserStatusClickAt = Date.now();
                 stopSiren();
             }
@@ -728,14 +764,35 @@
                 if (isMenuOption(el)) return false;
                 return isVisibleEl(el);
             });
-            if (statusTrigger) statusTrigger.click();
+            if (!statusTrigger) {
+                reportActionResult("CHANGE_STATUS", false,
+                    "未找到「可见」的 IM 状态显示区（页面结构可能变了），状态没切");
+                return;
+            }
+            statusTrigger.click();
 
             setTimeout(() => {
                 const items = Array.from(document.querySelectorAll('.el-dropdown-menu__item'))
                     .filter(item => isVisibleEl(item));      // 只点可见的菜单项
-                const target = items.find(item => normText(item.innerText).indexOf(normText(targetStatus)) !== -1);
-                if (target) target.click();
-                else console.warn("⚠️ [探针] 未找到可见的 IM 状态选项：" + targetStatus);
+                // ★ 等价匹配：页面状态区写"IM在线"，菜单项可能只写"在线"（反之亦然）
+                const target = items.find(item => sameStatus(item.innerText, targetStatus))
+                    || items.find(item => normText(item.innerText).indexOf(normText(targetStatus)) !== -1);
+                if (target) {
+                    target.click();
+                    // 点完立刻回读真实状态并回报（切成功与否手机端马上能看到，不再"显示成功其实没变"）
+                    setTimeout(() => {
+                        const now = findIMStatusText();
+                        const okNow = sameStatus(now, targetStatus);
+                        reportActionResult("CHANGE_STATUS", okNow,
+                            okNow ? ("已切换为 " + targetStatus) :
+                                    ("点了「" + normText(target.innerText) + "」但页面仍是 " + (now || "未知")));
+                        if (PROBE_CONFIG.forceStatusOnConnect) readAndReportIMStatus(true);
+                    }, 350);
+                } else {
+                    const cand = items.map(i => normText(i.innerText)).filter(Boolean);
+                    reportActionResult("CHANGE_STATUS", false,
+                        "未找到可见的状态选项「" + targetStatus + "」；页面候选：" + cand.join("/"));
+                }
             }, 200);
         }
     };
@@ -786,14 +843,18 @@
         lastIMStatus = st;
         sendToBrain({
             event: "IM_STATUS",
-            data: { status: imStatusCode(st), manual: isManualOffline, forced: !!forced }
+            data: { status: imStatusCode(st), manual: isManualAway, forced: !!forced }
         });
         console.log("📡 [探针] 状态复核：" + st + (forced ? "（服务端请求）" : ""));
         return true;
     }
 
-    // 离线守护：客服手动挂了"离线"，网页却自己跳回"在线/忙碌" -> 改回离线并如实上报
+    // 手动状态守护：客服手动挂了"离线/忙碌"，网页却自己跳回"在线"（很多 IM 在窗口重新获得焦点时
+    // 会自动上线）-> 改回你手动设的那个状态并如实上报。
+    //   ★ 客服铁律：任何情况都不得把"离线/忙碌"自动改成"在线"，除非手动。
     function restoreManualOffline(flippedTo) {
+        const want = manualAwayStatus || 'IM离线';
+        const wantCode = imStatusCode(want);
         const now = Date.now();
         if (now - lastGuardAt > PROBE_CONFIG.guardWindowMs) {
             guardHits = 0;                                   // 距上次久远 -> 新窗口，重新计数
@@ -808,10 +869,11 @@
         }
         lastGuardAt = now;
         guardHits++;
-        console.warn("🛡️ [探针] 检测到网页把状态自动改成了「" + flippedTo + "」，按你的手动离线设置改回「IM离线」（第 " + guardHits + " 次）");
-        Operator.switchIMStatus('IM离线');
-        lastIMStatus = 'IM离线';                             // 先把手机端稳住，不再显示在线
-        sendToBrain({ event: "IM_STATUS", data: { status: 3, manual: true, guarded: true } });
+        console.warn("🛡️ [探针] 检测到网页把状态自动改成了「" + flippedTo + "」，按你手动设置的「"
+                     + want + "」改回去（第 " + guardHits + " 次）");
+        Operator.switchIMStatus(want);
+        lastIMStatus = want;                                 // 先把手机端稳住，不再显示在线
+        sendToBrain({ event: "IM_STATUS", data: { status: wantCode, manual: true, guarded: true } });
         return true;
     }
 
@@ -950,7 +1012,9 @@
             else if (cmd.command === "CHANGE_STATUS") {
                 const map = { 1: 'IM在线', 2: 'IM忙碌', 3: 'IM离线' };
                 // 这是"人在手机端点的"，属于用户意图：同步手动标记 + 记一次点击时间，
-                // 免得离线守护把用户刚点的"在线"又改回去。
+                // 免得离线/忙碌守护把用户刚点的状态又改回去。
+                // ★ V7.5 补充：忙碌也算"手动状态"（客服要求：离线/忙碌都不许被自动改成在线）
+                isManualAway = (cmd.status === 2 || cmd.status === 3);
                 isManualOffline = (cmd.status === 3);
                 lastUserStatusClickAt = Date.now();
                 lastIMStatus = null;                 // 下一次 tick 重新读 DOM 并如实上报
@@ -985,13 +1049,12 @@
         const currentStatus = findIMStatusText();     // 'IM在线' | 'IM忙碌' | 'IM离线' | null
         if (!currentStatus) return;
 
-        // ★ V7.3 离线守护：客服手动挂了"离线"，网页却自己跳回"在线/忙碌"（很多 IM 在窗口
-        //   重新获得焦点时会自动上线）——在你离开页面/切窗口的那一刻就把它改回离线。
-        //   只处理"网页自己跳的"：你自己点的状态有 manualGraceMs 的免打扰时间。
-        if (currentStatus !== lastIMStatus && currentStatus !== 'IM离线'
-            && isManualOffline && PROBE_CONFIG.keepManualOffline
+        // ★ V7.5 手动状态守护：客服手动挂了"离线/忙碌"，网页却自己跳回"在线"（很多 IM 在窗口
+        //   重新获得焦点时会自动上线）—— 只处理"网页自己跳的"（你刚点过的有 manualGraceMs 免打扰）。
+        if (currentStatus !== lastIMStatus && currentStatus === 'IM在线'
+            && isManualAway && manualAwayStatus && PROBE_CONFIG.keepManualOffline
             && (Date.now() - lastUserStatusClickAt) > PROBE_CONFIG.manualGraceMs) {
-            if (restoreManualOffline(currentStatus)) return;   // 已改回离线并上报
+            if (restoreManualOffline(currentStatus)) return;   // 已改回你设的状态并上报
         }
 
         if (currentStatus === lastIMStatus) return;   // 未变化不重复上报
@@ -1003,7 +1066,7 @@
         //    （否则手机端会一直显示旧状态，手动挂"离线"更是永远同步不过去）
         sendToBrain({
             event: "IM_STATUS",
-            data: { status: imStatusCode(currentStatus), manual: isManualOffline }
+            data: { status: imStatusCode(currentStatus), manual: isManualAway }
         });
 
         // 2) 只有"异常掉线"才拉警报；手动离线不报警
@@ -1018,6 +1081,8 @@
             stopSiren();
             if (prev === 'IM离线' && currentStatus === 'IM在线') {
                 isManualOffline = false;
+                isManualAway = false;          // 网页真的回到在线（守护没拦住/不需要拦）-> 手动离开状态结束
+                manualAwayStatus = null;
                 sendToBrain({ event: "ALARM_RECOVERED" });
             }
         }
@@ -1110,6 +1175,7 @@
         status: function () {
             const st = { version: PROBE_VERSION, kind: chipKind, detail: chipDetail,
                          imStatus: lastIMStatus, manualOffline: isManualOffline,
+                         manualAway: manualAwayStatus,
                          keepManualOffline: PROBE_CONFIG.keepManualOffline,
                          guardHits: guardHits,
                          wsState: ws ? ws.readyState : -1, online: !!(ws && ws.readyState === WebSocket.OPEN) };

@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '7.5';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '7.6';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -71,6 +71,7 @@ function makeEl(text, classes) {
 }
 
 let statusText = 'IM在线';
+let statusTriggerNodes = [];                   // 模拟"IM 状态显示区"节点（V7.6 等价匹配用例）
 let bubbles = [];
 let playerInfoText = '玩家A\nUID:12345';
 let ticketIdAttr = '';                       // 模拟页面上真实工单号（data-ticket-id）
@@ -108,6 +109,7 @@ const documentStub = {
     },
     querySelectorAll: sel => {
         if (sel.indexOf('.el-dropdown-menu__item') === 0) return [makeEl(statusText)];
+        if (sel === 'div, span, button') return statusTriggerNodes;
         if (sel.indexOf('.im-action-btn') === 0) return actionButtons;
         if (sel === '.chat-bubble-row') return bubbles;
         return [];
@@ -522,6 +524,40 @@ function check(name, ok, extra) {
     check('分类选不中时不再盲选第一项（改回报候选）',
         code.indexOf('兜底：取第一项') === -1 && code.indexOf('宁可不选') !== -1);
 
+    console.log('\n[8.9.0] V7.6 IM 状态：写法等价 + 切换后回读回报 + 手动"忙碌"也守住');
+    check('状态文本兼容"在线/忙碌/离线"（不要求必须带 IM 前缀）',
+        code.indexOf('function normStatus') !== -1 && code.indexOf("bare === '离线'") !== -1);
+    check('状态胶囊类名兜底（is-im-online / is-im-busy / is-im-offline）',
+        code.indexOf('is-im-busy') !== -1 && code.indexOf('is-im-offline') !== -1);
+    check('状态选项等价匹配（菜单写"在线"也能对上"IM在线"）',
+        code.indexOf('function sameStatus') !== -1 && code.indexOf('items.find(item => sameStatus') !== -1);
+    check('切完立刻回读并回报（不再"显示成功其实没变"）',
+        code.indexOf('点完立刻回读真实状态并回报') !== -1
+        && code.indexOf('reportActionResult("CHANGE_STATUS"') !== -1);
+    check('手动"忙碌"与"离线"都纳入守护（不许被自动改成在线）',
+        code.indexOf('isManualAway') !== -1 && code.indexOf('manualAwayStatus') !== -1
+        && code.indexOf('isManualAway && manualAwayStatus') !== -1);
+
+    // 行为：菜单项写"在线"（无 IM 前缀）时也要点得到
+    statusTriggerNodes = [makeEl('在线')];
+    statusText = '在线';
+    clickedLabels = [];
+    sent.length = 0;
+    const wsStat = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    if (wsStat.readyState !== FakeWebSocket.OPEN) wsStat.readyState = FakeWebSocket.OPEN;
+    wsStat.onmessage({ data: JSON.stringify({ command: 'CHANGE_STATUS', status: 1 }) });
+    await new Promise(r => setTimeout(r, 5));
+    timeouts.filter(t => t.ms === 200).forEach(t => t.fn());
+    await new Promise(r => setTimeout(r, 5));
+    timeouts.filter(t => t.ms === 350).forEach(t => t.fn());
+    check('页面写"在线"也能点到（等价匹配）', clickedLabels.indexOf('在线') !== -1,
+        JSON.stringify(clickedLabels));
+    check('切换结果回报给手机端（ACTION_RESULT/CHANGE_STATUS）',
+        sent.some(s => s.event === 'ACTION_RESULT' && s.data.command === 'CHANGE_STATUS'),
+        JSON.stringify(sent.filter(s => s.event === 'ACTION_RESULT').slice(-1)));
+    statusTriggerNodes = [];
+    statusText = 'IM在线';
+
     console.log('\n[8.9.1] V7.5 挂起/恢复自动重试（按钮懒渲染 or 收在「更多」里）');
     timeouts.filter(t => t.ms === 400).forEach(t => t.fn());   // 先清掉上一用例遗留的重试计时器
     actionButtons = [];                       // 第一次扫不到按钮
@@ -656,12 +692,16 @@ function check(name, ok, extra) {
     check('缓存命中时不再点开网页上的分类下拉',
         code.indexOf('categoryCache.options.length') !== -1 && code.indexOf('面板本来就开着') !== -1);
     check('读完会把下拉收起，不留一个自己弹开的菜单', code.indexOf('再点一下收起') !== -1);
-    // 中继侧：只有"还没拿到过分类"时才请求（避免每次连接都去点开）
+    // 中继侧（V7.6）：连接时**不再**主动嗅探分类，只有真要选分类时才按需请求
     let serverSrc = '';
     try { serverSrc = fs.readFileSync('bridge_server.py', 'utf8'); } catch (e) {}
-    check('中继只在没拿到分类时才请求（避免反复点开）',
-        serverSrc.indexOf('if not state.get("category_options")') !== -1,
+    check('连接探针时不再主动请求分类（不嗅探下拉）',
+        serverSrc.indexOf('探针一连上**不再**主动去读分类') !== -1
+        && serverSrc.indexOf('if not state.get("category_options"):') === -1,
         serverSrc ? '' : 'bridge_server.py 不可读');
+    check('分类改为按需读取（ensure_category_options，只在 AI 关单时调用）',
+        serverSrc.indexOf('def ensure_category_options') !== -1
+        && serverSrc.indexOf('options = await ensure_category_options()') !== -1);
 
     console.log('\n[9] 自检可见性（V7.2 新增：页面胶囊 + 握手 + 心跳）');
     const chip = (documentStub.body._children || []).find(n => n.tagName === 'DIV');

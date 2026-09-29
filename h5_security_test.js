@@ -471,7 +471,7 @@ check('又一条新消息 -> 再响一次', oscCount - oscBefore === 2, '振荡�
 check('手动模式下提示"AI 未自动起草"',
     (els['toast'].innerText || '').indexOf('未自动起草') !== -1, els['toast'].innerText);
 
-console.log('\n[16] V7.5 正在看该会话时不响铃（只提醒别的会话）');
+console.log('\n[16] 统一提示（不区分是否正在看该会话）');
 onmsg({ type: 'FULL_SYNC', data: {
     afk_mode: false, alarm_status: false, extension_online: true, im_status: 1, im_status_known: true,
     human_alerts: [],
@@ -486,16 +486,48 @@ check('会话卡片可点击进入聊天页（事件委托绑定）', !!(cardVie
 if (cardView && cardView._click) cardView._click();          // -> activeGroupId = T-VIEW
 let osc16 = oscCount;
 onmsg({ type: 'NEW_MESSAGE', groupID: 'T-VIEW', name: '正在看的人', preview: '又发了一条', mode: 'semi', ts: 3333 });
-check('正在看的会话来新消息 -> 不响铃/不弹提示（消息已在聊天流里）',
-    oscCount === osc16, '振荡器 +' + (oscCount - osc16));
-const toast16 = els['toast'].innerText || '';
-check('正在看的会话也不弹提示（不打扰）', toast16.indexOf('又发了一条') === -1, toast16);
+check('正在看的会话来新消息 -> 照常响铃（客服要求：统一都要提示）',
+    oscCount - osc16 === 2, '振荡器 +' + (oscCount - osc16));
+check('正在看的会话也弹提示（玩家名+预览）',
+    (els['toast'].innerText || '').indexOf('又发了一条') !== -1, els['toast'].innerText);
 
 osc16 = oscCount;
 onmsg({ type: 'NEW_MESSAGE', groupID: 'T-OTHER', name: '别的玩家', preview: '别的会话新消息', mode: 'semi', ts: 4444 });
-check('别的会话来新消息 -> 照常响铃', oscCount - osc16 === 2, '振荡器 +' + (oscCount - osc16));
-check('别的会话提示里带玩家名',
-    (els['toast'].innerText || '').indexOf('别的玩家') !== -1, els['toast'].innerText);
+check('别的会话来新消息 -> 也响铃', oscCount - osc16 === 2, '振荡器 +' + (oscCount - osc16));
+
+console.log('\n[17] 三个 AI 动作的独立开关（手机侧）');
+check('H5 读取中继下发的 features（ai_close / auto_draft / f10_polish）',
+    h5code.indexOf('function featureOn') !== -1 && h5code.indexOf('globalState.features') !== -1);
+check('有"已关闭"提示条（feature-hint）', py.indexOf('id="feature-hint"') !== -1
+    && h5code.indexOf('function renderFeatureButtons') !== -1);
+check('「AI 回复并关单」按钮被关闭时点不动（走 AI_CLOSE 前先检查开关）',
+    h5code.indexOf("if (!featureOn('ai_close'))") !== -1);
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true, im_status: 1, im_status_known: true,
+    human_alerts: [], features: { ai_close: false, auto_draft: false, f10_polish: true },
+    companies: { main: { conversations: {
+        'T-M2': { name: '开关测试', updatedAt: nowMs, msgs: [{ sender: 'player', text: '你好', ts: nowMs }] }
+    } } }
+} });
+check('已关闭的功能在手机端标出来（⛔ 已关闭：…）',
+    (els['feature-hint'].innerText || '').indexOf('已关闭') !== -1
+    && (els['feature-hint'].innerText || '').indexOf('AI 回复并关单') !== -1,
+    els['feature-hint'].innerText);
+// 进入该会话（否则 activeGroupId 为空，execCommand 直接返回，测不到开关拦截）
+const cards17 = (els['conv-container']._cards || []);
+const card17 = cards17.filter(c => c.dataset.gid === 'T-M2')[0];
+if (card17 && card17._click) card17._click();
+wsInst.readyState = 1;
+FakeWebSocket.sent.length = 0;
+els['err-text'].innerText = '';
+sandbox.execCommand('AI_CLOSE');
+const sentHasAiClose = FakeWebSocket.sent.some(m => m.action === 'AI_CLOSE');
+const errHasClosed = (els['err-text'].innerText || '').indexOf('关闭') !== -1;
+check('关闭后点「AI 回复并关单」不会下发 AI_CLOSE（本地就拦住并提示）',
+    !sentHasAiClose && errHasClosed,
+    'sentHasAiClose=' + sentHasAiClose + ' errHasClosed=' + errHasClosed
+    + ' | sent=' + JSON.stringify(FakeWebSocket.sent)
+    + ' | err=' + (els['err-text'].innerText || ''));
 
 console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
 process.exit(fail === 0 ? 0 : 1);

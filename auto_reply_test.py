@@ -217,8 +217,53 @@ check("Bark 开关默认开启（本机 config.json）", bool(B.config.get("bark
       str(B.config.get("bark_on_new_message", None)))
 check("手动模式不再用延迟队列重复提示（改即时通知）",
       "手机端已即时提示" in SRC and 'status": "manual"' not in SRC)
-check("H5 正在看的会话不再响铃（避免打扰当前会话）",
-      "activeGroupId && gid === activeGroupId" in SRC)
+check("H5 已取消\"正在看不打扰\"（客服要求：统一都要提示）",
+      "activeGroupId && gid === activeGroupId" not in SRC
+      and "统一都要提示" in SRC)
+
+print("\n[10] IM 状态铁律：离线/忙碌不许被自动改成在线（除手动）")
+prev_st, prev_manual = B.state.get("im_status"), B.state.get("im_status_manual")
+try:
+    # 手动设为"忙碌"后，探针上报"在线"（网页自动跳回）必须被拦下
+    B.apply_im_status(2, manual=True, source="手机/小窗手动")
+    ch = B.apply_im_status(1, manual=False, source="探针上报")
+    check("手动忙碌后：网页自动跳回在线被拦下（状态不变）",
+          B.state.get("im_status") == 2 and ch is False, f"status={B.state.get('im_status')}")
+    # 手动切在线（manual=True）才允许变
+    ch = B.apply_im_status(1, manual=True, source="手机/小窗手动")
+    check("手动切在线时才允许变更", B.state.get("im_status") == 1, f"status={B.state.get('im_status')}")
+    # 手动离线同理
+    B.apply_im_status(3, manual=True, source="手机/小窗手动")
+    ch = B.apply_im_status(1, manual=False, source="掉线恢复")
+    check("手动离线后：掉线恢复也不许自动上线（仍保留离线）",
+          B.state.get("im_status") == 3 and ch is False, f"status={B.state.get('im_status')}")
+    # 非手动状态下跟随网页真实状态
+    B.apply_im_status(3, manual=False, source="异常掉线")
+    ch = B.apply_im_status(1, manual=False, source="网页真实状态")
+    check("非手动状态下正常跟随网页真实状态", B.state.get("im_status") == 1, f"status={B.state.get('im_status')}")
+finally:
+    B.state["im_status"] = prev_st
+    B.state["im_status_manual"] = prev_manual
+    B.save_im_state(B.state.get("im_status") or 1, bool(B.state.get("im_status_manual")))
+    B._PENDING_CLOSE.clear()
+
+check("apply_im_status 支持来源标注（便于排查是谁改的）",
+      "source" in B.apply_im_status.__code__.co_varnames)
+
+print("\n[11] 三个 AI 动作的独立开关（服务端）")
+SRC2 = SRC
+check("开关函数 feature_flags 存在且三项都在",
+      "def feature_flags" in SRC2 and all(k in SRC2 for k in
+                                          ('enable_ai_close', 'enable_auto_draft', 'enable_f10_polish')))
+check("AI_CLOSE 被开关拦住（关闭时不下发）",
+      'if not feature_flags()["ai_close"]' in SRC2)
+check("自动起草被开关拦住（半自动也不再自动出手）",
+      'if not force and not feature_flags()["auto_draft"]' in SRC2)
+check("分类改为按需读取（不再连接时就嗅探下拉）",
+      "def ensure_category_options" in SRC2 and 'await safe_send(ext, {"command": "REQUEST_CATEGORIES"})' in SRC2)
+check("按需读取只在真要选分类时调用（handle_ai_close 里）",
+      "options = await ensure_category_options()" in SRC2)
+check("分类候选回报会唤醒等待者", "_notify_category_waiters(state[\"category_options\"])" in SRC2)
 
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

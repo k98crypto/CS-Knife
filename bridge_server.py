@@ -112,14 +112,82 @@ def save_im_state(status, manual):
         print(f"[警告] IM 状态记忆写入失败：{e}")
 
 
-def apply_im_status(status, manual=None):
-    """IM 状态唯一写入口：内存 + 落盘 + 标记"已核实"，返回是否有变化。"""
+def feature_flags():
+    """三个可独立开关的 AI 动作（客服要求：要能单独关掉，不是一刀切）。
+
+    - ai_close    : 手机/电脑的「AI 回复并关单」
+    - auto_draft  : 「AI 自动起草」（半自动模式下 AI 不再自动出手）
+    - f10_polish  : 桌面 F10「AI 润色」
+    对应 config.json：enable_ai_close / enable_auto_draft / enable_f10_polish（默认都 true）
+    """
+    return {
+        "ai_close": bool(config.get("enable_ai_close", True)),
+        "auto_draft": bool(config.get("enable_auto_draft", True)),
+        "f10_polish": bool(config.get("enable_f10_polish", True)),
+    }
+
+
+# 让手机端/小窗能拿到这三个开关（随 FULL_SYNC / /api/diag 下发）
+state["features"] = feature_flags()
+
+
+async def ensure_category_options(timeout: float = 2.0):
+    """按需拿"问题分类"候选：内存里有就用；没有才请探针读一次（避免连接时就嗅探下拉）。
+
+    只有真的要选分类（AI 关单）时才会调用到这里。
+    """
+    opts = state.get("category_options") or []
+    if opts or not active_clients["extension"]:
+        return opts
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _CATEGORY_WAITERS.append(fut)
+    for ext in list(active_clients["extension"]):
+        await safe_send(ext, {"command": "REQUEST_CATEGORIES"})
+    try:
+        return (await asyncio.wait_for(fut, timeout=timeout)) or []
+    except asyncio.TimeoutError:
+        print("[分类] 按需读取超时（页面可能还没渲染出分类选择器）")
+        return state.get("category_options") or []
+
+
+def _notify_category_waiters(options):
+    while _CATEGORY_WAITERS:
+        fut = _CATEGORY_WAITERS.pop()
+        if not fut.done():
+            try:
+                fut.set_result(list(options or []))
+            except Exception:
+                pass
+
+
+def apply_im_status(status, manual=None, source=""):
+    """IM 状态唯一写入口：内存 + 落盘 + 标记"已核实"，返回是否有变化。
+
+    ★ 客服铁律（第三轮补充）：**任何情况都不得把"离线/忙碌"自动改成"在线"**，除非是人工手动动作。
+      这里加一道守卫：当内存里是 2(忙碌)/3(离线) 且带 manual 标记时，
+      探针上报的"在线"（网页自己跳回去的）会被拦下并提示 —— 想切在线只能通过手机/小窗手动点。
+    """
     try:
         st = int(status)
     except Exception:
         st = 1
     if st not in (1, 2, 3):
         st = 1
+    prev = int(state.get("im_status") or 1)
+    manual_held = bool(state.get("im_status_manual"))
+    if st == 1 and prev in (2, 3) and manual_held and not manual:
+        _prev_txt = {2: "忙碌", 3: "离线"}.get(prev, str(prev))
+        print(f"[状态] 🛡️ 拦截自动上线：你手动设的是「{_prev_txt}」，"
+              f"网页想跳回在线（来源：{source or '探针上报'}）—— 只有手动切才会变")
+        for m in list(active_clients["mobile"]):
+            try:
+                asyncio.get_event_loop().create_task(safe_send(m, {
+                    "type": "AI_STATUS", "status": "error",
+                    "message": f"已拦截：网页自动跳回「在线」，你手动设的是「{_prev_txt}」"}))
+            except Exception:
+                pass
+        return False
     changed = (state.get("im_status") != st) or (not state.get("im_status_known"))
     state["im_status"] = st
     state["im_status_known"] = True
@@ -321,6 +389,8 @@ _IM_AUTH_FP = {"value": None}   # 上一次认证头的指纹，用于去重，�
 
 # 最近一次有消息活动的工单 ID（供 /api/ticket 定位"当前工单"，比按插入顺序取最后一个更准）
 _LAST_ACTIVE = {"gid": None}
+# ★ 分类候选的"按需等待者"（ensure_category_options 用）
+_CATEGORY_WAITERS = []
 # ★ 玩家新消息"已提示到手机"的水位线：gid -> 最新已提示的玩家消息 ts
 #   用途：只对**新增**的玩家消息提示一次（避免 FULL_SYNC 反复刷新时重复响铃）
 _LAST_NOTIFIED = {}
@@ -332,7 +402,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "7.5"
+SERVER_VER = "7.6"
 
 
 def _probe_refresh():
@@ -539,6 +609,11 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
         print(f"[手动模式] {group_id} 有新消息，AI 未自动起草（手机端已即时提示）")
         return
 
+    # ★ 独立开关②（enable_auto_draft=false）：即使是半自动也不自动出手，只提示
+    if not force and not feature_flags()["auto_draft"]:
+        print(f"[自动起草] 已在设置里关闭（enable_auto_draft=false）：{group_id} 只提示、不起草")
+        return
+
     # ★ 只在"玩家最后发言、且这条还没被回过"时才动手（不抢话、不重复回）
     if not force and not should_auto_reply(conv):
         return
@@ -720,6 +795,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     .action-bar::-webkit-scrollbar{display:none}
     .action-btn{flex:0 0 auto;height:32px;padding:0 13px;border-radius:999px;font-size:12.5px;font-weight:650;
                 white-space:nowrap;background:var(--card);border:1px solid var(--line);color:var(--text)}
+    .feature-hint{flex:0 0 auto;padding:0 12px 6px;font-size:11.5px;color:#E5C07B}
+    .feature-hint:empty{display:none}
     .action-btn:active{background:var(--card-2)}
     .action-btn.ai{color:#D3ECFF;border-color:rgba(124,196,255,.34);
                    background:linear-gradient(135deg, rgba(78,201,176,.20), rgba(124,196,255,.16))}
@@ -837,12 +914,13 @@ HTML_CONTENT = """<!DOCTYPE html>
           <div class="chat-meta" id="chat-ticket-id"></div>
         </div>
         <div class="action-bar">
-          <button class="action-btn ai" onclick="execCommand('AI_CLOSE')">🤖 AI 回复并关单</button>
-          <button class="action-btn ai" onclick="execCommand('F9')">✨ AI 起草</button>
+          <button class="action-btn ai" id="btn-ai-close" onclick="execCommand('AI_CLOSE')">🤖 AI 回复并关单</button>
+          <button class="action-btn ai" id="btn-f9" onclick="execCommand('F9')">✨ AI 起草</button>
           <button class="action-btn" onclick="execCommand('HANGUP')">⏸ 挂起</button>
           <button class="action-btn" onclick="execCommand('RESUME')">▶ 恢复</button>
           <button class="action-btn" onclick="execCommand('CLOSE')">✅ 关单</button>
         </div>
+        <div class="feature-hint" id="feature-hint"></div>
         <div class="chat-stream" id="chat-stream"></div>
         <div class="player-card" id="player-card" onclick="togglePlayerCard()"></div>
         <div class="input-bar">
@@ -1102,6 +1180,28 @@ HTML_CONTENT = """<!DOCTYPE html>
         return setReplyMode(currentMode() === 'afk' ? 'semi' : 'afk');
     }
 
+    // ==================== 功能开关（三个 AI 动作可独立关闭） ====================
+    // 开关来源：中继下发 state.features（config.json → enable_ai_close / enable_auto_draft / enable_f10_polish）
+    function featureOn(key) {
+        if (!globalState || !globalState.features) return true;      // 拿不到就按"开着"处理
+        return globalState.features[key] !== false;
+    }
+    function renderFeatureButtons() {
+        const aiCloseOn = featureOn('ai_close');
+        const b1 = document.getElementById('btn-ai-close');
+        if (b1 && b1.style) {
+            b1.style.opacity = aiCloseOn ? '' : '0.45';
+            b1.title = aiCloseOn ? '' : '已在设置里关闭（enable_ai_close=false）';
+        }
+        const d1 = document.getElementById('feature-hint');
+        if (d1) {
+            const off = [];
+            if (!aiCloseOn) off.push('AI 回复并关单');
+            if (!featureOn('auto_draft')) off.push('AI 自动起草');
+            d1.innerText = off.length ? ('⛔ 已关闭：' + off.join('、') + '（改 config.json 后重启中继）') : '';
+        }
+    }
+
     // ==================== 轻提示 ====================
     let toastTimer = null;
     function toast(msg) {
@@ -1306,6 +1406,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             renderIMStatus();
             renderAFK();
             renderChips();
+            renderFeatureButtons();          // 三个开关：把已关闭的功能标出来
             // 需要人工介入：横幅 + 专属提示音（只对"新出现的告警"响一次）
             const alerts = (globalState && globalState.human_alerts) || [];
             showHumanBanner(alerts);
@@ -1323,9 +1424,8 @@ HTML_CONTENT = """<!DOCTYPE html>
             const gid = String(payload.groupID || '');
             const ts = Number(payload.ts) || Date.now();
             if (gid && notifiedMsgTs[gid] && ts <= notifiedMsgTs[gid]) return;
-            if (gid) notifiedMsgTs[gid] = ts;         // 先记账：即使这次不响，也不该以后为同一条再响
-            // ★ ① 正在看这个会话：消息马上会出现在聊天流里，不再响铃/弹提示（只有"别的会话"才提醒）
-            if (activeGroupId && gid === activeGroupId) return;
+            if (gid) notifiedMsgTs[gid] = ts;         // 先记账：同一条只提示一次
+            // 客服要求（第十九轮补充）：**统一都要提示**，不再区分"是否正在看这个会话"
             playNewMsgSound();
             try {
                 if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(40);
@@ -1484,6 +1584,11 @@ HTML_CONTENT = """<!DOCTYPE html>
           return;
       }
       if (cmd === 'AI_CLOSE') {
+          if (!featureOn('ai_close')) {
+              const m = '「AI 回复并关单」已在设置里关闭（config.json → enable_ai_close=false）';
+              toast(m); showErr(m);
+              return;
+          }
           if (!confirm('AI 将自动选择问题分类并生成结束语，然后回复并关单；关单后该会话会从列表移除。确定继续？')) return;
           if (!sendMsg({ action: 'AI_CLOSE', groupID: activeGroupId })) {
               toast('连接已断开，正在重连');
@@ -1651,6 +1756,8 @@ def _kb_stats():
 
 
 async def api_diag(request):
+    # 顺手刷新一次三个开关（配置文件被改过也能反映出来）
+    state["features"] = feature_flags()
     """一键自检：中继 / 探针 / 手机端 到底谁没在线（排障第一入口）。"""
     convs = state["companies"]["main"]["conversations"]
     now = time.time()
@@ -1658,6 +1765,7 @@ async def api_diag(request):
     return web.json_response({
         "ok": True,
         "server_ver": SERVER_VER,
+        "features": state.get("features") or feature_flags(),
         "server": {
             "port": PORT,
             "ip": get_local_ip(),
@@ -1887,13 +1995,13 @@ async def ws_ext_handler(request):
     _PROBE_CONNS.setdefault(ws, {})
     state["extension_online"] = True
     # 排障用横幅：一眼看出"电脑端探针到底连上来了没"（含来源页，便于识破多开/错页面）
+    # ★ 客服要求（第十九轮）：**不要老是嗅探分类下拉**。
+    #   旧版探针一连上就去点开"问题分类"读选项 —— 页面上的下拉会自己弹出来，很烦。
+    #   现在改为**按需**：只有当真的要选分类（AI 关单）却还没有候选时，才让探针去读一次（见 ensure_category_options）。
     print(f"[探针] ✅ 已连接 · 来源: {request.headers.get('Referer', '未知')}")
     # 8 秒内不上报版本 => 油猴里还是旧脚本（< 7.3），主动喊一嗓子
     asyncio.create_task(_probe_hello_watchdog(ws))
-    # 探针一连上就请它回报网页上的真实问题分类（供手机端 AI 一键关单选分类）
-    # ★ 只在"还没拿到过分类"时才要，避免每次连接都去点开网页上的分类下拉（客服反馈"下拉老是自己跑下来"）
-    if not state.get("category_options"):
-        await safe_send(ws, {"command": "REQUEST_CATEGORIES"})
+    # 探针一连上**不再**主动去读分类（避免"下拉自己弹出来"）；真要选分类时按需请求（见 ensure_category_options）
     # ★ V7.3：把服务端策略同步给探针（手动离线守护开关），并请它立刻复核一次真实 IM 状态。
     #   这样即使中继刚重启、内存里是默认值，几毫秒内就会被真实状态覆盖。
     await safe_send(ws, {"command": "POLICY",
@@ -1985,6 +2093,7 @@ async def ws_ext_handler(request):
                     if isinstance(opts, list) and opts:
                         state["category_options"] = [str(o)[:40] for o in opts][:300]
                         print(f"[分类] 已获取 {len(state['category_options'])} 个问题分类")
+                        _notify_category_waiters(state["category_options"])   # 唤醒按需等待者
                         for m in list(active_clients["mobile"]):
                             await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     continue
@@ -1996,8 +2105,9 @@ async def ws_ext_handler(request):
                         st = int(data.get("status", 1))
                     except Exception:
                         st = 1
-                    manual = bool(data.get("manual", False)) or (st == 3)
-                    apply_im_status(st, manual=manual)
+                    # 离线/忙碌都视为"人工状态"：绝不允许网页随后自动跳回在线（见 apply_im_status 守卫）
+                    manual = bool(data.get("manual", False)) or (st in (2, 3))
+                    apply_im_status(st, manual=manual, source="探针上报")
                     if data.get("guarded"):
                         print("[状态] 🛡️ 探针已按手动离线设置，把网页自动跳回的在线改回离线")
                     for m in list(active_clients["mobile"]):
@@ -2007,7 +2117,7 @@ async def ws_ext_handler(request):
                 if ev == "ABNORMAL_OFFLINE":
                     # 异常掉线警报闭环（探针在页面上确实读到"离线"才会发这个事件）
                     state["alarm_status"] = True
-                    apply_im_status(3, manual=False)
+                    apply_im_status(3, manual=False, source="异常掉线")
                     # 推送给手机端
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 推送 Bark 通知（P0 修复：缺失的 Bark 警报）
@@ -2017,7 +2127,9 @@ async def ws_ext_handler(request):
                     
                 elif ev == "ALARM_RECOVERED":
                     state["alarm_status"] = False
-                    apply_im_status(1, manual=False)
+                    # 掉线恢复 = 自动把状态改回在线；若你手动设过 忙碌/离线，apply_im_status 会拦下（
+                    # 客服铁律：只有人工手动切才能变回在线）
+                    apply_im_status(1, manual=False, source="掉线恢复")
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 向探针发送确认回执
                     await ws.send_json({"command": "RECOVERY_CONFIRMED"})
@@ -2222,7 +2334,7 @@ async def handle_ai_close(group_id: str):
         return False, "会话不存在（可能已关单）"
 
     history_str = build_chat_history_str(group_id) or str(conv.get("playerInfo") or "") or "（无聊天记录）"
-    options = state.get("category_options") or config.get("close_category_options") or []
+    options = await ensure_category_options() or config.get("close_category_options") or []
 
     try:
         category, content = await asyncio.get_event_loop().run_in_executor(
@@ -2319,8 +2431,9 @@ async def ws_mobile_handler(request):
                         st = 1
                     if st not in (1, 2, 3):
                         st = 1
-                    # 手动切到离线 -> 记 manual，网页若自己跳回在线，探针会按离线守护改回来
-                    apply_im_status(st, manual=(st == 3))
+                    # ★ 手动切到 离线/忙碌 -> 记 manual（网页若自己跳回在线，探针会按守护改回来；
+                    #   中继侧 apply_im_status 也会拦住"自动上线"）
+                    apply_im_status(st, manual=(st in (2, 3)), source="手机/小窗手动")
                     for ext in list(active_clients["extension"]):
                         await safe_send(ext, {"command": "CHANGE_STATUS", "status": st})
                         if st == 1:
@@ -2331,6 +2444,11 @@ async def ws_mobile_handler(request):
 
                 # AI 一键回复并关单（AI 选问题分类 + 生成结束语，关单后会话从列表消失）
                 if act == "AI_CLOSE":
+                    if not feature_flags()["ai_close"]:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                                             "message": "「AI 回复并关单」已在设置里关闭"
+                                                        "（config.json → enable_ai_close=false）"})
+                        continue
                     gid = pkt.get("groupID")
                     if gid:
                         asyncio.create_task(_ai_close_and_notify(gid))
