@@ -52,6 +52,14 @@ function makeEl(id) {
                     out.push(row);
                 }
                 this._openRows = out;
+            } else if (sel.indexOf('[data-toggle-other]') === 0) {
+                // ★ V8.2："其它会话（不在网页列表里）"的展开/收起摘要行
+                if (this._html.indexOf('data-toggle-other="1"') !== -1) {
+                    const tg = makeEl('other-toggle');
+                    tg.dataset.toggleOther = '1';
+                    out.push(tg);
+                }
+                this._otherToggles = out;
             }
             return out;
         }
@@ -261,8 +269,17 @@ check('主页有一份"电脑网页上的会话"清单（含没聊过的，标�
     lh.indexOf('电脑网页上的会话（3）') !== -1 && lh.indexOf('玩家戊') !== -1 && lh.indexOf('未打开') !== -1);
 check('中继认识的会话直接渲染成完整卡片（不再两份列表互相重复）',
     lh.indexOf('data-gid="T-1"') !== -1 && lh.indexOf('甲的问题') !== -1);
-check('不在网页列表里的会话单独收尾并写明原因',
-    lh.indexOf('其它会话（不在网页列表里）') !== -1 && lh.indexOf('data-gid="T-2"') !== -1);
+check('不在网页列表里的会话默认收起成一行摘要（不再堆一大坨"鸡肋"列表）',
+    lh.indexOf('其它会话（不在网页列表里）') !== -1 && lh.indexOf('data-gid="T-2"') === -1);
+const otherToggles = els['conv-container']._otherToggles || [];
+check('那一行摘要可以点开', otherToggles.length === 1, '数量=' + otherToggles.length);
+if (otherToggles.length) {
+    otherToggles[0]._click();
+    const lh2 = els['conv-container'].innerHTML;
+    check('点开后能看到那些旧会话（玩家乙）',
+        lh2.indexOf('data-gid="T-2"') !== -1 && lh2.indexOf('玩家乙') !== -1);
+    otherToggles[0]._click();                  // 再点一下收起，避免影响后续用例
+}
 check('当前网页打开的那个会话有「当前」标记', lh.indexOf('🖥 当前') !== -1 && lh.indexOf('page-active') !== -1);
 check('网页列表里的新内容有未读点（fresh）', lh.indexOf('unread-dot') !== -1);
 check('顶栏计数跟着网页列表走', els['list-count'].innerText.indexOf('电脑网页') !== -1,
@@ -302,6 +319,22 @@ check('电脑切过去并上报后 -> 手机自动进聊天页（不用再点第
     && els['chat-player-name'].innerText === '玩家戊',
     els['chat-player-name'].innerText + ' / active=' + els['chat-view'].classList.contains('active'));
 check('打开后返回列表', (function () { sandbox.popChat(); return els['list-view'].classList.contains('active'); })());
+
+// ★ V8.2：点卡片"进不去会话"的加固（客服反馈了两次）
+const pushBody = h5code.slice(h5code.indexOf('function pushChat'), h5code.indexOf('function popChat'));
+check('点卡片先切视图再渲染（渲染里出错也不会"点了没反应"）',
+    pushBody.indexOf('showChat();') !== -1
+    && pushBody.indexOf('showChat();') < pushBody.indexOf('renderPlayerCard(conv);'));
+check('渲染步骤各自 try/catch（单条数据异常不连累整个页面）',
+    pushBody.indexOf('try { renderChatStream(conv); } catch') !== -1
+    || pushBody.indexOf('renderChatStream(conv); } catch') !== -1);
+check('列表点击有兜底委托（某次渲染没绑上也能进会话，且不会重复处理）',
+    h5code.indexOf('bindListFallback') !== -1 && h5code.indexOf('_h5Handled') !== -1);
+let threwPush = null;
+try { sandbox.pushChat('不存在的会话'); } catch (e) { threwPush = e.message; }
+check('点一条"数据还没到"的会话不抛异常，并给出提示',
+    threwPush === null && String(els['toast'].innerText).indexOf('数据还没到') !== -1,
+    threwPush || String(els['toast'].innerText));
 
 console.log('\n[8] 布局与滚动（静态检查）');
 check('已移除 transform 滑动（iOS 文字发虚的元凶）', py.indexOf('transform: translateX') === -1);

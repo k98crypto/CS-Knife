@@ -756,6 +756,27 @@ async def main():
         check("/api/diag 提示「多开标签页会导致重复发送」",
               "多开" in str(dg_multi.get("warn") or ""), str(dg_multi.get("warn"))[:80])
         await ext8.close()
+
+        # ⑥ ★ V8.2：翻看**旧工单**（消息是几小时前的）-> AI 不插手、不推人工告警（Bark 的源头）
+        gidOld = "CLOSEFAIL-" + RUN
+        old_ts = int((time.time() - 3 * 3600) * 1000)          # 3 小时前的消息
+        await ext7.send_json({"event": "PLAYER_MESSAGE", "data": {
+            "groupID": gidOld, "name": "老工单丁", "playerInfo": "老工单丁 | UID:4",
+            "messages": [{"sender": "player", "text": "这是三小时前的老问题", "ts": old_ts}]}})
+        await asyncio.sleep(1.3)
+        _, e_oldc = await drain(ext7, 0.5, tries=8)
+        check("翻看旧工单：AI 不插手（不起草、不发送）",
+              not any(m.get("command") in ("SEND_REPLY", "FILL_DRAFT") for m in e_oldc),
+              str([m.get("command") for m in e_oldc][:6]))
+        _, m_oldc = await drain(mobile, 0.4, tries=6)
+        check("翻看旧工单：不产生「需要人工介入」告警（也就是不会再推 Bark 服务消息）",
+              not any(mm.get("type") == "HUMAN_ALERT" and str(mm.get("groupID")) == gidOld
+                      for mm in m_oldc),
+              str([(mm.get("type"), mm.get("groupID")) for mm in m_oldc][:4]))
+        check("翻看旧工单：也不弹「新消息」提示",
+              not any(mm.get("type") == "NEW_MESSAGE" and str(mm.get("groupID")) == gidOld
+                      for mm in m_oldc),
+              str([(mm.get("type"), mm.get("groupID")) for mm in m_oldc][:4]))
         await ext7.close()
 
         # ---------- 收尾：把 IM 状态与告警复位，避免测试给真实使用留下"离线/忙碌" ----------

@@ -8,6 +8,7 @@
   5) 表格里没答案 -> 发安抚话术 + 长报警 + 置顶 + 复制玩家信息&总结
 """
 import sys
+import time
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -36,12 +37,15 @@ def conv_with(msgs, **kw):
     return c
 
 
-def p(text, ts=1000):
-    return {"sender": "player", "text": text, "ts": ts}
+_NOW_MS = int(time.time() * 1000)          # ★ V8.2：AI 只对"新鲜消息"动手，测试要用当前时间戳
 
 
-def a(text, ts=2000):
-    return {"sender": "agent", "text": text, "ts": ts}
+def p(text, ts=None):
+    return {"sender": "player", "text": text, "ts": _NOW_MS if ts is None else ts}
+
+
+def a(text, ts=None):
+    return {"sender": "agent", "text": text, "ts": _NOW_MS if ts is None else ts}
 
 
 print("=== 自动回复节奏 / 人工介入 测试 ===\n")
@@ -69,10 +73,15 @@ check("玩家最后发言 -> 该回", B.should_auto_reply(conv_with([p("问题")
 check("客服最后发言 -> 不回（等玩家）",
       B.should_auto_reply(conv_with([p("问题"), a("答复")])) is False)
 check("这条玩家消息已经回过 -> 不回（防重复）",
-      B.should_auto_reply(conv_with([p("问题", 1000), a("答复", 2000)], last_reply_ts=1000)) is False)
+      B.should_auto_reply(conv_with([p("问题", _NOW_MS - 3000), a("答复", _NOW_MS - 2000)],
+                                    last_reply_ts=_NOW_MS - 3000)) is False)
 check("玩家又发了新的 -> 该回",
-      B.should_auto_reply(conv_with([p("问题", 1000), a("答复", 1500), p("补充", 2000)],
-                                    last_reply_ts=1000)) is True)
+      B.should_auto_reply(conv_with([p("问题", _NOW_MS - 3000), a("答复", _NOW_MS - 2500),
+                                     p("补充", _NOW_MS - 1000)],
+                                    last_reply_ts=_NOW_MS - 3000)) is True)
+# ★ V8.2：翻旧工单不许触发 AI（否则查不到答案还会推 Bark —— 客服投诉过）
+check("翻旧工单（消息是几小时前的）-> 不自动回（AI 不插手）",
+      B.should_auto_reply(conv_with([p("老问题", _NOW_MS - 3 * 3600 * 1000)])) is False)
 check("空会话 -> 不回", B.should_auto_reply(conv_with([])) is False)
 check("脏数据不炸", B.should_auto_reply({"msgs": "not-a-list"}) is False)
 
@@ -426,13 +435,30 @@ check("同一条会话同样内容 6 秒内重复发送会被忽略（防两条�
 check("出站审计：每次出站都留痕，并在 /api/diag 暴露 outbound_log",
       "def _log_outbound(" in SRC and '"outbound_log"' in SRC)
 check("通知收紧：只有「本来就认识的会话 + 玩家消息真的更新」才提示（翻旧会话不弹）",
-      "_was_known and new_ts and new_ts > _prev_last_pl" in SRC)
+      "_was_known and _prev_last_pl and new_ts > _prev_last_pl" in SRC)
 check("多工作台连接：只让「当前打开着目标会话」的那个探针执行（防同一条消息发两遍）",
       '_PROBE_CONNS.get(e) or {}).get("page_gid")' in SRC and "多开工作台标签页" in SRC)
 check("手机页面自己带版本号（页面 vX 胶囊），排查\"刷新没生效\"一眼可查",
       "const H5_VER" in SRC and "页面 v" in SRC)
 check("会话名归一化匹配（网页列表名 vs 聊天区名差空格/标点也能对上），点一下就能进会话",
       "function nameKey" in SRC and "lastKnownGids" in SRC)
+
+print("\n[10.12] V8.2 翻旧工单不打扰（AI 不插手 / 不推 Bark）+ 点卡片进会话加固")
+check("AI 只对「新鲜消息」动手（默认 10 分钟窗口，翻旧工单不触发）",
+      "AUTO_ACTIVE_WINDOW_MS" in SRC and "旧消息：AI 不插手，交给人工" in SRC)
+check("Bark 收紧：旧会话的「需要人工介入」只站内告警，不推 Bark",
+      "旧会话（消息不新鲜）：只做站内告警，不推 Bark" in SRC
+      and SRC.count('push_bark("🙋 需要人工介入"') == 1)
+check("新消息提示同时要求「时间戳真的更新 + 消息够新」",
+      "_prev_last_pl and new_ts > _prev_last_pl" in SRC
+      and "(now_ms - new_ts) <= AUTO_ACTIVE_WINDOW_MS" in SRC)
+check("探针给的时间戳会被沿用（翻旧工单不再被当成'刚刚'）",
+      '"ts": prev_ts.get(key) or _given or now_ms' in SRC)
+check("点卡片先切视图再渲染 + 每步 try/catch（点不进会话的加固）",
+      "pushChat" in SRC and "先切视图" in SRC and "renderChatStream(conv); } catch" in SRC)
+check("列表点击兜底委托（某次没绑上也能进会话）", "bindListFallback" in SRC and "_h5Handled" in SRC)
+check("「其它会话」默认收起成一行可点开的摘要（客服：很鸡肋）",
+      "data-toggle-other" in SRC and "showOtherConvs" in SRC)
 
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

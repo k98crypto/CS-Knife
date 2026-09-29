@@ -444,6 +444,9 @@ def should_auto_reply(conv) -> bool:
     """是否该由程序回复：
        ① 会话存在且最后一条是**玩家**发言（客服最后发言=等玩家，不抢话）
        ② 这条玩家消息还没被回复过（避免重复回、避免和人工回复打架）
+       ③ ★ V8.2：这条玩家消息得"新鲜"（默认 10 分钟内）—— 翻看旧工单**不许**触发 AI：
+          否则客服一打开老会话，过 1~3 分钟 AI 就对着几百年前的消息动手，
+          查不到答案还会推一条「🙋 需要人工介入」的 Bark（客服投诉过"选旧对话还收到服务消息"）。
     """
     if not isinstance(conv, dict):
         return False
@@ -453,7 +456,10 @@ def should_auto_reply(conv) -> bool:
     last = msgs[-1] if isinstance(msgs[-1], dict) else {}
     if last.get("sender") != "player":
         return False
-    return int(conv.get("last_reply_ts") or 0) < int(last.get("ts") or 0)
+    _ts = int(last.get("ts") or 0)
+    if _ts and (int(time.time() * 1000) - _ts) > AUTO_ACTIVE_WINDOW_MS:
+        return False                    # 旧消息：AI 不插手，交给人工
+    return int(conv.get("last_reply_ts") or 0) < _ts
 
 
 def cancel_pending_reply(gid: str):
@@ -514,6 +520,9 @@ _PONG_WAITERS = []                   # ★ V7.8：/api/probe_ping 等探针 PONG
 _OPEN_CONV_RESULT = {"ts": 0.0, "ok": None, "gid": "", "detail": "", "test": None}
 TEST_WS = set()                      # ★ V7.9：带 ?test=1 连上的"测试客户端"（测试脚本专用）
 _DEDUP_SENT = {}                     # ★ V8.0.2：重复发送防抖 {(gid, md5(text)): ts}
+# ★ V8.2：AI/通知只对"新鲜消息"动手的活跃窗口（默认 10 分钟）——
+#   翻看旧工单不该触发 AI、更不该推 Bark（客服投诉过"选旧对话还收到服务消息"）。
+AUTO_ACTIVE_WINDOW_MS = int(config.get("auto_active_window_sec", 600)) * 1000
 
 
 def ext_targets(origin=None):
@@ -902,10 +911,15 @@ async def send_hold_and_alert(group_id: str, conv: dict, history_str: str, reply
     conv["pinned"] = True
     conv["alert"] = True
     conv["alertTs"] = alert["ts"]
+    # ★ V8.2：只有"新鲜消息"才推 Bark —— 翻看旧工单（AI 本不该对旧消息动手）不再打扰手机锁屏
+    _lp = last_player_ts(conv)
+    if _lp and (int(time.time() * 1000) - _lp) <= AUTO_ACTIVE_WINDOW_MS:
+        push_bark("🙋 需要人工介入", f"{name}：表格里没有对应答案，已发安抚话术", group_id)
+    else:
+        print("[人工介入] 旧会话（消息不新鲜）：只做站内告警，不推 Bark")
     state["human_alerts"] = ([alert] + [a for a in state.get("human_alerts", []) if a.get("groupID") != group_id])[:20]
 
     print(f"[人工] 🙋 需要人工介入：{name}（{group_id}）· {summary[:60]}")
-    push_bark("🙋 需要人工介入", f"{name}：表格里没有对应答案，已发安抚话术", group_id)
     for m in list(active_clients["mobile"]):
         await safe_send(m, {"type": "HUMAN_ALERT", "groupID": group_id, "name": name,
                             "message": f"{name}：{alert['reason']}", "summary": summary,
@@ -1365,6 +1379,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     let pendingOpenName = '';
     let pendingOpenAt = 0;                 // 待打开的登记时间（25 秒后自动作废，避免乱开）
     let lastKnownGids = {};                // 上一次渲染时已知的会话（用于"兜底自动打开"）
+    let showOtherConvs = false;            // ★ V8.2："其它会话（不在网页列表里）"默认收起
     let audioCtx = null; let sirenInterval = null;
     let wsAttempts = 0;
     let imStatusRequested = false;      // 已向电脑端索要过真实状态（4 秒内不重复要）
@@ -2051,23 +2066,64 @@ HTML_CONTENT = """<!DOCTYPE html>
         });
       }
       const rest = keys.filter(g => !rendered[g]);
-      if (rest.length) {
-        parts.push('<div class="list-title" style="margin:8px 2px">' +
-                   (pageRows.length ? '其它会话（不在网页列表里）' : '会话') + '</div>');
-        rest.forEach(g => {
+      // ★ V8.2：客服说「其它会话」很鸡肋 —— 不再一股脑列出来：
+      //   只直接显示**需要留意**的（未读 / 需人工🙋 / 关单中⏳），其余收成一行可展开的摘要。
+      //   ⚠️ 只有"已经有网页列表"时才这么做；没有列表（旧探针/还没上报）就照旧全列出来。
+      function isImportant(g) {
+        const c = convs[g] || {};
+        const msgs = Array.isArray(c.msgs) ? c.msgs : [];
+        const last = msgs.length ? msgs[msgs.length - 1] : null;
+        return !!(c.alert || c.closing || (last && last.sender === 'player'));
+      }
+      const restImportant = pageRows.length ? rest.filter(isImportant) : rest;
+      const restHidden = pageRows.length ? rest.filter(g => !isImportant(g)) : [];
+      if (restImportant.length) {
+        parts.push('<div class="list-title" style="margin:8px 2px">其它会话（不在网页列表里 · 需要留意）</div>');
+        restImportant.forEach(g => {
           try { parts.push(convCardHtml(g)); }
           catch (e) { console.warn('[H5] 渲染会话卡片失败（已跳过）', g, e); }
         });
       }
+      if (restHidden.length) {
+        if (showOtherConvs) {
+          parts.push('<div class="list-title" style="margin:8px 2px">其它会话（不在网页列表里）（'
+                     + restHidden.length + '）</div>');
+          restHidden.forEach(g => {
+            try { parts.push(convCardHtml(g)); }
+            catch (e) { console.warn('[H5] 渲染会话卡片失败（已跳过）', g, e); }
+          });
+        } else {
+          parts.push('<div class="conv-card other-toggle" data-toggle-other="1">' +
+                     '<div class="avatar">⋯</div>' +
+                     '<div class="conv-body">' +
+                       '<div class="conv-top">' +
+                         '<div class="conv-name">其它会话（不在网页列表里） ' + restHidden.length + ' 条</div>' +
+                         '<div class="conv-time">点开</div>' +
+                       '</div>' +
+                       '<div class="conv-lastmsg">一般是被关单/已过滤的历史会话；点一下展开</div>' +
+                     '</div>' +
+                   '</div>');
+        }
+      }
       container.innerHTML = parts.join('');
 
       // 事件委托绑定（不再把数据拼进 onclick）
+      //   ★ V8.2：每个处理器都置 ev._h5Handled = true，避免与"启动时的兜底委托"重复处理
       container.querySelectorAll('.conv-card[data-gid]').forEach(el => {
-        el.addEventListener('click', () => pushChat(el.dataset.gid));
+        el.addEventListener('click', (ev) => { if (ev) ev._h5Handled = true; pushChat(el.dataset.gid); });
       });
       container.querySelectorAll('[data-openname]').forEach(el => {
-        el.addEventListener('click', () => openPageConv(el.dataset.openname || '',
-                                                        el.dataset.openlast || ''));
+        el.addEventListener('click', (ev) => {
+          if (ev) ev._h5Handled = true;
+          openPageConv(el.dataset.openname || '', el.dataset.openlast || '');
+        });
+      });
+      container.querySelectorAll('[data-toggle-other]').forEach(el => {
+        el.addEventListener('click', (ev) => {
+          if (ev) ev._h5Handled = true;
+          showOtherConvs = !showOtherConvs;
+          renderAll();
+        });
       });
       // ★ 点过的"未打开"会话，等它出现在中继会话列表里就自动打开聊天页（不用再点第二次）
       if (pendingOpenName) {
@@ -2124,19 +2180,27 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
     function pushChat(gid) {
       const conv = getConv(gid);
-      if (!conv) return;
+      if (!conv) {
+        // ★ V8.2：数据还没到也要给反馈，不能"点了没反应"
+        toast('这条会话的数据还没到，稍等一下再点…');
+        return;
+      }
       activeGroupId = gid;
       playerCardOpen = false;
-      document.getElementById('chat-player-name').innerText = conv.name || gid;
-      const meta = document.getElementById('chat-ticket-id');
-      if (meta) {
-        const t = String(gid);
-        meta.innerText = t.length > 16 ? t.slice(-16) : t;
-      }
-      renderPlayerCard(conv);
-      renderChatStream(conv);
+      try {
+        document.getElementById('chat-player-name').innerText = conv.name || gid;
+        const meta = document.getElementById('chat-ticket-id');
+        if (meta) {
+          const t = String(gid);
+          meta.innerText = t.length > 16 ? t.slice(-16) : t;
+        }
+      } catch (e) { console.warn('[H5] 设置会话标题失败', e); }
+      // ★ V8.2：**先切视图**再渲染 —— 以前渲染里任何一处抛异常，showChat 就永远不会执行，
+      //   表现就是"点了卡片没反应 / 进不去会话"（客服反馈过两次）。
       showChat();
-      renderAll();                 // 刷新列表（清掉该会话的未读点）
+      try { renderPlayerCard(conv); } catch (e) { console.warn('[H5] 玩家卡渲染失败', e); }
+      try { renderChatStream(conv); } catch (e) { console.warn('[H5] 聊天流渲染失败', e); }
+      try { renderAll(); } catch (e) { console.warn('[H5] 列表刷新失败', e); }   // 清掉该会话的未读点
     }
 
     function popChat() {
@@ -2207,6 +2271,29 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     // ==================== 启动 ====================
+    (function bindListFallback() {
+        // ★ V8.2：列表点击的**兜底委托** —— 万一某次渲染没把点击绑上（或将来改坏了绑定），
+        //   点卡片依然能进会话，不会再出现"点了没反应"。卡片上的直接绑定会先跑并置 ev._h5Handled，
+        //   所以这里只做兜底，不会重复处理（不会重复发 OPEN_CONV）。
+        const box = document.getElementById('conv-container');
+        if (!box || !box.addEventListener) return;
+        box.addEventListener('click', function (ev) {
+            if (!ev || ev._h5Handled) return;
+            const t = ev.target || {};
+            if (typeof t.closest !== 'function') return;
+            const card = t.closest('.conv-card[data-gid]');
+            if (card && card.dataset && card.dataset.gid) {
+                ev._h5Handled = true;
+                pushChat(card.dataset.gid);
+                return;
+            }
+            const row = t.closest('[data-openname]');
+            if (row && row.dataset) {
+                ev._h5Handled = true;
+                openPageConv(row.dataset.openname || '', row.dataset.openlast || '');
+            }
+        });
+    })();
     // 输入框：输入/聚焦时自动长高（有上限，超出滚动翻阅）；草稿被填进来时也会自动长高
     (function bindInputGrow() {
         const el = document.getElementById('chat-input');
@@ -3124,8 +3211,14 @@ async def ws_ext_handler(request):
                                 continue
                             sender = m.get("sender") if m.get("sender") in ("player", "agent") else "agent"
                             key = (sender, m.get("text"))
+                            # ★ V8.2：优先沿用已知时间戳；其次用探针给的时间戳（若有）；
+                            #   都没有才当"现在" —— 这样"翻看旧工单"才不会被误判成新消息。
+                            try:
+                                _given = int(m.get("ts") or 0)
+                            except Exception:
+                                _given = 0
                             cleaned.append({"sender": sender, "text": m.get("text"),
-                                            "ts": prev_ts.get(key) or now_ms})
+                                            "ts": prev_ts.get(key) or _given or now_ms})
                         c["msgs"] = cleaned
                     else:
                         c["msgs"] = []
@@ -3145,7 +3238,8 @@ async def ws_ext_handler(request):
                                 new_ts = int(pm.get("ts") or 0)
                                 new_txt = str(pm.get("text") or "")
                                 break
-                        if (_was_known and new_ts and new_ts > _prev_last_pl
+                        if (_was_known and _prev_last_pl and new_ts > _prev_last_pl
+                                and (now_ms - new_ts) <= AUTO_ACTIVE_WINDOW_MS
                                 and new_ts > int(_LAST_NOTIFIED.get(gid) or 0)):
                             _LAST_NOTIFIED[gid] = new_ts
                             if state.get("afk_mode"):
