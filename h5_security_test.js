@@ -338,6 +338,27 @@ check('视图切换 class + 行内 display 双保险（CSS 出问题也切得过
     && h5code.indexOf("lv.style.display = 'none'") !== -1);
 check('每次点击的提示都带页面版本（方便确认"手机到底刷没刷上"）',
     h5code.indexOf("（页面 v' + H5_VER + '）") !== -1);
+// ★ V8.4：会话里的按键必须是**按钮**（点一下立刻执行），不是开关
+check('会话里的按键是实心按钮（38px 高 + 11px 圆角，不是胶囊/开关样式）',
+    py.indexOf('.action-btn{flex:0 0 auto;height:38px') !== -1
+    && py.indexOf('border-radius:11px') !== -1);
+check('AI 回复并关单 = 主按钮样式（primary）',
+    py.indexOf('class="action-btn primary" id="btn-ai-close"') !== -1);
+check('AI 起草按钮写明「立刻起草」并解释了不会等 1~3 分钟',
+    py.indexOf('✨ AI 立刻起草') !== -1 && py.indexOf('不会等 1~3 分钟') !== -1);
+check('点「AI 立刻起草」立刻发 TRIGGER_F9 并给反馈（不是开关）',
+    h5code.indexOf("sendMsg({ action: 'TRIGGER_F9', groupID: activeGroupId })") !== -1
+    && h5code.indexOf('AI 正在起草，马上填入输入框') !== -1);
+check('功能"关闭"用 🔒 标记而不是变灰（变灰像开关被关掉）',
+    h5code.indexOf("' 🔒'") !== -1 || h5code.indexOf('🔒') !== -1);
+wsInst.readyState = 1;
+sandbox.pushChat('T-1');                     // 先进入一条会话（execCommand 需要 activeGroupId）
+FakeWebSocket.sent.length = 0;
+sandbox.execCommand('F9');
+check('点「AI 立刻起草」会真的把 TRIGGER_F9 发出去',
+    FakeWebSocket.sent.filter(m => m.action === 'TRIGGER_F9').length === 1,
+    JSON.stringify(FakeWebSocket.sent));
+sandbox.popChat();
 let threwPush = null;
 try { sandbox.pushChat('不存在的会话'); } catch (e) { threwPush = e.message; }
 check('点一条"数据还没到"的会话不抛异常，并给出提示',

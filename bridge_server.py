@@ -1230,16 +1230,22 @@ HTML_CONTENT = """<!DOCTYPE html>
     .back-btn:active{background:var(--card-2)}
     .chat-title{flex:1 1 auto;min-width:0;font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .chat-meta{flex:0 0 auto;font-size:10.5px;color:var(--text-3);font-variant-numeric:tabular-nums}
-    .action-bar{flex:0 0 auto;display:flex;gap:7px;padding:9px 12px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+    .action-bar{flex:0 0 auto;display:flex;gap:8px;padding:10px 12px;overflow-x:auto;-webkit-overflow-scrolling:touch;
                 border-bottom:1px solid var(--line-soft)}
     .action-bar::-webkit-scrollbar{display:none}
-    .action-btn{flex:0 0 auto;height:32px;padding:0 13px;border-radius:999px;font-size:12.5px;font-weight:650;
-                white-space:nowrap;background:var(--card);border:1px solid var(--line);color:var(--text)}
+    /* ★ V8.4：这些是**动作按钮**（点一下立刻执行），不是开关 —— 做成实心方块按钮，别像胶囊标签 */
+    .action-btn{flex:0 0 auto;height:38px;padding:0 15px;border-radius:11px;font-size:13px;font-weight:700;
+                white-space:nowrap;background:var(--card-2);border:1px solid var(--line);color:var(--text);
+                box-shadow:0 1px 0 rgba(255,255,255,.05) inset}
+    .action-btn:active{transform:translateY(1px)}
+    .action-btn.ai{color:#EAF6FF;border-color:rgba(124,196,255,.45);
+                   background:linear-gradient(135deg, rgba(78,201,176,.30), rgba(124,196,255,.24))}
+    .action-btn.primary{color:#04231D;border-color:rgba(78,201,176,.65);font-weight:800;
+                        background:linear-gradient(135deg,#4EC9B0,#7CC4FF)}
+    .action-btn.locked{opacity:.6}
     .feature-hint{flex:0 0 auto;padding:0 12px 6px;font-size:11.5px;color:#E5C07B}
     .feature-hint:empty{display:none}
     .action-btn:active{background:var(--card-2)}
-    .action-btn.ai{color:#D3ECFF;border-color:rgba(124,196,255,.34);
-                   background:linear-gradient(135deg, rgba(78,201,176,.20), rgba(124,196,255,.16))}
     .chat-stream{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
                  padding:14px 12px 10px;display:flex;flex-direction:column;gap:10px}
     .player-card{flex:0 0 auto;margin:8px 12px 0;padding:10px 12px;border-radius:14px;background:var(--card);
@@ -1353,9 +1359,9 @@ HTML_CONTENT = """<!DOCTYPE html>
           <div class="chat-title" id="chat-player-name">玩家</div>
           <div class="chat-meta" id="chat-ticket-id"></div>
         </div>
-        <div class="action-bar">
-          <button class="action-btn ai" id="btn-ai-close" onclick="execCommand('AI_CLOSE')">🤖 AI 回复并关单</button>
-          <button class="action-btn ai" id="btn-f9" onclick="execCommand('F9')">✨ AI 起草</button>
+        <div class="action-bar" id="action-bar">
+          <button class="action-btn primary" id="btn-ai-close" onclick="execCommand('AI_CLOSE')">🤖 AI 回复并关单</button>
+          <button class="action-btn ai" id="btn-f9" onclick="execCommand('F9')">✨ AI 立刻起草</button>
           <button class="action-btn" onclick="execCommand('HANGUP')">⏸ 挂起</button>
           <button class="action-btn" onclick="execCommand('RESUME')">▶ 恢复</button>
           <button class="action-btn" onclick="execCommand('CLOSE')">✅ 关单</button>
@@ -1374,7 +1380,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
     // ★ V8.0.2：手机页面版本号（顶栏胶囊显示）——"刷新了没生效"时第一眼就能确认
-    const H5_VER = '8.3';
+    const H5_VER = '8.4';
     // ★ V8.0.1：点过"未打开"的会话后，等它出现在中继会话列表里就自动打开聊天页（不用点第二次）
     let pendingOpenName = '';
     let pendingOpenAt = 0;                 // 待打开的登记时间（25 秒后自动作废，避免乱开）
@@ -1685,17 +1691,27 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
     function renderFeatureButtons() {
         const aiCloseOn = featureOn('ai_close');
+        // ★ V8.4：这些是**按钮**（点一下立刻执行），所以"关闭"用 🔒 + 说明文字表达，
+        //   不再用 opacity 变灰（那看着像开关被关掉）。
         const b1 = document.getElementById('btn-ai-close');
-        if (b1 && b1.style) {
-            b1.style.opacity = aiCloseOn ? '' : '0.45';
-            b1.title = aiCloseOn ? '' : '已在设置里关闭（enable_ai_close=false）';
+        if (b1) {
+            b1.innerText = '🤖 AI 回复并关单' + (aiCloseOn ? '' : ' 🔒');
+            if (b1.classList) aiCloseOn ? b1.classList.remove('locked') : b1.classList.add('locked');
+            b1.title = aiCloseOn ? '点击后 AI 立刻选分类、写结束语并关单'
+                                 : '已在设置里关闭（enable_ai_close=false）';
+        }
+        const b2 = document.getElementById('btn-f9');
+        if (b2) {
+            b2.innerText = '✨ AI 立刻起草';
+            b2.title = '点一下立刻让 AI 起草（不会等 1~3 分钟；那 1~3 分钟只用于"自动起草"）';
         }
         const d1 = document.getElementById('feature-hint');
         if (d1) {
             const off = [];
             if (!aiCloseOn) off.push('AI 回复并关单');
-            if (!featureOn('auto_draft')) off.push('AI 自动起草');
-            d1.innerText = off.length ? ('⛔ 已关闭：' + off.join('、') + '（改 config.json 后重启中继）') : '';
+            const extra = featureOn('auto_draft') ? '' :
+                '（「AI 自动起草」已关：新消息不会自动起草，但点「✨ AI 立刻起草」仍会立即起草）';
+            d1.innerText = (off.length ? ('⛔ 已关闭：' + off.join('、') + '（改 config.json 后重启中继）') : '') + extra;
         }
     }
 
@@ -1948,6 +1964,8 @@ HTML_CONTENT = """<!DOCTYPE html>
             if (input) input.value = payload.content || '';
             autoGrowInput();                       // 草稿可能很长：自动长高到看得全（有上限，超出滚动）
             if (input && input.focus) { try { input.focus(); } catch (e) {} }
+            // ★ V8.4：起草是"动作"，必须给明确反馈（客服点了才知道生效）
+            if (payload.content) toast('✅ AI 草稿已填入输入框（可修改后点 ↑ 发送 · 页面 v' + H5_VER + '）');
         }
         else if (payload.type === 'AI_STATUS') {
             if (payload.message) toast(payload.message);   // 关单结果 / AI 状态提示
@@ -2254,26 +2272,37 @@ HTML_CONTENT = """<!DOCTYPE html>
               toast('连接已断开，正在重连');
               return;
           }
-          toast('AI 正在生成结束语…');
+          toast('AI 正在生成结束语…（页面 v' + H5_VER + '）');
           return;
       }
       if (cmd === 'F9') {
-          sendMsg({ action: 'TRIGGER_F9', groupID: activeGroupId });
+          // ★ V8.4：这是**动作按钮** —— 点一下立刻起草（force=True，不走 1~3 分钟的自动节奏）
+          if (!sendMsg({ action: 'TRIGGER_F9', groupID: activeGroupId })) {
+              toast('连接已断开，正在重连');
+              return;
+          }
+          toast('AI 正在起草，马上填入输入框…（页面 v' + H5_VER + '）');
+          return;
       } else if (cmd === 'HANGUP') {
           sendMsg({ action: 'EXT_COMMAND', command: 'ACTION_HANGUP', groupID: activeGroupId });
-          toast('已请求电脑端挂起，结果会再提示…');
+          toast('已请求电脑端挂起，结果会再提示…（页面 v' + H5_VER + '）');
       } else if (cmd === 'RESUME') {
           sendMsg({ action: 'EXT_COMMAND', command: 'ACTION_RESUME', groupID: activeGroupId });
-          toast('已请求电脑端恢复/接入，结果会再提示…');
+          toast('已请求电脑端恢复/接入，结果会再提示…（页面 v' + H5_VER + '）');
       } else {
           const input = document.getElementById('chat-input');
           const text = input && input.value ? input.value.trim() : '';
           if (cmd === 'CLOSE') {
               sendMsg({ action: 'EXT_COMMAND', command: 'ACTION_REPLY_CLOSE', groupID: activeGroupId, content: text, category: "其他" });
+              toast('已请求回复并关单…（页面 v' + H5_VER + '）');
           } else if (cmd === 'SEND' && text) {
               const c = getConv(activeGroupId);
-              sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text,
-                        name: (c && c.name && String(c.name) !== String(activeGroupId)) ? c.name : '' });
+              if (!sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text,
+                             name: (c && c.name && String(c.name) !== String(activeGroupId)) ? c.name : '' })) {
+                  toast('连接已断开，正在重连');
+                  return;
+              }
+              toast('已发送（页面 v' + H5_VER + '）');
           }
           if (input) input.value = '';
           autoGrowInput();                       // 清空后把高度收回去

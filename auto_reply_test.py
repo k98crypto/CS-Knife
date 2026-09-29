@@ -468,5 +468,15 @@ check("Bark 只在「冒出一条全新会话」时推；列表里某行内容�
 check("自己刚回的内容不会反过来提醒自己（按会话名比对最后一条客服发言）",
       "_own_last" in SRC and "别把自己刚回的" in SRC)
 
+print("\n[10.14] V8.4 按钮即动作：「AI 立刻起草」点一下立刻起草（不走 1~3 分钟节奏）")
+check("TRIGGER_F9 走 force=True（立刻执行，不等延迟）",
+      'handle_ai_automation(pkt.get("groupID"), source="phone", force=True)' in SRC)
+check("force 路径里没有排延迟队列（延迟只属于自动起草）",
+      'schedule_auto_reply' not in SRC.split('elif act == "TRIGGER_F9":')[1].split('elif act ==')[0])
+check("半自动/手动点按钮 -> 草稿推到网页与手机输入框（FILL_DRAFT）",
+      '{"type": "FILL_DRAFT", "content": body}' in SRC)
+check("草稿不覆盖客服正在写的字（noOverwrite）",
+      '"noOverwrite": True' in SRC)
+
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)
