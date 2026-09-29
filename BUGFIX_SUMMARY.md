@@ -1159,7 +1159,7 @@ diag 30 · hud_layout 39 · rules_sync 18 · probe_smoke 79 · h5_security 84
 | 删除 | `build/`、`dist/`、`__pycache__/` | 打包/编译中间产物，可重建 |
 | 移出仓库 | `launcher.spec` | PyInstaller 自动生成，`一键打包清理.bat` 本来就会删它 |
 | 移入 `_internal/` | 5 份内部文档（规章同步/ Git / 打包说明） | 根目录清爽，内容仍在本机（如需彻底删除可随时删） |
-| 改名 | `启动服务.vbs` → **`启动服务.vbs`** | ① 去掉品牌词（文件名也算泄漏面）；② 内容升级为**一次启动两个服务**（中继带窗口 + 悬浮窗静默） |
+| 改名 | 旧的启动 vbs（**文件名里带品牌词**）→ **`启动服务.vbs`** | ① 去掉品牌词（文件名也算泄漏面）；② 内容升级为**一次启动两个服务**（中继带窗口 + 悬浮窗静默） |
 | 保留 | `launcher.exe`、`launcher.bat`、`Ironman.ico/jpg`、`token_leak_test.py` | 都是仍在用的本机工具/测试 |
 
 ### 3) 启动方式写入文档（README 4.1 改成四种方式）
