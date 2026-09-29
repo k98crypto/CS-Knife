@@ -18,7 +18,7 @@ except Exception:
     pass
 
 BASE = "http://127.0.0.1:8765"
-TEST_VER = "7.8"
+TEST_VER = "7.9"
 TEST_PAGE = "https://ticket.example.com/imChat/workstation"
 
 passed = 0
@@ -116,7 +116,7 @@ async def main():
 
         # ---------- 4. 探针握手 -> 后端可查 ----------
         print("\n[4] 探针握手 PROBE_HELLO -> /api/diag 可查版本")
-        ext = await s.ws_connect(BASE + "/ws/extension")
+        ext = await s.ws_connect(BASE + "/ws/extension?test=1")
         await ext.send_json({"event": "PROBE_HELLO",
                              "data": {"version": TEST_VER, "page": TEST_PAGE, "ua": "diag_test"}})
         await asyncio.sleep(0.5)
@@ -135,7 +135,7 @@ async def main():
 
         # ---------- 5. 手机端快照也带探针版本 ----------
         print("\n[5] 手机端 FULL_SYNC 带 probe_version")
-        mobile = await s.ws_connect(BASE + "/ws/mobile")
+        mobile = await s.ws_connect(BASE + "/ws/mobile?test=1")
         snap = await drain(mobile)
         check("快照可拿到", isinstance(snap, dict))
         check("快照含 probe_version", (snap or {}).get("probe_version") == TEST_VER,

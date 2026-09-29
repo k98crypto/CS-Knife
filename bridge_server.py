@@ -207,7 +207,8 @@ async def _reassert_im_status(target_code):
     state["im_status_tries"] = tries
     state["im_last_request"] = {"status": int(target_code), "status_text": _im_txt(target_code),
                                 "source": f"自动重试 #{tries}", "ts": int(time.time())}
-    for ext in list(active_clients["extension"]):
+    # ★ V7.9：若这个"人工意图"是测试客户端设的，重试也只打到测试探针（绝不点真实工单）
+    for ext in ext_targets("test" if state.get("im_intent_test") else None):
         await safe_send(ext, {"command": "CHANGE_STATUS", "status": int(target_code)})
     want = _im_txt(target_code)
     if tries <= 3:
@@ -500,6 +501,24 @@ _LAST_ACTIVE = {"gid": None}
 # ★ 分类候选的"按需等待者"（ensure_category_options 用）
 _CATEGORY_WAITERS = []
 _PONG_WAITERS = []                   # ★ V7.8：/api/probe_ping 等探针 PONG 的地方（诊断用）
+TEST_WS = set()                      # ★ V7.9：带 ?test=1 连上的"测试客户端"（测试脚本专用）
+
+
+def ext_targets(origin=None):
+    """给电脑端探针下发"会在页面上动手"的指令时，该发给哪些连接。
+
+    ★ 严格隔离（客服投诉过：测试把指令发到了他的真实工作台页面）：
+      - 来自**测试客户端**（连接时带 `?test=1`）的指令，**只发给同样是测试连接的客户端**；
+      - 真实手机端的指令照旧发给所有探针连接。
+      这样"跑测试"永远不可能点到客服的真实工单（哪怕测试里写了挂起/关单/发送）。
+    """
+    all_ext = list(active_clients["extension"])
+    try:
+        if origin is not None and (origin in TEST_WS or origin == "test"):
+            return [w for w in all_ext if w in TEST_WS]
+    except Exception:
+        pass
+    return all_ext
 # ★ 玩家新消息"已提示到手机"的水位线：gid -> 最新已提示的玩家消息 ts
 #   用途：只对**新增**的玩家消息提示一次（避免 FULL_SYNC 反复刷新时重复响铃）
 _LAST_NOTIFIED = {}
@@ -511,7 +530,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "7.8"
+SERVER_VER = "7.9"
 
 
 def _probe_refresh():
@@ -570,11 +589,13 @@ def safe_outbound(text, where=""):
     return clean, left
 
 
-async def send_to_player(payload, where=""):
+async def send_to_player(payload, where="", origin=None):
     """把指令发给电脑端探针去执行前，先把"玩家可见文本"过一遍安全闸。
 
     payload 形如 {"command": "SEND_REPLY"|"FILL_DRAFT"|"ACTION_REPLY_CLOSE", "content": "..."}
     返回 True=已发出；False=清洗后为空（调用方需兜底，比如改发安抚话术）。
+
+    origin：指令的来源连接。★ V7.9 —— 若来源是"测试客户端"，只发给测试探针（绝不点真实工单）。
     """
     pkt = dict(payload or {})
     if pkt.get("content"):
@@ -583,7 +604,7 @@ async def send_to_player(payload, where=""):
             print(f"[安全闸] 内容清洗后为空，已拦截（{where}）")
             return False
         pkt["content"] = clean
-    for ext in list(active_clients["extension"]):
+    for ext in ext_targets(origin):
         await safe_send(ext, pkt)
     return True
 
@@ -708,6 +729,16 @@ async def send_hold_and_alert(group_id: str, conv: dict, history_str: str, reply
     return alert
 
 
+# ==================== ★ V7.9 测试隔离 ====================
+def _auto_origin():
+    """自动起草/自动回复的指令来源标记。
+
+    若最近这批"玩家消息"是测试脚本（?test=1）发来的，就返回 "test" —— 后续指令只会
+    发给测试探针，绝不填/发客服的真实工单（客服投诉过测试把他的工单点了）。
+    """
+    return "test" if state.get("automation_origin_test") else None
+
+
 async def handle_ai_automation(group_id: str, source: str = "", force: bool = False):
     conv = state["companies"]["main"]["conversations"].get(group_id)
     if not conv:
@@ -776,13 +807,14 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
                 await send_to_player({"command": "ACTION_REPLY_CLOSE", "category": "其他",
                                       "categoryPath": (config.get("close_category_path") or ["一级分类", "二级分类"]),
                                       "defaultCategory": config.get("close_category_default", "其他"),
-                                      "content": body, "groupID": group_id}, "超时关单")
+                                      "content": body, "groupID": group_id}, "超时关单", origin=_auto_origin())
             else:
                 await send_to_player({"command": "SEND_REPLY", "content": body,
-                                      "groupID": group_id}, "AFK 自动回复")
+                                      "groupID": group_id}, "AFK 自动回复", origin=_auto_origin())
         else:
             # 半自动模式：草稿推到网页与手机输入框（同样已过安全闸）
-            await send_to_player({"command": "FILL_DRAFT", "content": body, "category": "其他"}, "半自动草稿")
+            await send_to_player({"command": "FILL_DRAFT", "content": body, "category": "其他"},
+                                 "半自动草稿", origin=_auto_origin())
             for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": body})
 
 
@@ -2247,6 +2279,9 @@ async def ws_ext_handler(request):
     # heartbeat=30：定期 ping，及时发现 iOS 退后台/网络抖动造成的死连接
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
+    # ★ V7.9：测试脚本用 ?test=1 连上；这类连接只会收到"来自测试客户端"的指令（见 ext_targets）
+    if request.query.get("test") == "1":
+        TEST_WS.add(ws)
     active_clients["extension"].add(ws)
     _PROBE_CONNS.setdefault(ws, {})
     state["extension_online"] = True
@@ -2457,6 +2492,8 @@ async def ws_ext_handler(request):
                     
                 elif ev == "PLAYER_MESSAGE":
                     payload = pkt.get("data", {})
+                    # ★ V7.9：记下"这批玩家消息是不是测试脚本发来的"，后续自动起草/回复只打到测试探针
+                    state["automation_origin_test"] = (ws in TEST_WS)
                     gid = payload.get("groupID")
                     
                     target = state["companies"]["main"]
@@ -2644,11 +2681,12 @@ async def _close_confirm_watchdog(gid: str):
         await safe_send(m, {"type": "FULL_SYNC", "data": state})
 
 
-async def handle_ai_close(group_id: str):
+async def handle_ai_close(group_id: str, origin=None):
     """手机端「AI 回复并关单」。
 
     流程：AI 选问题分类 + 生成结束语 -> 通知探针执行「回复并关单」-> 会话从列表移除。
     任一步失败都会明确返回错误，绝不误删会话。
+    ★ V7.9：origin 为"测试客户端"时只发给测试探针（测试绝不点客服的真实工单）。
     """
     conv = state["companies"]["main"]["conversations"].get(group_id)
     if not conv:
@@ -2669,8 +2707,8 @@ async def handle_ai_close(group_id: str):
     content, left = safe_outbound(content, "关单结束语")
     if not content.strip():
         return False, "结束语清洗后为空（只含内部提示），已取消关单"
-    if not active_clients["extension"]:
-        return False, "电脑端探针未连接，无法关单"
+    if not ext_targets(origin):
+        return False, "电脑端探针未连接（或测试客户端没有测试探针），无法关单"
 
     path = config.get("close_category_path") or ["一级分类", "二级分类"]
     payload = {
@@ -2682,7 +2720,7 @@ async def handle_ai_close(group_id: str):
         "defaultCategory": config.get("close_category_default", "其他"),
         "groupID": group_id,
     }
-    await send_to_player(payload, "关单结束语")
+    await send_to_player(payload, "关单结束语", origin=origin)
 
     # ★ 关键改动：不再立刻移除会话 —— 先标记"关单中"，等探针回执确认成功后才移除。
     #   （旧实现删早了：页面点失败会导致"卡片消失但工单还挂着"）
@@ -2696,9 +2734,9 @@ async def handle_ai_close(group_id: str):
     return True, category
 
 
-async def _ai_close_and_notify(gid: str):
+async def _ai_close_and_notify(gid: str, origin=None):
     try:
-        ok, info = await handle_ai_close(gid)
+        ok, info = await handle_ai_close(gid, origin=origin)
     except Exception as e:
         ok, info = False, f"关单异常: {e}"
     msg = (f"结束语已下发，等待页面执行「回复并关单」（分类：{info}）" if ok else str(info))
@@ -2711,6 +2749,9 @@ async def ws_mobile_handler(request):
     # heartbeat=30：手机退后台/锁屏时能尽快探活，配合前端重连即补拉快照
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
+    # ★ V7.9：测试脚本用 ?test=1 连上；这类连接发的指令只会发给"测试探针"，绝不碰真实工作台页面
+    if request.query.get("test") == "1":
+        TEST_WS.add(ws)
     active_clients["mobile"].add(ws)
     await ws.send_json({"type": "FULL_SYNC", "data": state})
     # ★ V7.3：手机端一连上就请电脑端探针把"网页上的真实 IM 状态"复核一次。
@@ -2738,7 +2779,7 @@ async def ws_mobile_handler(request):
                 #   现在改为：先问电脑端探针，拿到真实值再显示（没核实前手机端显示"正在获取…"）。
                 if act == "REQUEST_IM_STATUS":
                     await safe_send(ws, {"type": "FULL_SYNC", "data": state})
-                    for ext in list(active_clients["extension"]):
+                    for ext in ext_targets(ws):                     # ★ V7.9：测试客户端不会打扰真实探针
                         await safe_send(ext, {"command": "REQUEST_IM_STATUS"})
                     if not active_clients["extension"]:
                         print("[状态] 手机端请求复核状态，但电脑端探针未连接")
@@ -2757,8 +2798,9 @@ async def ws_mobile_handler(request):
                     apply_im_status(st, manual=(st in (2, 3)), source="手机/小窗手动")
                     state["im_last_request"] = {"status": st, "status_text": _im_txt(st),
                                                 "source": "手机/小窗手动", "ts": int(time.time())}
-                    _conns = list(active_clients["extension"])
+                    _conns = ext_targets(ws)                        # ★ V7.9：测试客户端只打到测试探针
                     _sent = 0
+                    state["im_intent_test"] = (ws in TEST_WS)       # 给"自动重试"用的隔离标记
                     for ext in _conns:
                         if await safe_send(ext, {"command": "CHANGE_STATUS", "status": st}):
                             _sent += 1
@@ -2787,7 +2829,7 @@ async def ws_mobile_handler(request):
 
                 # 🧭 请探针把"状态下拉的可见选项"回报过来（实机校准用，只读诊断）
                 if act == "DUMP_STATUS":
-                    _dconns = list(active_clients["extension"])
+                    _dconns = ext_targets(ws)                       # ★ V7.9：测试客户端只打到测试探针
                     _dsent = 0
                     for ext in _dconns:
                         if await safe_send(ext, {"command": "DUMP_STATUS_MENU"}):
@@ -2811,7 +2853,12 @@ async def ws_mobile_handler(request):
                         continue
                     gid = pkt.get("groupID")
                     if gid:
-                        asyncio.create_task(_ai_close_and_notify(gid))
+                        # ★ V7.9：测试客户端不许真的关单（AI_CLOSE 是后台任务，得单独拦）
+                        if ws in TEST_WS and not ext_targets(ws):
+                            await safe_send(ws, {"type": "AI_STATUS", "status": "ok",
+                                                 "message": "（测试客户端：已跳过真实 AI 关单，未触碰工作台）"})
+                            continue
+                        asyncio.create_task(_ai_close_and_notify(gid, origin=ws))
                     continue
 
                 if act == "SET_AUTO_DELAY":
@@ -2862,10 +2909,15 @@ async def ws_mobile_handler(request):
                                             "message": ("回复模式：" + label) if ok else note})
                 elif act == "SILENCE_ALARM":
                     state["alarm_status"] = False
-                    for ext in list(active_clients["extension"]): await safe_send(ext, {"command": "SILENCE_ALARM"})
+                    for ext in ext_targets(ws): await safe_send(ext, {"command": "SILENCE_ALARM"})
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                 elif act == "TRIGGER_F9":
-                    asyncio.create_task(handle_ai_automation(pkt.get("groupID"), source="phone", force=True))
+                    # ★ V7.9：测试客户端不许真的去草稿/回复（会打到客服的真实工单）
+                    if ws in TEST_WS and not ext_targets(ws):
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "ok",
+                                             "message": "（测试客户端：已跳过真实 AI 起草，未触碰工作台）"})
+                    else:
+                        asyncio.create_task(handle_ai_automation(pkt.get("groupID"), source="phone", force=True))
                 elif act == "EXT_COMMAND":
                     # ★ 安全闸：挂起/恢复等动作可能带 content（如手机端"关单"会把输入框内容一起发），
                     #   凡是"要进玩家对话框"的文本都必须清洗
@@ -2888,7 +2940,7 @@ async def ws_mobile_handler(request):
                             asyncio.create_task(_close_confirm_watchdog(_cgid))
                             for m in list(active_clients["mobile"]):
                                 await safe_send(m, {"type": "FULL_SYNC", "data": state})
-                    for ext in list(active_clients["extension"]):
+                    for ext in ext_targets(ws):                 # ★ V7.9：测试客户端只打到测试探针
                         await safe_send(ext, fwd)
                 elif act == "SEND_REPLY":
                     gid = pkt.get("groupID")
@@ -2912,7 +2964,7 @@ async def ws_mobile_handler(request):
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 修复 BUG-011：过滤 action 字段，仅转发必要字段
                     await send_to_player({"command": "SEND_REPLY", "groupID": gid,
-                                          "content": text}, "手机端代发")
+                                          "content": text}, "手机端代发", origin=ws)
     finally:
         active_clients["mobile"].discard(ws)
     return ws

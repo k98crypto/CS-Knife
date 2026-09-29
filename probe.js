@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V7.8 实机靶点校准 + 指令自检版)
+// @name         智能工单探针 (V7.9 hover 触发修正 + 指令自检版)
 // @namespace    http://tampermonkey.net/
-// @version      7.8
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）
+// @version      7.9
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "7.8";
+    const PROBE_VERSION = "7.9";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -474,6 +474,15 @@
         try { if (typeof Event === 'function') { el.dispatchEvent(new Event('click', { bubbles: true })); return true; } } catch (e) {}
         return false;
     }
+    // ★ V7.9（线上实机数据修正）：Element 的 el-dropdown / el-tooltip 默认是 **hover 触发** ——
+    //   客服工作台的状态胶囊实测为 `span.status-trigger.is-im-online.el-tooltip__trigger`，
+    //   只派发 click 永远不会打开菜单（这正是"点了 3 次都找不到选项"的真因）。补一套 hover 事件。
+    function fireHover(el) {
+        ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', 'mousemove'].forEach(t => {
+            try { if (typeof Event === 'function') el.dispatchEvent(new Event(t, { bubbles: true })); } catch (e) {}
+        });
+    }
+
 
     const Operator = {
         // 回复输入框（★ V7.7 实机校准：本工作台的回复框是 Quill 富文本 div.ql-editor[contenteditable]）
@@ -851,6 +860,36 @@
             } catch (e) {}
             return out;
         },
+        // ★ V7.9（实机数据修正）：收集"可能的状态触发器"，**越靠里的越优先**
+        //   线上实测：`span.status-label-text`（叶子）→ `span.status-trigger.is-im-online.el-tooltip__trigger`
+        //   → `div.el-dropdown.status-dropdown`（外层包装）。Element 的处理器挂在内层，
+        //   点外层 div 是**点不开**的（这就是"点了 3 次都找不到选项"的真因）。
+        //   点最里层靠事件冒泡一定能触达真正的触发器；不行再换下一个候选。
+        statusTriggers: function() {
+            const out = [];
+            try {
+                Array.from(document.querySelectorAll('div, span, button, a')).forEach(el => {
+                    if (!statusTextOf(el)) return;
+                    if (isMenuOption(el)) return;
+                    if (!isVisibleEl(el)) return;
+                    const t = normText(el.innerText);
+                    if (!t || t.length > 12) return;                 // 只认短标签（大容器排除）
+                    let depth = 0, n = el;
+                    while (n && n.parentElement) { depth++; n = n.parentElement; }
+                    out.push({ el: el, depth: depth, cls: elClassOf(el), tag: el.tagName,
+                               text: t, isTriggerClass: /status-trigger|el-tooltip__trigger|el-dropdown/.test(elClassOf(el)) });
+                });
+            } catch (e) {}
+            out.sort((a, b) => b.depth - a.depth);                    // 深（叶子）优先
+            return out;
+        },
+        // 下拉面板有没有真的打开（Element 的下拉/popper 容器），用于如实回报"是没打开还是选项不匹配"
+        panelAppeared: function() {
+            const sel = '.el-dropdown-menu, .el-popper, .el-select-dropdown, .el-cascader__dropdown';
+            let nodes = [];
+            try { nodes = Array.from(document.querySelectorAll(sel)); } catch (e) { return false; }
+            return nodes.some(n => isVisibleEl(n));
+        },
         // 收集"可见的状态菜单项"：① 已知实机靶点（Element 下拉/级联/原生 li）
         //   ② V7.8 兜底：点开下拉后"新出现"的状态文本节点（exclude = 点开前已有的元素）
         statusMenuItems: function(exclude) {
@@ -890,19 +929,19 @@
             let attempt = 0;
             const doAttempt = () => {
                 attempt++;
-                // 触发下拉：只点"看得见"的状态显示区（菜单项 / 隐藏节点都不算）
-                const statusTrigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
-                    const t = statusTextOf(el);
-                    if (!t) return false;
-                    if (isMenuOption(el)) return false;
-                    return isVisibleEl(el);
-                });
+                // ★ V7.9（线上实机数据修正）：候选触发器按"由内到外"排，逐次尝试。
+                //   实测：状态胶囊最里层是 span.status-label-text，其父是
+                //   span.status-trigger.is-im-online.el-tooltip__trigger，最外层是 div.el-dropdown.status-dropdown。
+                //   旧版取的是 DOM 顺序里第一个（= 最外层 div）→ 点不开 → 永远找不到选项。
+                const cands = Operator.statusTriggers();
+                const statusTrigger = cands.length ? cands[(attempt - 1) % cands.length].el : null;
                 if (!statusTrigger) {
                     reportActionResult("CHANGE_STATUS", false,
                         "未找到「可见」的 IM 状态显示区（页面结构可能变了），状态没切");
                     return;
                 }
                 const beforeNodes = Operator.visibleStatusNodes().map(o => o.el);   // ★ V7.8：点开前已有的元素（差集用）
+                fireHover(statusTrigger);        // ★ V7.9：Element 的下拉是 hover 触发，必须先派发 hover
                 fireClick(statusTrigger);
 
                 Operator.waitForMenu(function(items) {
@@ -911,10 +950,11 @@
                         || items.find(o => o.text.indexOf(wantTxt) !== -1);
                     if (!target) {
                         const cand = items.map(o => o.tag + ':' + o.text).filter(Boolean);
-                        if (attempt < 3) { setTimeout(doAttempt, 400); return; }   // 菜单可能还没渲染完，再试一次
+                        if (attempt < 3) { setTimeout(doAttempt, 400); return; }   // 菜单可能还没渲染完，再试
                         reportActionResult("CHANGE_STATUS", false,
-                            "点了 " + attempt + " 次都没找到可见的状态选项「" + targetStatus + "」；页面候选："
-                            + (cand.join("/") || "（下拉里没有任何可见选项）")
+                            "点了 " + attempt + " 次都没找到可见的状态选项「" + targetStatus + "」；下拉"
+                            + (Operator.panelAppeared() ? "打开了但选项对不上" : "没打开")
+                            + "；页面候选：" + (cand.join("/") || "（无）")
                             + "；完整清单见页面控制台 __probe.dumpStatus()");
                         Operator.dumpStatusMenu();      // ★ V7.7：失败自动回报"真实可见选项"，让中继能据此校准
                         return;
@@ -940,10 +980,6 @@
         },
         // 排障/实机校准：把"状态显示区 + 下拉全部可见选项"原样回报（tag/class/文本），绝不靠猜标签
         dumpStatusMenu: function() {
-            const trigger = Array.from(document.querySelectorAll('div, span, button')).find(el => {
-                const t = statusTextOf(el);
-                return !!t && !isMenuOption(el) && isVisibleEl(el);
-            });
             // ① 页面上"文字像状态"的全部可见节点（有它说明状态区在，且能看出真实写法与类名）
             const nodes = [];
             try {
@@ -955,20 +991,35 @@
                                  isMenu: isMenuOption(el) });
                 });
             } catch (e) {}
-            const triggerInfo = trigger
-                ? { clicked: true, tag: trigger.tagName, cls: elClassOf(trigger).slice(0, 60),
-                    text: normText(trigger.innerText) }
-                : { clicked: false };
             const beforeNodes = Operator.visibleStatusNodes().map(o => o.el);   // ★ V7.8：点开前已有的（差集用）
             const beforeInfo = Operator.visibleStatusNodes().map(o => o.tag + ':' + o.cls);
-            if (trigger) fireClick(trigger);
+            // ★ V7.9：用"由内到外"的候选触发器（实测最里层才挂 hover/click 处理器）
+            const cands = Operator.statusTriggers();
+            const trigger = cands.length ? cands[0].el : null;
+            const triggerInfo = trigger
+                ? { clicked: true, tag: trigger.tagName, cls: elClassOf(trigger).slice(0, 60),
+                    text: normText(trigger.innerText), candidates: cands.length,
+                    all: cands.map(o => o.tag + ':' + o.cls.slice(0, 50)) }
+                : { clicked: false, candidates: 0 };
+            if (trigger) { fireHover(trigger); fireClick(trigger); }        // ★ V7.9：hover + click 都派发
             Operator.waitForMenu(function(items) {
                 const rows = items.map(o => ({ tag: o.tag, cls: o.cls, text: o.text }));
+                // ★ V7.9：连"下拉面板本身"也回报（判断是没打开、还是选项结构不认识）
+                const panel = (function () {
+                    try {
+                        const p = Array.from(document.querySelectorAll(
+                            '.el-dropdown-menu, .el-popper, .el-select-dropdown, .el-cascader__dropdown')).filter(isVisibleEl)[0];
+                        if (!p) return { appeared: false };
+                        return { appeared: true, cls: elClassOf(p), tag: p.tagName,
+                                 text: normText(p.innerText).slice(0, 200),
+                                 html: String(p.innerHTML || '').slice(-800) };
+                    } catch (e) { return { appeared: false, err: String((e && e.message) || e) }; }
+                })();
                 sendToBrain({ event: "STATUS_MENU_DUMP", data: { current: findIMStatusText(), items: rows,
                                                                  trigger: triggerInfo, visible_status_nodes: nodes,
-                                                                 before_open_nodes: beforeInfo } });
+                                                                 before_open_nodes: beforeInfo, panel: panel } });
                 console.log("🧭 [探针] 状态显示区 / 下拉可见选项：",
-                            { trigger: triggerInfo, beforeOpen: beforeInfo, visible: nodes, menuItems: rows });
+                            { trigger: triggerInfo, beforeOpen: beforeInfo, visible: nodes, menuItems: rows, panel: panel });
                 try { if (trigger) fireClick(trigger); } catch (e) {}    // 收起下拉
             }, 1500, 150, beforeNodes);
         }

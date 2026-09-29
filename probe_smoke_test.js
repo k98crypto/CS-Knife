@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '7.8';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '7.9';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -109,7 +109,7 @@ const documentStub = {
     },
     querySelectorAll: sel => {
         if (sel.indexOf('.el-dropdown-menu__item') === 0) return [makeEl(statusText)];
-        if (sel === 'div, span, button') return statusTriggerNodes;
+        if (sel === 'div, span, button' || sel === 'div, span, button, a') return statusTriggerNodes;
         if (sel.indexOf('.im-action-btn') === 0) return actionButtons;
         if (sel === '.chat-bubble-row') return bubbles;
         return [];
@@ -612,7 +612,8 @@ function check(name, ok, extra) {
     documentStub.querySelectorAll = sel => {
         if (sel === '.el-dropdown-menu__item, .el-select-dropdown__item, [role="menuitem"], li') return [];
         if (sel.indexOf('.el-dropdown-menu__item') === 0) return statusText ? [makeEl(statusText)] : [];
-        if (sel === 'div, span, button' || sel === 'div, span, button, li, a, p') {
+        if (sel === 'div, span, button' || sel === 'div, span, button, a'
+            || sel === 'div, span, button, li, a, p') {
             return statusTriggerNodes.concat(diffNewNodes);
         }
         if (sel.indexOf('.im-action-btn') === 0) return actionButtons;
@@ -741,7 +742,7 @@ function check(name, ok, extra) {
     check('新增 __probe.editor() / __probe.dumpStatus() 排障入口',
         code.indexOf('editor: function ()') !== -1 && code.indexOf('dumpStatus: function ()') !== -1);
 
-    console.log('\n[8.9.5] V7.8 指令自检（PING/PONG 自报家门 + 指令出错不再静默）');
+    console.log('\n[8.9.5] V7.9 指令自检（PING/PONG 自报家门 + 指令出错不再静默）');
     check('探针能回 PING（证明"指令收到没"）',
         code.indexOf('cmd.command === "PING"') !== -1 && code.indexOf('event: "PONG"') !== -1);
     check('PONG 会自报"代码里到底有没有这些函数"（typeof 逐个查）',
@@ -750,6 +751,17 @@ function check(name, ok, extra) {
         && code.indexOf('editorReadonly:') !== -1);
     check('onmessage 整段 try/catch，出错回报 PROBE_ERROR（不再"点了没反应还查不到"）',
         code.indexOf('event: "PROBE_ERROR"') !== -1 && code.indexOf('处理指令出错') !== -1);
+
+    console.log('\n[8.9.6] V7.9 状态胶囊实机修正（hover 触发 / 触发器由内到外 / 面板结构回报）');
+    check('补派 hover 事件（Element 下拉默认 hover 才打开，只点 click 永远打不开）',
+        code.indexOf('function fireHover') !== -1 && code.indexOf('fireHover(statusTrigger)') !== -1);
+    check('候选触发器按"由内到外"排序并逐个尝试（旧版点到最外层 .el-dropdown 包装，点不开）',
+        code.indexOf('statusTriggers: function()') !== -1
+        && code.indexOf('out.sort((a, b) => b.depth - a.depth)') !== -1
+        && code.indexOf('cands[(attempt - 1) % cands.length].el') !== -1);
+    check('失败原因区分"下拉没打开 / 打开了但选项对不上"，并回报面板真实结构',
+        code.indexOf('panelAppeared') !== -1 && code.indexOf('panel: panel') !== -1
+        && code.indexOf('下拉') !== -1);
 
     // 行为：收到 PING 必须回一条 PONG，且带上版本与函数存在性
     sent.length = 0;

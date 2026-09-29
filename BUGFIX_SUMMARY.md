@@ -1438,6 +1438,43 @@ multi_conv 通过 / hud_layout 55 / agent_core 16 / rules_sync 18 / token_leak �
 > `ACTION_RESULT(ok=false, detail="未找到可见的状态选项「IM在线」；页面候选：")`
 > ——证明「手机 → 中继 → 网页」这条链**一直是通的**，坏的是"在网页上找到并点击状态选项"这一段。
 
+### 第十九轮续 2（v7.9）：真因确认 + 测试隔离（客服投诉）
+
+**（1）状态切不动的真因（来自 `/diag` 的「网页下拉实测」实机数据）**
+
+```
+trigger = { clicked: true, tag: DIV, cls: "el-dropdown status-dropdown", text: "IM在线" }
+visible_status_nodes = [ DIV.el-dropdown.status-dropdown,
+                         SPAN.status-trigger.is-im-online.el-tooltip__trigger,
+                         SPAN.status-label-text ]
+items = []        ← 点完"一个选项都没读到"
+```
+
+| 真因 | 修法（V7.9） |
+|------|--------------|
+| 触发器选错了：按 DOM 顺序取到的**第一个**是最外层包装 `div.el-dropdown`，Element 的处理器挂在**内层** → 点不开 | 新增 `statusTriggers()`：候选按 **DOM 深度由内到外**排序，逐次尝试（叶子 → `.status-trigger` → `.el-dropdown`） |
+| **Element 的 el-dropdown / el-tooltip 默认是 hover 触发**（类名里有 `el-tooltip__trigger`，且点完没有任何新节点出现）→ 只派发 click 永远打不开菜单 | 新增 `fireHover()`：补派 `pointerenter/pointerover/mouseenter/mouseover/mousemove`，再 click |
+| 失败原因说不清 | 失败回执区分 **「下拉没打开」/「打开了但选项对不上」**，并把面板类名/文本/HTML 片段一并回报（`dumpStatusMenu` 新增 `panel`、`before_open_nodes`、`candidates`） |
+
+**（2）测试隔离（客服严正投诉："测试不许真的关闭我的工单"）—— 已彻底解决**
+
+- 根因：测试脚本的 fake 探针与客服**真实探针**同时在 `active_clients["extension"]` 里，
+  而中继的动作指令是**广播**给所有 extension 连接的 → 测试的关单/挂起/代发都打到了真实工作台。
+- 修法（`bridge_server.py`）：
+  - 连接时带 `?test=1` 的 ws 记入 `TEST_WS`（`/ws/extension` 与 `/ws/mobile` 都认）；
+  - 新增 `ext_targets(origin)`：**测试客户端发出的指令只发给同样是测试连接的探针**；
+  - 覆盖全部"会在页面上动手"的路径：`CHANGE_STATUS`、`SILENCE_ALARM`、`DUMP_STATUS_MENU`、
+    `EXT_COMMAND`（挂起/恢复/关单）、`SEND_REPLY`/`send_to_player(origin=)`（含 AI 关单结束语）、
+    自动重试（`im_intent_test`）、AI 起草/自动回复（`_auto_origin()` ← PLAYER_MESSAGE 来源标记）；
+  - `AI_CLOSE` / `TRIGGER_F9` 来自测试客户端且**没有测试探针**时直接跳过（后台任务不会打到真实页面）；
+  - 4 个服务端测试脚本全部改用 `?test=1` 连接；`mobile_feature_test` 新增 **[1.6] 测试隔离** 断言：
+    不带的探针连接**收不到**任何测试指令（状态/挂起），带的照常收到。
+
+> 验证：`mobile_feature 58/0（连续两次）`、`diag 30/0`、`multi_conv 通过`、`token_leak 无泄露`、
+> `auto_reply 92/0`、`probe_smoke 116/0`、`h5_security 119/0`、`hud_layout 55/0`、`agent_core 16/0`、`rules_sync 通过`。
+> 线上 `/api/probe_ping` 实测：探针回 `PONG{version:"7.8", composer:"DIV.ql-editor ql-blank",
+> editorReadonly:false, hasReplyBtnTarget:true, imStatus:"IM在线"}` —— 指令通道与"回复框已指向 Quill"双双得到确认。
+
 ---
 
 *此文档由 AI Bug 排查 Agent 自动生成*

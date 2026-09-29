@@ -14,7 +14,7 @@ async def main():
     ok = True
     async with aiohttp.ClientSession() as s:
         # ---- 1. 探针（extension）连接并注入 Token ----
-        ext = await s.ws_connect(BASE + "/ws/extension")
+        ext = await s.ws_connect(BASE + "/ws/extension?test=1")
         # 模拟"探针反复重连重发"场景：同一份内容连发 3 次，再发 1 次不同内容
         for _ in range(3):
             await ext.send_json({
@@ -30,7 +30,7 @@ async def main():
         print("    (同一内容重复发送 3 次 + 轮换 1 次，用于验证去重)")
 
         # ---- 2. 手机端连接（服务端会立即回一条 FULL_SYNC）----
-        mobile = await s.ws_connect(BASE + "/ws/mobile")
+        mobile = await s.ws_connect(BASE + "/ws/mobile?test=1")
         leaked = False
         raw = ""
         for _ in range(3):

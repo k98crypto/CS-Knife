@@ -61,7 +61,7 @@ async def main():
             print(f"  [FAIL] {name}" + (f"  -> {extra}" if extra else ""))
 
     async with aiohttp.ClientSession() as s:
-        ext = await s.ws_connect(BASE + "/ws/extension")
+        ext = await s.ws_connect(BASE + "/ws/extension?test=1")
 
         # ---- 建立两个不同玩家的会话（messages 为空，不触发 AI）----
         await ext.send_json({"event": "PLAYER_MESSAGE", "data": {
@@ -71,7 +71,7 @@ async def main():
             "groupID": GID_B, "name": "玩家乙", "messages": [], "playerInfo": "玩家乙 | UID:2002"}})
         await asyncio.sleep(0.4)
 
-        mobile = await s.ws_connect(BASE + "/ws/mobile")
+        mobile = await s.ws_connect(BASE + "/ws/mobile?test=1")
         snap = await wait_full_sync(mobile)
         convs = convs_of(snap)
 

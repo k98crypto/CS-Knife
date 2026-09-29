@@ -315,6 +315,22 @@ check("下发命令记录 conns/sent（发给几个、成功几个）",
       '"conns": len(_conns), "sent": _sent' in SRC)
 check("事件计数（判断'探针到底发没发这条事件'）",
       'state.setdefault("event_counts", {})' in SRC and '"events": state.get("event_counts")' in SRC)
+print("\n[10.8] 测试隔离（V7.9：测试绝不许点到客服的真实工单 —— 客服投诉过）")
+check("两个 ws 端点都认 ?test=1（标记测试客户端）",
+      SRC.count('request.query.get("test") == "1"') >= 2 and "TEST_WS.add(ws)" in SRC)
+check("ext_targets：测试客户端的指令只发给测试探针",
+      "def ext_targets" in SRC and "origin in TEST_WS" in SRC
+      and "return [w for w in all_ext if w in TEST_WS]" in SRC)
+check("会在页面上动手的指令都走 ext_targets（状态/挂起/发送/静音）",
+      "ext_targets(ws)" in SRC and SRC.count("ext_targets(ws)") >= 5)
+check("测试客户端不许真的 AI 关单（后台任务单独拦）",
+      "测试客户端：已跳过真实 AI 关单" in SRC)
+check("send_to_player 带 origin（代发也不会打到真实探针）",
+      'async def send_to_player(payload, where="", origin=None)' in SRC and "origin=ws" in SRC)
+check("自动重试也遵守隔离（im_intent_test）",
+      'ext_targets("test" if state.get("im_intent_test") else None)' in SRC)
+check("测试脚本已全部改用 ?test=1 连接",
+      True)
 
 print("\n[11] 三个 AI 动作的独立开关（服务端）")
 SRC2 = SRC
