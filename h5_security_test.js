@@ -18,6 +18,7 @@ function check(name, ok, extra) {
 function makeEl(id) {
     return {
         id: id, _html: '', className: '', innerText: '', value: '',
+        style: {},                              // ★ V8.3：视图切换会写行内 display，这里必须有
         scrollTop: 0, scrollHeight: 100, clientHeight: 50,
         dataset: {}, _click: null, _listeners: {},
         classList: {
@@ -330,6 +331,13 @@ check('渲染步骤各自 try/catch（单条数据异常不连累整个页面）
     || pushBody.indexOf('renderChatStream(conv); } catch') !== -1);
 check('列表点击有兜底委托（某次渲染没绑上也能进会话，且不会重复处理）',
     h5code.indexOf('bindListFallback') !== -1 && h5code.indexOf('_h5Handled') !== -1);
+check('兜底委托同时挂在容器与 document 上（容错到底）',
+    h5code.indexOf("document.addEventListener('click', onTap)") !== -1);
+check('视图切换 class + 行内 display 双保险（CSS 出问题也切得过去）',
+    h5code.indexOf("cv.style.display = 'flex'") !== -1
+    && h5code.indexOf("lv.style.display = 'none'") !== -1);
+check('每次点击的提示都带页面版本（方便确认"手机到底刷没刷上"）',
+    h5code.indexOf("（页面 v' + H5_VER + '）") !== -1);
 let threwPush = null;
 try { sandbox.pushChat('不存在的会话'); } catch (e) { threwPush = e.message; }
 check('点一条"数据还没到"的会话不抛异常，并给出提示',

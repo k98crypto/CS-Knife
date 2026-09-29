@@ -1374,7 +1374,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
     // ★ V8.0.2：手机页面版本号（顶栏胶囊显示）——"刷新了没生效"时第一眼就能确认
-    const H5_VER = '8.1';
+    const H5_VER = '8.3';
     // ★ V8.0.1：点过"未打开"的会话后，等它出现在中继会话列表里就自动打开聊天页（不用点第二次）
     let pendingOpenName = '';
     let pendingOpenAt = 0;                 // 待打开的登记时间（25 秒后自动作废，避免乱开）
@@ -1430,13 +1430,20 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     // 页面切换（列表 / 会话）：用 class 控制 display，不用 transform（避免 iOS 文字发虚）
+    // ★ V8.3：再加一层**行内样式**保险 —— 万一某条 CSS 被覆盖/没加载，视图也必须真的切过去
+    //   （"点了卡片进不去会话"必须绝迹）。
     function showList() {
-        document.getElementById('list-view').classList.add('active');
-        document.getElementById('chat-view').classList.remove('active');
+        const lv = document.getElementById('list-view');
+        const cv = document.getElementById('chat-view');
+        if (lv) { lv.classList.add('active'); if (lv.style) lv.style.display = 'flex'; }
+        if (cv) { cv.classList.remove('active'); if (cv.style) cv.style.display = 'none'; }
     }
     function showChat() {
-        document.getElementById('list-view').classList.remove('active');
-        document.getElementById('chat-view').classList.add('active');
+        const lv = document.getElementById('list-view');
+        const cv = document.getElementById('chat-view');
+        if (lv) { lv.classList.remove('active'); if (lv.style) lv.style.display = 'none'; }
+        if (cv) { cv.classList.add('active'); if (cv.style) cv.style.display = 'flex'; }
+        try { window.scrollTo(0, 0); } catch (e) {}
     }
 
     // ==================== 顶部两个下拉框：IM 状态 / 回复模式 ====================
@@ -2157,6 +2164,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     // 点网页列表里的会话：让电脑切过去；中继认识的话同时打开聊天页
     function openPageConv(name, lastText) {
       if (!name) return;
+      toast('正在让电脑打开「' + name + '」…（页面 v' + H5_VER + '）');
       const key = nameKey(name);
       const gid = (function () {
         const convs = getConvs();
@@ -2182,11 +2190,13 @@ HTML_CONTENT = """<!DOCTYPE html>
       const conv = getConv(gid);
       if (!conv) {
         // ★ V8.2：数据还没到也要给反馈，不能"点了没反应"
-        toast('这条会话的数据还没到，稍等一下再点…');
+        toast('这条会话的数据还没到，稍等一下再点…（页面 v' + H5_VER + '）');
         return;
       }
       activeGroupId = gid;
       playerCardOpen = false;
+      // ★ V8.3：点卡片一定给反馈（带页面版本）——"点了有没有反应"从此可自证
+      toast('打开「' + String(conv.name || gid) + '」…（页面 v' + H5_VER + '）');
       try {
         document.getElementById('chat-player-name').innerText = conv.name || gid;
         const meta = document.getElementById('chat-ticket-id');
@@ -2272,12 +2282,11 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     // ==================== 启动 ====================
     (function bindListFallback() {
-        // ★ V8.2：列表点击的**兜底委托** —— 万一某次渲染没把点击绑上（或将来改坏了绑定），
+        // ★ V8.2/V8.3：列表点击的**兜底委托** —— 万一某次渲染没把点击绑上（或将来改坏了绑定），
         //   点卡片依然能进会话，不会再出现"点了没反应"。卡片上的直接绑定会先跑并置 ev._h5Handled，
         //   所以这里只做兜底，不会重复处理（不会重复发 OPEN_CONV）。
-        const box = document.getElementById('conv-container');
-        if (!box || !box.addEventListener) return;
-        box.addEventListener('click', function (ev) {
+        //   同时绑在容器与 document 上（两处都带 _h5Handled 去重），容错到底。
+        function onTap(ev) {
             if (!ev || ev._h5Handled) return;
             const t = ev.target || {};
             if (typeof t.closest !== 'function') return;
@@ -2291,8 +2300,18 @@ HTML_CONTENT = """<!DOCTYPE html>
             if (row && row.dataset) {
                 ev._h5Handled = true;
                 openPageConv(row.dataset.openname || '', row.dataset.openlast || '');
+                return;
             }
-        });
+            const tg = t.closest('[data-toggle-other]');
+            if (tg) {
+                ev._h5Handled = true;
+                showOtherConvs = !showOtherConvs;
+                renderAll();
+            }
+        }
+        const box = document.getElementById('conv-container');
+        if (box && box.addEventListener) box.addEventListener('click', onTap);
+        try { document.addEventListener('click', onTap); } catch (e) {}
     })();
     // 输入框：输入/聚焦时自动长高（有上限，超出滚动翻阅）；草稿被填进来时也会自动长高
     (function bindInputGrow() {
@@ -3064,11 +3083,24 @@ async def ws_ext_handler(request):
                             if _first_sight:
                                 continue
                             if _nm not in _prev:
-                                r["fresh"] = True
-                                fresh.append((_nm, _last, "new"))
+                                _kind = "new"
                             elif _prev.get(_nm) != _last:
-                                r["fresh"] = True
-                                fresh.append((_nm, _last, "msg"))
+                                _kind = "msg"
+                            else:
+                                continue
+                            # ★ V8.3：别把自己刚回的也当成"新内容"来提醒自己
+                            _own_last = ""
+                            for _cg, _cc in state["companies"]["main"]["conversations"].items():
+                                if str((_cc or {}).get("name") or "").strip() == _nm:
+                                    _cm = _cc.get("msgs") or []
+                                    if _cm and isinstance(_cm[-1], dict) and _cm[-1].get("sender") == "agent":
+                                        _own_last = " ".join(str(_cm[-1].get("text") or "").split())[:60]
+                                    break
+                            if _own_last and _own_last == " ".join(str(_last).split())[:60]:
+                                r.pop("fresh", None)
+                                continue
+                            r["fresh"] = True
+                            fresh.append((_nm, _last, _kind))
                         if is_test_ws:
                             state["conv_list_test"] = rows
                         else:
@@ -3105,9 +3137,11 @@ async def ws_ext_handler(request):
                                                     "from_page_list": True, "kind": _kind})
                             print(f"[新消息] 🖥 网页列表{'新会话' if _kind == 'new' else '有新内容'}："
                                   f"{_nm} — {_preview[:30]}")
-                            if not is_test_ws and config.get("bark_on_new_message", True):
-                                push_bark(("🆕 新会话 " if _kind == "new" else "💬 ") + _nm,
-                                          _preview or "（网页会话列表有新内容）")
+                            # ★ V8.3：**只有"冒出一条全新会话"才推 Bark**。
+                            #   列表里只是"某行内容变了"分不清是谁发的（可能是我们自己刚回的、
+                            #   也可能是页面把预览截断方式变了），拿它推锁屏通知 = 客服投诉的"切换工单也 Bark"。
+                            if _kind == "new" and not is_test_ws and config.get("bark_on_new_message", True):
+                                push_bark("🆕 新会话 " + _nm, _preview or "（电脑网页上出现了一条新会话）")
                     continue
 
                 # ★ V7.8：探针自报家门（PONG）—— 诊断"指令到底有没有到、浏览器里是哪版代码"
@@ -3151,6 +3185,9 @@ async def ws_ext_handler(request):
                     _is_test_origin = (ws in TEST_WS)
                     state["automation_origin_test"] = _is_test_origin
                     gid = payload.get("groupID")
+                    # ★ V8.3：这次上报**之前**网页打开着哪条会话 —— 用来区分
+                    #   "我正在看的会话来了新消息"（该提示）与"我刚切到另一条工单"（不该提示/不该推 Bark）。
+                    _prev_page_gid = str(page_gid(ws) or "")
                     # ★ V7.9 血泪教训：探针的"发送/填写"永远作用于**页面当前打开的那个工单**。
                     #   这里记下"网页上此刻打开的工单"，发送前必须核对，避免发错人。
                     #   真实探针与测试探针各记一份（测试的假探针不该污染真实页面的绑定）。
@@ -3238,7 +3275,12 @@ async def ws_ext_handler(request):
                                 new_ts = int(pm.get("ts") or 0)
                                 new_txt = str(pm.get("text") or "")
                                 break
-                        if (_was_known and _prev_last_pl and new_ts > _prev_last_pl
+                        # ★ V8.3：新增"我当时是否正看着这条会话"这个条件 ——
+                        #   切到另一条工单时，探针会把那条工单的**整段历史**读一遍，
+                        #   若它末尾有系统没见过的玩家消息（时间戳只能补成 now），就会被误判成新消息。
+                        _was_watching = bool(_prev_page_gid) and str(_prev_page_gid) == str(gid)
+                        if (_was_known and _was_watching and _prev_last_pl
+                                and new_ts > _prev_last_pl
                                 and (now_ms - new_ts) <= AUTO_ACTIVE_WINDOW_MS
                                 and new_ts > int(_LAST_NOTIFIED.get(gid) or 0)):
                             _LAST_NOTIFIED[gid] = new_ts

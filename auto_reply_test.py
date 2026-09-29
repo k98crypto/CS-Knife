@@ -434,8 +434,9 @@ check("同一条会话同样内容 6 秒内重复发送会被忽略（防两条�
       "_DEDUP_SENT" in SRC and "重复发送防抖" in SRC)
 check("出站审计：每次出站都留痕，并在 /api/diag 暴露 outbound_log",
       "def _log_outbound(" in SRC and '"outbound_log"' in SRC)
-check("通知收紧：只有「本来就认识的会话 + 玩家消息真的更新」才提示（翻旧会话不弹）",
-      "_was_known and _prev_last_pl and new_ts > _prev_last_pl" in SRC)
+check("通知收紧：只有「本来就认识的会话 + 我当时正看着它 + 玩家消息真的更新」才提示",
+      "_was_known and _was_watching and _prev_last_pl" in SRC
+      and "and new_ts > _prev_last_pl" in SRC)
 check("多工作台连接：只让「当前打开着目标会话」的那个探针执行（防同一条消息发两遍）",
       '_PROBE_CONNS.get(e) or {}).get("page_gid")' in SRC and "多开工作台标签页" in SRC)
 check("手机页面自己带版本号（页面 vX 胶囊），排查\"刷新没生效\"一眼可查",
@@ -450,7 +451,7 @@ check("Bark 收紧：旧会话的「需要人工介入」只站内告警，不�
       "旧会话（消息不新鲜）：只做站内告警，不推 Bark" in SRC
       and SRC.count('push_bark("🙋 需要人工介入"') == 1)
 check("新消息提示同时要求「时间戳真的更新 + 消息够新」",
-      "_prev_last_pl and new_ts > _prev_last_pl" in SRC
+      "and new_ts > _prev_last_pl" in SRC
       and "(now_ms - new_ts) <= AUTO_ACTIVE_WINDOW_MS" in SRC)
 check("探针给的时间戳会被沿用（翻旧工单不再被当成'刚刚'）",
       '"ts": prev_ts.get(key) or _given or now_ms' in SRC)
@@ -459,6 +460,13 @@ check("点卡片先切视图再渲染 + 每步 try/catch（点不进会话的加
 check("列表点击兜底委托（某次没绑上也能进会话）", "bindListFallback" in SRC and "_h5Handled" in SRC)
 check("「其它会话」默认收起成一行可点开的摘要（客服：很鸡肋）",
       "data-toggle-other" in SRC and "showOtherConvs" in SRC)
+print("\n[10.13] V8.3 切换工单不再误报（Bark 再收紧一层）")
+check("只有「我当时正看着这条会话」才把来消息当成新消息（切换工单不算）",
+      "_prev_page_gid" in SRC and "_was_watching" in SRC)
+check("Bark 只在「冒出一条全新会话」时推；列表里某行内容变了不推 Bark（分不清是谁发的）",
+      'if _kind == "new" and not is_test_ws' in SRC and "🆕 新会话 " in SRC)
+check("自己刚回的内容不会反过来提醒自己（按会话名比对最后一条客服发言）",
+      "_own_last" in SRC and "别把自己刚回的" in SRC)
 
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)
