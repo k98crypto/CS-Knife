@@ -600,6 +600,25 @@ def safe_outbound(text, where=""):
     return clean, left
 
 
+def _ver_at_least(v, want):
+    """粗粒度版本比较（"8.0" >= "7.9"），解析失败一律返回 True（"不确定就不拦"）。"""
+    def _p(x):
+        out = []
+        for part in str(x or "").split("."):
+            d = "".join(c for c in part if c.isdigit())
+            out.append(int(d) if d else 0)
+        return out
+    try:
+        a, b = _p(v), _p(want)
+        while len(a) < len(b):
+            a.append(0)
+        while len(b) < len(a):
+            b.append(0)
+        return a >= b
+    except Exception:
+        return True
+
+
 async def ensure_page_on(gid, name=None, origin=None, timeout=4.0):
     """确保"电脑网页当前打开的就是 gid 这个工单"；不是就先替客服切过去。返回 (ok, 说明)。
 
@@ -626,6 +645,13 @@ async def ensure_page_on(gid, name=None, origin=None, timeout=4.0):
     targets = ext_targets(origin)
     if not targets:
         return False, "电脑端探针未连接，无法切换会话"
+    # ★ V8.0：若连着的探针**全都**是旧版（不认识 OPEN_CONV），别干等到超时 ——
+    #   直接告诉客服"油猴里还是旧脚本"，并给出重新粘贴的地址（这是最常见的真实原因）。
+    _vers = [str((_PROBE_CONNS.get(e) or {}).get("version") or "") for e in targets]
+    if _vers and all(v and not _ver_at_least(v, "8.0") for v in _vers):
+        return False, (f"油猴脚本还是旧版（v{_vers[0]}），它不认识「切会话」指令 —— "
+                       f"请在电脑上打开 http://127.0.0.1:{PORT}/probe.js 重新复制粘贴一次"
+                       f"（v{SERVER_VER}）并刷新工作台")
     msgs = conv.get("msgs") or []
     last_text = str((msgs[-1] or {}).get("text") or "")[:60] if msgs else ""
     for ext in targets:

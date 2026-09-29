@@ -379,6 +379,8 @@ check("手机端代发会把会话名一起带来（中继不知道名字时也�
       'page_name=str(pkt.get("name") or "")' in SRC and "name: (c && c.name" in SRC)
 check("F9/F10 直填接口支持 ?test=1 只打测试探针（测试不许往真实回复框填字）",
       'origin=("test" if request.query.get("test") == "1" else None)' in SRC)
+check("连着旧版探针时立刻拒发并提示重新粘贴脚本（不干等超时）",
+      "def _ver_at_least(v, want)" in SRC and "它不认识「切会话」指令" in SRC)
 check("手机端可点会话让电脑切过去（action=OPEN_CONV）",
       'act == "OPEN_CONV"' in SRC and '"command": "OPEN_CONV"' in SRC)
 check("会话列表入库并推给手机端（CONV_LIST -> state.conv_list -> FULL_SYNC）",

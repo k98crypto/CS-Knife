@@ -82,6 +82,23 @@ async def main():
             snap, _ = await drain(mobile, 0.4)
             return (snap or {}) or {}
 
+        async def multi_client():
+            """★ 是否"另有真实探针在线"的多客户端场景。
+
+            除了开局探测一次，**断言前再复查一次**：如果中继刚好在测试期间被重启，
+            你浏览器里的探针会在几秒后自动重连上来（它是真实探针、会如实上报网页真实现状），
+            此时"服务端必须记录成测试设的值""断开后必须 false"这类断言就不成立了 —— 会误报失败。
+            """
+            if external_probe:
+                return True
+            try:
+                async with s.get(BASE + "/api/diag") as r:
+                    if r.status == 200:
+                        return bool(((await r.json()) or {}).get("probe", {}).get("online"))
+            except Exception:
+                pass
+            return False
+
         # ---------- 1. 远程 IM 状态切换 ----------
         print("\n[1] 远程切换 IM 状态")
         await mobile.send_json({"action": "SET_IM_STATUS", "status": 3})
@@ -93,7 +110,7 @@ async def main():
         snap = await fresh_state()
         # ★ 多客户端场景：若有真实探针（你自己开着的客服工作台）在线，它会**如实上报网页真实状态**，
         #   随时覆盖"测试手机端设的状态"。这与 extension_online 的处理方式一致：跳过状态断言，只核对指令已下发。
-        if external_probe:
+        if await multi_client():
             check("另有真实探针在线，跳过「服务端记录 im_status=3」断言（多客户端场景）", True,
                   f"got im_status={snap.get('im_status')}（真实探针会如实上报网页状态）")
         else:
@@ -109,7 +126,7 @@ async def main():
               any(m.get("command") == "SILENCE_ALARM" for m in ext_msgs2))
         # ★ 多客户端场景下同上：真实探针会覆盖状态，此时只核对指令已下发（CHANGE_STATUS/SILENCE_ALARM）
         d2 = await fresh_state()
-        if external_probe:
+        if await multi_client():
             check("另有真实探针在线，跳过「im_status=1 且警报已清除」断言（多客户端场景）", True,
                   f"got im_status={d2.get('im_status')} alarm={d2.get('alarm_status')}")
         else:
@@ -130,7 +147,7 @@ async def main():
               isinstance(snap_r, dict)
               and all(k in snap_r for k in ("im_status", "im_status_known", "im_status_manual")),
               str({k: (snap_r or {}).get(k) for k in ("im_status", "im_status_manual")}))
-        if external_probe:
+        if await multi_client():
             check("另有真实探针在线，跳过「手动锁已清除」断言（多客户端场景）", True,
                   f"got im_status_manual={(snap_r or {}).get('im_status_manual')}")
         else:
@@ -346,7 +363,7 @@ async def main():
         await ext.send_json({"event": "IM_STATUS", "data": {"status": 2, "manual": False}})
         await asyncio.sleep(0.4)
         snapC, _ = await drain(mobile, 0.4)
-        if external_probe:
+        if await multi_client():
             # ★ V7.9：真实探针在线时它会**如实上报网页真实现状**（例如在线）从而覆盖这条记录 ——
             #   多客户端场景下不做断言，只核对"事件已被处理"（与文件里其它多客户端断言口径一致）
             check("另有真实探针在线，跳过「探针上报忙碌 -> im_status=2」断言（多客户端场景）", True,
@@ -359,7 +376,7 @@ async def main():
         await ext.close()
         await asyncio.sleep(0.9)
         snapD, _ = await drain(mobile, 0.6)
-        if external_probe:
+        if await multi_client():
             # 另有真实探针在线（例如你自己开着的客服工作台）：extension_online 本就该保持 true
             check("另有真实探针在线，跳过「断开后必须为 false」断言（多客户端场景）", True,
                   f"expected extension_online=true, got {str((snapD or {}).get('extension_online'))}")
