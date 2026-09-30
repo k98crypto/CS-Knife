@@ -543,8 +543,8 @@ check("「需要人工介入」隔离：测试来源只站内告警，不推手�
       and "测试来源：只做站内告警（不推手机、不推 Bark）" in SRC)
 check("手机输入框里的字不被 AI 草稿冲掉（红线⑫延伸到手机端）",
       "lastDraftFilled" in SRC and "AI 草稿没覆盖你在输入框里写的内容" in SRC)
-check("手机页面版本号已更新（改完一眼能确认手机刷没刷上）",
-      "const H5_VER = '8.5.1'" in SRC)
+check("手机页面版本号存在且是 8.6（改完一眼能确认手机刷没刷上）",
+      "const H5_VER = '8.6'" in SRC)
 check("防重复发送的字典不会无限增长（60 秒前的记录清掉）",
       "对 6 秒防抖已无意义" in SRC and "len(_DEDUP_SENT) > 200" in SRC)
 

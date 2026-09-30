@@ -1829,13 +1829,28 @@ HTML_CONTENT = """<!DOCTYPE html>
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
     // ★ V8.0.2：手机页面版本号（顶栏胶囊显示）——"刷新了没生效"时第一眼就能确认
-    const H5_VER = '8.5.1';
+    // ★ V8.9：升到 8.6 —— 这次修了"所有按钮点了没反应"，必须能一眼确认手机上跑的是哪版
+    const H5_VER = '8.6';
+    // ★ V8.9：任何脚本异常都要**看得见**（否则就表现为"点了没反应"，无从排查）
+    let lastJsError = '';
+    let lastToastMsg = '';
+    try {
+        window.addEventListener('error', function (e) {
+            lastJsError = String((e && (e.message || (e.error && e.error.message))) || '未知错误');
+            try { showErr('⚠️ 页面脚本异常：' + lastJsError + '（页面 v' + H5_VER + '）'); } catch (x) {}
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+            lastJsError = String((e && e.reason) || '未处理的 Promise 异常');
+            try { showErr('⚠️ 页面脚本异常：' + lastJsError + '（页面 v' + H5_VER + '）'); } catch (x) {}
+        });
+    } catch (e) {}
     // ★ V8.0.1：点过"未打开"的会话后，等它出现在中继会话列表里就自动打开聊天页（不用点第二次）
     let pendingOpenName = '';
     let pendingOpenAt = 0;                 // 待打开的登记时间（25 秒后自动作废，避免乱开）
     let lastKnownGids = {};                // 上一次渲染时已知的会话（用于"兜底自动打开"）
     let showOtherConvs = false;            // ★ V8.2："其它会话（不在网页列表里）"默认收起
     let lastDraftFilled = '';              // ★ V8.5：本页自己填进去的最后一份草稿（用来判断"输入框里的字是不是客服写的"）
+    let _goneWarned = {};                  // ★ V8.9：已提示过"会话暂时不存在"的 gid（避免每次快照都刷红条）
     // ★ V8.8：发送回执机制 —— 点发送后进入"发送中"，**收到中继回执**才清空输入框/复位按钮
     //   （旧版：内容为空时静默什么都不做、失败也照样清空 -> 客服体感"按钮点不动、一直蓝着"）
     let pendingSend = null;                // { id, text, gid }
@@ -2180,6 +2195,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     // ==================== 轻提示 ====================
     let toastTimer = null;
     function toast(msg) {
+        lastToastMsg = String(msg || '');
         const el = document.getElementById('toast');
         if (!el) return;
         el.innerText = String(msg || '');
@@ -2378,7 +2394,21 @@ HTML_CONTENT = """<!DOCTYPE html>
         if (payload.type === 'FULL_SYNC') {
             globalState = payload.data || null;
             // 若当前打开的会话已不存在（如被关单清理），自动退回列表
-            if (activeGroupId && !getConv(activeGroupId)) { activeGroupId = null; showList(); }
+            // 若当前打开的会话已不存在（如被关单清理 / 中继刚重启还没同步）
+            // ★ V8.9：**绝不在快照里把人踢回列表** —— 旧版一被弹回，activeGroupId 就变 null，
+            //   之后所有按钮/发送都"点了没反应"（客服反馈的原话）。这里只给一次明确提示；
+            //   真正的"关单成功"由 AI_STATUS 回执触发返回列表（见下方）。
+            if (activeGroupId && !getConv(activeGroupId)) {
+                if (!_goneWarned[activeGroupId]) {
+                    _goneWarned[activeGroupId] = 1;
+                    try {
+                        showErr('这条会话在中继里暂时不存在（电脑端可能刚重启/还没同步）：'
+                                + '可点 ← 返回列表刷新；若刚才关单成功，请直接返回列表。' + h5DiagLine());
+                    } catch (e) {}
+                }
+            } else if (activeGroupId) {
+                _goneWarned[activeGroupId] = 0;
+            }
             renderAll();
             renderIMStatus();
             renderAFK();
@@ -2458,6 +2488,13 @@ HTML_CONTENT = """<!DOCTYPE html>
                     autoGrowInput();
                     hideErr();
                 }
+            }
+            // ★ V8.9：**只有"关单成功"才返回列表**（这是唯一能确认"该会话真的结束了"的信号）；
+            //   其它情况（中继重启/还没同步）一律留在会话里，避免"被弹回后按钮全没反应"。
+            if (payload.status === 'ok' && /关单/.test(String(payload.message || ''))
+                && activeGroupId && !getConv(activeGroupId)) {
+                activeGroupId = null;
+                showList();
             }
             // ★ 失败原因不要一闪而过：常驻显示，可复制（含页面真实按钮名）
             if (payload.status === 'error') {
@@ -2978,12 +3015,55 @@ HTML_CONTENT = """<!DOCTYPE html>
         if (d) d.classList.remove('show');
     }
 
+    // ★ V8.9：手机上排障入口 —— 控制台里执行 __h5() 就能看到"到底哪一环断了"
+    //   （版本 / 连接 / 有没有打开的会话 / 上次提示 / 上次脚本异常）
+    window.__h5 = function () {
+        const gid = activeGroupId;
+        const conv = gid ? getConv(gid) : null;
+        return { ver: H5_VER, ws: (ws ? ws.readyState : -1),
+                 relay_online: !!globalState,
+                 probe_online: !!(globalState && globalState.extension_online),
+                 activeGroupId: gid, active_name: (conv && conv.name) || '',
+                 convs: Object.keys(getConvs()).length,
+                 pendingSend: !!pendingSend, csOpen: csOpen,
+                 cs_path: [csData.l1, csData.l2, csData.l3],
+                 last_toast: lastToastMsg, last_error: lastJsError };
+    };
+
     // ==================== 电脑端指令下发 ====================
+    // ★ V8.9：任何一次点击都必须给出"看得见的结果"（成功有 toast / 失败有红条），
+    //   绝不允许静默 return —— "点了没反应"是这个项目里最贵的排查成本。
+    //   被挡住时把"到底哪一环断了"一起写出来（ws / 中继 / 探针 / 已打开会话数），
+    //   客服截图即可定位，不用再猜。
+    function h5DiagLine() {
+        let wsState = -1;
+        try { wsState = ws ? ws.readyState : -1; } catch (e) {}
+        return '（诊断：ws=' + wsState + ' 中继=' + (globalState ? 'ok' : '无快照')
+             + ' 探针=' + (globalState && globalState.extension_online ? 'ok' : '离线')
+             + ' 会话=' + Object.keys(getConvs()).length + ' 页面v' + H5_VER + '）';
+    }
+    function blockTap(msg) {
+        const m = msg + h5DiagLine();
+        try { showErr(m); } catch (e) {}
+        try { toast(m); } catch (e) {}
+    }
     function execCommand(cmd) {
-      if (!activeGroupId) return;
-      if (extensionOffline()) { toast('电脑端未连接，请先在电脑上打开客服工作台'); return; }
+      try {
+        return execCommandInner(cmd);
+      } catch (e) {
+        const m = '操作异常：' + ((e && e.message) || e) + h5DiagLine();
+        try { showErr(m); } catch (x) {}
+        try { toast(m); } catch (x) {}
+      }
+    }
+    function execCommandInner(cmd) {
+      if (!activeGroupId) {
+          blockTap('没有打开的会话：请返回列表，点一条会话再操作');
+          return;
+      }
+      if (extensionOffline()) { blockTap('电脑端未连接，请先在电脑上打开客服工作台'); return; }
       if (!ws || ws.readyState !== WebSocket.OPEN) {
-          alert('连接已断开，正在重连，请稍后再试');
+          blockTap('手机与中继的连接已断开，正在重连：请等几秒再点');
           return;
       }
       if (cmd === 'AI_CLOSE') {

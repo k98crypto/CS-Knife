@@ -196,7 +196,13 @@ wsInst.readyState = 3;                 // CLOSED
 let threw = null;
 try { sandbox.execCommand('SEND'); } catch (e) { threw = e.message; }
 check('execCommand 在断线时不抛异常', threw === null, threw || '');
-check('execCommand 断线时给出提示', alerts.length > 0, alerts[alerts.length - 1] || '');
+// ★ V8.9：断线时的反馈从 alert() 改成"常驻红条 + 弹条"（不打断操作，且能复制诊断信息），
+//   所以这里断言"有可见提示"而不是"必须有 alert"，同时保留"不抛异常"这个核心要求。
+check('execCommand 断线时给出提示（红条/弹条，不再静默）',
+      alerts.length > 0
+      || (typeof windowStub.__h5 === 'function'
+          && String(windowStub.__h5().last_toast || '').indexOf('连接已断开') !== -1),
+      (alerts[alerts.length - 1] || (typeof windowStub.__h5 === 'function' ? windowStub.__h5().last_toast : '')) || '');
 
 let threw2 = null;
 try { sandbox.toggleAFK(); } catch (e) { threw2 = e.message; }
