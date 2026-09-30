@@ -72,7 +72,7 @@ const els = {};
  'sheet', 'sheet-title', 'sheet-body', 'sheet-backdrop', 'link-chips', 'brand-sub',
  'player-card', 'toast', 'alarm-overlay', 'chat-input', 'conv-container', 'chat-stream',
  'chat-player-name', 'chat-ticket-id', 'chat-view', 'list-view', 'btn-send',
- 'action-bar', 'feature-hint', 'human-banner', 'err-bar'].forEach(i => { els[i] = makeEl(i); });
+ 'action-bar', 'feature-hint', 'human-banner', 'err-bar', 'err-text'].forEach(i => { els[i] = makeEl(i); });
 
 const documentStub = {
     getElementById: id => els[id] || (els[id] = makeEl(id)),
@@ -146,7 +146,7 @@ if (typeof wsInst.onopen === 'function') wsInst.onopen();
 function onmsg(obj) { wsInst.onmessage({ data: JSON.stringify(obj) }); }
 const h5 = () => sb.window.__h5();
 
-check('页面版本已升到 8.6（能一眼确认手机上跑的是新版）', h5().ver === '8.6', h5().ver);
+check('页面版本已升到 8.7（能一眼确认手机上跑的是新版）', h5().ver === '8.7', h5().ver);
 check('有 __h5() 排障入口（版本/连接/会话/上次提示/上次异常）',
       typeof sb.window.__h5 === 'function');
 
@@ -249,6 +249,22 @@ onmsg3({ type: 'AI_STATUS', status: 'ok', groupID: 'T-9',
 check('★ 收到"关单成功"回执 -> 返回列表（唯一会主动返回列表的时机）',
       sb3.window.__h5().activeGroupId === null,
       'activeGroupId=' + String(sb3.window.__h5().activeGroupId));
+
+// ⑨ 点击遥测：不管后面成功与否，"点了什么"必须先送到中继（"点了没反应"时靠这条定位）
+FakeWebSocket.sent.length = 0;
+sb.execCommand('SEND');
+check('★ 每次点击都会先把"点击遥测"发给中继（H5_TAP）',
+      FakeWebSocket.sent.some(x => x.action === 'H5_TAP' && x.cmd === 'SEND'),
+      JSON.stringify(FakeWebSocket.sent));
+
+// ⑩ 常驻诊断条 + 诊断按钮（不用控制台也能看到/复制状态）
+check('顶栏有常驻诊断条（连接/中继/探针/上次点击）', els['h5-diag'].textContent.indexOf('v8.7') !== -1,
+      String(els['h5-diag'].textContent));
+els['err-text'].innerText = '';
+sb.showDiag();
+check('「🧪 诊断」把 __h5() 全量状态显示到红条（可截图/复制）',
+      String(els['err-text'].innerText).indexOf('"ver"') !== -1,
+      String(els['err-text'].innerText).slice(0, 70));
 
 console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
 process.exit(fail === 0 ? 0 : 1);

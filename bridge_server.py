@@ -1702,6 +1702,10 @@ HTML_CONTENT = """<!DOCTYPE html>
                      color:var(--text);background:var(--card);border:1px solid var(--line);outline:none;
                      overflow-y:hidden;display:block;box-sizing:border-box}
     .chat-text-input:focus{border-color:rgba(124,196,255,.5)}
+    /* ★ V8.10：常驻诊断条（点一下等于按「🧪 诊断」）——"点了没反应"时截图它即可定位 */
+    .diag-chip{padding:5px 12px 6px;font-size:11px;line-height:1.35;color:var(--fg-dim);
+               border-bottom:1px solid var(--line-soft);white-space:nowrap;overflow-x:auto;
+               -webkit-overflow-scrolling:touch}
     .send-btn{flex:0 0 auto;width:40px;height:40px;border-radius:50%;border:none;font-size:17px;font-weight:700;
               align-self:flex-end;
               color:#0B0C0E;background:linear-gradient(145deg,#7CC4FF,#4EC9B0)}
@@ -1808,12 +1812,14 @@ HTML_CONTENT = """<!DOCTYPE html>
           <div class="chat-title" id="chat-player-name">玩家</div>
           <div class="chat-meta" id="chat-ticket-id"></div>
         </div>
+        <div class="diag-chip" id="h5-diag" onclick="showDiag()">v8.7 启动中…</div>
         <div class="action-bar" id="action-bar">
           <button class="action-btn primary" id="btn-ai-close" onclick="execCommand('AI_CLOSE')">🤖 AI 回复并关单</button>
           <button class="action-btn ai" id="btn-f9" onclick="execCommand('F9')">✨ AI 立刻起草</button>
           <button class="action-btn" onclick="execCommand('HANGUP')">⏸ 挂起</button>
           <button class="action-btn" onclick="execCommand('RESUME')">▶ 恢复</button>
           <button class="action-btn" onclick="execCommand('CLOSE')">✅ 关单</button>
+          <button class="action-btn" onclick="showDiag()">🧪 诊断</button>
         </div>
         <div class="feature-hint" id="feature-hint"></div>
         <div class="chat-stream" id="chat-stream"></div>
@@ -1829,8 +1835,8 @@ HTML_CONTENT = """<!DOCTYPE html>
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
     // ★ V8.0.2：手机页面版本号（顶栏胶囊显示）——"刷新了没生效"时第一眼就能确认
-    // ★ V8.9：升到 8.6 —— 这次修了"所有按钮点了没反应"，必须能一眼确认手机上跑的是哪版
-    const H5_VER = '8.6';
+    // ★ V8.10：升到 8.7 —— 新增"点击遥测"（点了什么一定能被中继看见）+ 常驻诊断条 + 诊断按钮
+    const H5_VER = '8.7';
     // ★ V8.9：任何脚本异常都要**看得见**（否则就表现为"点了没反应"，无从排查）
     let lastJsError = '';
     let lastToastMsg = '';
@@ -2413,6 +2419,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             renderIMStatus();
             renderAFK();
             renderChips();
+            try { renderDiagChip(); } catch (e) {}          // ★ V8.10：常驻诊断条（连接/中继/探针）
             renderFeatureButtons();          // 三个开关：把已关闭的功能标出来
             // 需要人工介入：横幅 + 专属提示音（只对"新出现的告警"响一次）
             const alerts = (globalState && globalState.human_alerts) || [];
@@ -3042,6 +3049,57 @@ HTML_CONTENT = """<!DOCTYPE html>
              + ' 探针=' + (globalState && globalState.extension_online ? 'ok' : '离线')
              + ' 会话=' + Object.keys(getConvs()).length + ' 页面v' + H5_VER + '）';
     }
+    // ★ V8.10：**点击遥测** —— 不管后面被哪道门拦住，都要让"点过"这件事被中继看见。
+    //   为什么：客服反馈"8.6 了点了还是没反应"。如果连点击都没到中继，那就不是业务逻辑问题，
+    //   而是页面层（脚本没跑 / 被遮挡 / 连接死了）。这里 WS 通就走 WS，不通就用 HTTP 兜底上报。
+    let lastTapInfo = '';
+    function tapTelemetry(cmd) {
+        let w = -1;
+        try { w = ws ? ws.readyState : -1; } catch (e) {}
+        const now = new Date();
+        const hh = ('0' + now.getHours()).slice(-2) + ':' + ('0' + now.getMinutes()).slice(-2)
+                 + ':' + ('0' + now.getSeconds()).slice(-2);
+        lastTapInfo = String(cmd || '') + ' @' + hh + ' · ws=' + w
+                    + ' · 中继=' + (globalState ? 'ok' : '无快照')
+                    + ' · 探针=' + (globalState && globalState.extension_online ? 'ok' : '离线')
+                    + ' · 会话=' + (activeGroupId || '无');
+        try { renderDiagChip(); } catch (e) {}
+        let convs = 0;
+        try { convs = Object.keys(getConvs()).length; } catch (e) {}
+        const payload = { action: 'H5_TAP', cmd: String(cmd || ''), ver: H5_VER, ws: w,
+                          gid: String(activeGroupId || ''), relay: !!globalState,
+                          probe: !!(globalState && globalState.extension_online), convs: convs };
+        let sent = false;
+        try { sent = sendMsg(payload); } catch (e) {}
+        if (!sent) {
+            try {
+                fetch('/api/h5_tap?cmd=' + encodeURIComponent(payload.cmd) + '&ws=' + w
+                      + '&ver=' + encodeURIComponent(H5_VER) + '&gid=' + encodeURIComponent(payload.gid)
+                      + '&relay=' + (payload.relay ? 1 : 0) + '&probe=' + (payload.probe ? 1 : 0)
+                      + '&convs=' + convs, { cache: 'no-store' })['catch'](function () {});
+            } catch (e) {}
+        }
+    }
+    // 常驻诊断条（顶栏）：一眼看出"连接/中继/探针/上次点击"，截图即可定位
+    function renderDiagChip() {
+        const el = document.getElementById('h5-diag');
+        if (!el) return;
+        let w = -1;
+        try { w = ws ? ws.readyState : -1; } catch (e) {}
+        let txt = 'v' + H5_VER + ' · 连接' + (w === 1 ? '✓' : ('✗' + w))
+                + ' · 中继' + (globalState ? '✓' : '✗')
+                + ' · 探针' + (globalState && globalState.extension_online ? '✓' : '✗');
+        if (lastTapInfo) txt += ' ｜ 上次点击：' + lastTapInfo;
+        el.textContent = txt;
+    }
+    // 「🧪 诊断」按钮：把 __h5() 全量状态显示到常驻红条（可长按复制），不用开控制台
+    function showDiag() {
+        let j = {};
+        try { j = (window.__h5 ? window.__h5() : {}); } catch (e) {}
+        const txt = '🧪 诊断：' + JSON.stringify(j) + '\n上次点击：' + (lastTapInfo || '（还没点过）');
+        try { showErr(txt); } catch (e) {}
+        try { toast('诊断已显示在下方红条（可长按复制）'); } catch (e) {}
+    }
     function blockTap(msg) {
         const m = msg + h5DiagLine();
         try { showErr(m); } catch (e) {}
@@ -3057,6 +3115,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       }
     }
     function execCommandInner(cmd) {
+      tapTelemetry(cmd);                      // ★ V8.10：先让中继知道"点了什么"（不管后面成功与否）
       if (!activeGroupId) {
           blockTap('没有打开的会话：请返回列表，点一条会话再操作');
           return;
@@ -3213,6 +3272,24 @@ async def index_handler(request):
     return web.Response(text=HTML_CONTENT, content_type="text/html",
                         headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                                  "Pragma": "no-cache", "Expires": "0"})
+
+
+async def api_h5_tap(request):
+    """★ V8.10：手机"点击遥测"的 HTTP 兜底 —— WS 断开时也能把"点了什么"送回中继。
+
+    用法（浏览器/命令行都能测）：
+      http://127.0.0.1:8765/api/h5_tap?cmd=SEND&ws=1&ver=8.7&gid=T1&relay=1&probe=1&convs=3
+    结果：中继日志出现 `[手机] 👆 (HTTP兜底) 点击 …`，/api/diag 的 `h5_last_tap` 也能看到。
+    """
+    q = request.query
+    tap = {"cmd": str(q.get("cmd") or "")[:24], "ver": str(q.get("ver") or "")[:12],
+           "ws": q.get("ws"), "gid": str(q.get("gid") or "")[:40],
+           "relay": str(q.get("relay") or "") == "1", "probe": str(q.get("probe") or "") == "1",
+           "convs": q.get("convs"), "ts": int(time.time()), "via": "http"}
+    state["h5_last_tap"] = tap
+    print(f"[手机] 👆 (HTTP兜底) 点击 {tap['cmd']}：ws={tap['ws']} "
+          f"探针={'ok' if tap['probe'] else '离线'} 会话={tap['gid'] or '无'} (v{tap['ver']})")
+    return web.json_response({"ok": True, "tap": tap})
 
 
 async def api_categories(request):
@@ -3429,6 +3506,8 @@ async def api_diag(request):
                              "source": _q.get("source"),
                              "age_sec": int(time.time() - float(_q.get("ts") or 0))}
                         for _g, _q in list(_REPLY_QUEUE.items())[:5]},
+        # ★ V8.10：手机最近一次点击的遥测（"点了没反应"时先看它：点击有没有到中继、当时各环状态）
+        "h5_last_tap": state.get("h5_last_tap") or {},
         # ★ V8.6：电脑端提醒兜底（探针出不了声时，由桌面悬浮窗响铃）
         "sound_ok": state.get("probe_sound_ok", True),
         "desktop_ding": state.get("desktop_ding") or {},
@@ -4737,6 +4816,20 @@ async def ws_mobile_handler(request):
                     continue
                 act = pkt.get("action")
 
+                # ★ V8.10：手机"点击遥测" —— 不管后面被哪道门拦住，先如实记下"点了什么、当时什么状态"。
+                #   这条日志是判断"点击到底有没有到中继"的铁证（客服反馈"8.6 了还点不动"时靠它定位）。
+                if act == "H5_TAP":
+                    _tap = {"cmd": str(pkt.get("cmd") or "")[:24], "ver": str(pkt.get("ver") or "")[:12],
+                            "ws": pkt.get("ws"), "gid": str(pkt.get("gid") or "")[:40],
+                            "relay": bool(pkt.get("relay")), "probe": bool(pkt.get("probe")),
+                            "convs": pkt.get("convs"), "ts": int(time.time())}
+                    state["h5_last_tap"] = _tap
+                    print(f"[手机] 👆 点击 {_tap['cmd']}：ws={_tap['ws']} "
+                          f"中继={'ok' if _tap['relay'] else '无快照'} "
+                          f"探针={'ok' if _tap['probe'] else '离线'} "
+                          f"会话={_tap['gid'] or '无'} 共{_tap['convs']}条 (v{_tap['ver']})")
+                    continue
+
                 # 补拉快照：iOS 锁屏/退后台恢复后前端主动要一次最新状态，防止界面停留在几分钟前
                 if act == "REQUEST_SNAPSHOT":
                     await safe_send(ws, {"type": "FULL_SYNC", "data": state})
@@ -5104,6 +5197,7 @@ app.router.add_get("/diag", diag_page_handler)
 app.router.add_get("/probe.js", probe_js_handler)
 app.router.add_get("/api/ticket", api_current_ticket)
 app.router.add_get("/api/categories", api_categories)
+app.router.add_get("/api/h5_tap", api_h5_tap)          # ★ V8.10：手机点击遥测的 HTTP 兜底
 app.router.add_post("/api/fill_draft", api_fill_draft)
 app.router.add_get("/api/alerts", api_alerts)
 app.router.add_post("/api/alerts/ack", api_alerts_ack)
