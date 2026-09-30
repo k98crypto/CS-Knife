@@ -502,7 +502,11 @@ check("TRIGGER_F9 走 force=True（立刻执行，不等延迟）",
 check("force 路径里没有排延迟队列（延迟只属于自动起草）",
       'schedule_auto_reply' not in SRC.split('elif act == "TRIGGER_F9":')[1].split('elif act ==')[0])
 check("半自动/手动点按钮 -> 草稿推到网页与手机输入框（FILL_DRAFT）",
-      '{"type": "FILL_DRAFT", "content": body}' in SRC)
+      ('{"type": "FILL_DRAFT", "content": _first}' in SRC
+       or '{"type": "FILL_DRAFT", "content": body}' in SRC))
+check("多段回复一条一条发（V8.6）：半自动只填第 1 段 + 排队，AFK 逐条发",
+      "queue_reply_segments(" in SRC and "send_segments_drip(" in SRC and "multi_send_on()" in SRC
+      and "advance_reply_queue(" in SRC)
 check("草稿不覆盖客服正在写的字（noOverwrite）",
       '"noOverwrite": True' in SRC)
 

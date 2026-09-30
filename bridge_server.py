@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import time
 import random
 import asyncio
@@ -727,6 +728,164 @@ def _log_outbound(where, pkt, ok, note="", auto=False, targets=None):
         print(f"[审计] 记录失败（不影响发送）：{e}")
 
 
+# ==================== ★ V8.6：多段回复"一条一条发" ====================
+# 客服痛点：AI 一次给出"两段话"（先安抚 + 再索要信息），整段塞进输入框一次发出，
+#   看起来就是一大坨，也不像真人节奏。这里把回复**分段**：
+#   · AFK（全自动）：段间随机等 3~8 秒，逐条发出；
+#   · 半自动 / F9：**只粘第 1 段**，其余进"待发队列"；客服把这 1 段发出去后，自动粘下一段（按顺序）。
+# 🛑 红线不变：**每一段**都走 send_to_player（出站安全闸 + 非 AFK 不许自动发 + 6 秒防重复 + 页面绑定）。
+_REPLY_QUEUE = {}          # gid -> {name, total, sent, expect, remaining[], ts, source}
+
+
+def multi_send_on():
+    """总开关（config.json: multi_send_enabled，默认开）。"""
+    return bool(config.get("multi_send_enabled", True))
+
+
+def split_reply(text, max_seg=5, soft_limit=120):
+    """把一段回复切成多段（供"一条一条发"）。规则：
+
+      ① 先按**空行**分段（AI 最常见的"两段"写法）；
+      ② 段内若超过 soft_limit 字，再按句末标点（。！？!?；;~）切成 ≤soft_limit；
+      ③ 最多 max_seg 段，多出来的并进最后一段（防刷屏）；
+      ④ 本来就是"一句话、没有空行" -> 原样返回 1 段（**老行为完全不变**）。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return []
+    try:
+        max_seg = max(1, int(max_seg or 5))
+        soft_limit = max(40, int(soft_limit or 120))
+    except Exception:
+        max_seg, soft_limit = 5, 120
+    segs = []
+    for para in [p.strip() for p in re.split(r"\n\s*\n", t) if p.strip()]:
+        one = " ".join(para.split("\n")).strip()       # 段内换行合成一行（"1. 2. 3." 不被拆散）
+        if len(one) <= soft_limit:
+            segs.append(one)
+            continue
+        cur = ""
+        for piece in re.split(r"(?<=[。！？!?；;~])", one):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if cur and len(cur) + len(piece) > soft_limit:
+                segs.append(cur)
+                cur = piece
+            else:
+                cur += piece
+        if cur:
+            segs.append(cur)
+    segs = [s for s in segs if s]
+    if not segs:
+        return [t]
+    if len(segs) > max_seg:
+        segs = segs[:max_seg - 1] + [" ".join(segs[max_seg - 1:])]
+    return segs
+
+
+def _text_similar(a, b):
+    """粗略相似度（字符集合重叠率）：判断"客服这次发出去的，是不是我们粘的那一段"。"""
+    sa = set(re.sub(r"\s+", "", str(a or "")))
+    sb = set(re.sub(r"\s+", "", str(b or "")))
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / float(max(1, min(len(sa), len(sb))))
+
+
+def queue_reply_segments(gid, name, segs, source=""):
+    """半自动：第 1 段已粘进输入框，其余排进"待发队列"（客服发出去后自动续粘）。返回段数。"""
+    segs = [s for s in (segs or []) if s]
+    if not gid or len(segs) < 2:
+        _REPLY_QUEUE.pop(gid, None)
+        return 0
+    _REPLY_QUEUE[gid] = {"name": name or gid, "total": len(segs), "sent": 1,
+                         "expect": segs[0], "remaining": list(segs[1:]),
+                         "ts": time.time(), "source": source}
+    print(f"[分段回复] 共 {len(segs)} 段：第 1 段已粘入输入框，其余 {len(segs) - 1} 段排队"
+          f"（客服发出第 1 段后自动粘下一条）")
+    return len(segs)
+
+
+async def advance_reply_queue(gid, human_text, name=""):
+    """客服把第 N 段发出去了 -> 自动粘第 N+1 段。三道安全阀：
+
+      ① 没有队列 -> 什么都不做；
+      ② 他发的必须**就是我们粘的那一段**（相似度 ≥ 0.6）才续粘 —— 换话题/自己重写了就
+         **丢掉队列**，绝不硬塞下一段；
+      ③ 队列超过 30 分钟视为过期，丢弃。
+    """
+    q = _REPLY_QUEUE.get(gid)
+    if not q:
+        return False
+    if time.time() - float(q.get("ts") or 0) > 1800:
+        _REPLY_QUEUE.pop(gid, None)
+        print("[分段回复] 队列已过期（>30 分钟），丢弃")
+        return False
+    sim = _text_similar(human_text, q.get("expect"))
+    if sim < 0.6:
+        _REPLY_QUEUE.pop(gid, None)
+        print(f"[分段回复] ⏹ 客服这次发的内容与第 {q.get('sent')} 段不像（相似度 {sim:.2f}），"
+              f"已放弃自动续粘（避免硬塞下一段）")
+        return False
+    rest = list(q.get("remaining") or [])
+    if not rest:
+        _REPLY_QUEUE.pop(gid, None)          # 最后一段也发出去了 -> 收工
+        return False
+    seg = rest.pop(0)
+    q["sent"] = int(q.get("sent") or 1) + 1
+    q["expect"] = seg
+    q["remaining"] = rest
+    q["ts"] = time.time()
+    ok = await send_to_player({"command": "FILL_DRAFT", "content": seg, "groupID": gid,
+                               "noOverwrite": True}, "分段草稿（自动续粘）",
+                              origin=_auto_origin(gid), require_page=True)
+    left = len(rest)
+    print(f"[分段回复] ✅ 已自动粘第 {q['sent']}/{q['total']} 段（{'已发出' if ok else '被拦下/未发出'}），"
+          f"还剩 {left} 段")
+    for m in list(active_clients["mobile"]):
+        await safe_send(m, {"type": "AI_STATUS", "status": "ok" if ok else "error",
+                            "message": (f"已自动粘第 {q['sent']}/{q['total']} 段，发出后还会继续（剩 {left} 段）"
+                                        if left else
+                                        f"最后一段（第 {q['sent']}/{q['total']} 段）已粘好，发出即完成")})
+    return True
+
+
+async def send_segments_drip(gid, name, segs, where):
+    """AFK 全自动：把回复按段**逐条发出**（段间随机 3~8 秒）。
+
+    每段发出前重新校验"仍在 AFK"：中途切回半自动/手动就停下并如实提示手机（绝不偷偷继续发）。
+    """
+    segs = [s for s in (segs or []) if s]
+    if not segs:
+        return False
+    total = len(segs)
+    if total == 1:
+        return await send_to_player({"command": "SEND_REPLY", "content": segs[0], "groupID": gid},
+                                    where, origin=_auto_origin(gid), require_page=True, auto=True)
+    lo = float(config.get("multi_send_delay_min_sec", 3) or 3)
+    hi = max(lo, float(config.get("multi_send_delay_max_sec", 8) or 8))
+    print(f"[分段发送] {name or gid}：分 {total} 段逐条发，段间随机 {lo:g}~{hi:g} 秒")
+    for i, seg in enumerate(segs):
+        if i > 0:
+            await asyncio.sleep(random.uniform(lo, hi))
+            if not state.get("afk_mode"):
+                print(f"[分段发送] ⏹ 模式已切回非 AFK：停止后续 {total - i} 段（已发 {i} 段）")
+                for m in list(active_clients["mobile"]):
+                    await safe_send(m, {"type": "AI_STATUS", "status": "error",
+                                        "message": f"已切回半自动/手动，剩下 {total - i} 段没有自动发，请手动确认"})
+                return False
+        ok = await send_to_player({"command": "SEND_REPLY", "content": seg, "groupID": gid},
+                                  f"{where}（第 {i + 1}/{total} 段）",
+                                  origin=_auto_origin(gid), require_page=True, auto=True)
+        if not ok:
+            print(f"[分段发送] ⏹ 第 {i + 1}/{total} 段被拦下/清洗为空，停止后续")
+            return False
+        await asyncio.sleep(0.3)
+    print(f"[分段发送] ✅ {name or gid}：{total} 段全部发完")
+    return True
+
+
 # ==================== ★ V8.3：人工回复"影子录制"语料（供 distill_rules.py 离线蒸馏） ====================
 # 背景：探针 V8.3 会把客服**真人**在工作台上发出的回复 + 当时的工单上下文，静默上报 RECORD_MANUAL_DEMO。
 # 这里只做一件事：把它落盘成 JSONL，给离线的 distill_rules.py 去逆向蒸馏话术规则。
@@ -791,6 +950,108 @@ def _append_demo_record(data, is_test=False):
         return True
     except Exception as e:
         print(f"[DemoRecorder] ⚠️ 记录失败（不影响任何发送）：{e}")
+        return False
+
+
+# ==================== ★ QC 历史语料（质检页采集器 qc_probe.js → distill_rules.py --mode history） ====================
+# 场景：客服可以在「质检明细」页按"我的会话"回看历史工单。这里把那些**整段历史对话**采集下来，
+# 给离线的 distill_rules.py 当蒸馏语料（比实时嗅探的样本量大得多）。
+#
+# 🛑 红线声明：本文件与这些函数**只落盘、零出站** —— 不填草稿、不发送、不改会话状态，
+#   也不进入手机端会话列表 / Bark / ext_targets（采集器走独立通道 /ws/qc，物理隔离）。
+HISTORY_FILE = os.path.join(BASE_DIR, "demonstrations_history.jsonl")
+_HISTORY_DEDUP = {}          # 会话指纹 -> 已记录（跨本次进程内去重）
+_HISTORY_IDS_LOADED = {"done": False}
+_HISTORY_MAX_MSGS = 80       # 单条会话最多保留多少条消息（防异常大包）
+
+
+def _history_known_ids():
+    """首次调用时把已落盘的历史会话指纹读进内存 —— 这样"重跑采集/翻页重叠"不会重复记。"""
+    if _HISTORY_IDS_LOADED["done"]:
+        return
+    _HISTORY_IDS_LOADED["done"] = True
+    try:
+        if not os.path.exists(HISTORY_FILE):
+            return
+        with open(HISTORY_FILE, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                fp = str((rec or {}).get("fingerprint") or "")
+                if fp:
+                    _HISTORY_DEDUP[fp] = 0.0
+        if _HISTORY_DEDUP:
+            print(f"[QCRecorder] 已载入 {len(_HISTORY_DEDUP)} 条历史会话指纹（重跑不会重复记）")
+    except Exception as e:
+        print(f"[QCRecorder] ⚠️ 读取历史语料指纹失败（不影响继续）：{e}")
+
+
+def _append_history_record(data):
+    """把质检页采集到的一条"整段历史会话"追加写入 JSONL。返回 True = 真的写入了。
+
+    只落盘、零出站；防刷：
+      ① 消息少于 2 条、或整段里没有客服发言 -> 忽略（对蒸馏没用）；
+      ② 同一会话（会话ID 或消息指纹）只记一次，且**跨重启**也去重（见 _history_known_ids）；
+      ③ 任何异常只打印，绝不影响采集器与页面。
+    """
+    try:
+        data = data or {}
+        msgs = data.get("messages")
+        if not isinstance(msgs, list):
+            return False
+        clean = []
+        for m in msgs[:_HISTORY_MAX_MSGS]:
+            if not isinstance(m, dict):
+                continue
+            txt = " ".join(str(m.get("text") or "").split())[:2000]
+            if not txt:
+                continue
+            s = str(m.get("sender") or "")
+            clean.append({"sender": s if s in ("player", "agent", "system") else "unknown", "text": txt})
+        if len(clean) < 2:
+            return False
+        if not any(m["sender"] == "agent" and len(m["text"]) >= 2 for m in clean):
+            return False                                   # 没有客服发言 => 对蒸馏没价值
+        _history_known_ids()
+        sid = str(data.get("sessionId") or "").strip()
+        import hashlib
+        body = "||".join(m["sender"] + ":" + m["text"] for m in clean)
+        fp = sid or hashlib.md5(body.encode("utf-8")).hexdigest()
+        if fp in _HISTORY_DEDUP:
+            return False                                   # 已记过（重跑/翻页重叠/同一条被点两次）
+        _HISTORY_DEDUP[fp] = time.time()
+        if len(_HISTORY_DEDUP) > 20000:
+            for k in sorted(_HISTORY_DEDUP, key=lambda k: _HISTORY_DEDUP[k])[:10000]:
+                _HISTORY_DEDUP.pop(k, None)
+        rec = {
+            "fingerprint": fp,
+            "sessionId": sid,
+            "recordedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "scannedAt": int(data.get("scannedAt") or int(time.time() * 1000)),
+            "category": str(data.get("category") or "")[:80],
+            "score": data.get("score") or 0,
+            "aiScore": data.get("aiScore") or 0,
+            "aiResult": str(data.get("aiResult") or "")[:20],
+            "reviewer": str(data.get("reviewer") or "")[:20],
+            "source": str(data.get("source") or "")[:20],
+            "language": str(data.get("language") or "")[:20],
+            "game": str(data.get("game") or "")[:40],
+            "agent": str(data.get("agent") or "")[:40],
+            "page": int(data.get("page") or 0),
+            "row": int(data.get("row") or 0),
+            "qcVersion": str(data.get("qcVersion") or "")[:16],
+            "messages": clean,
+        }
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        print(f"[QCRecorder] ⚠️ 记录失败（不影响页面）：{e}")
         return False
 
 
@@ -1192,16 +1453,36 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
                                       "content": body, "groupID": group_id}, "超时关单",
                                      origin=_auto_origin(group_id), require_page=True, auto=True)
             else:
-                await send_to_player({"command": "SEND_REPLY", "content": body,
-                                      "groupID": group_id}, "AFK 自动回复",
-                                     origin=_auto_origin(group_id), require_page=True, auto=True)
+                # ★ V8.6：多段回复 -> 段间随机几秒，**逐条发出**（每段仍各自过安全闸 + 核对页面绑定）
+                _segs = (split_reply(body, int(config.get("multi_send_max_seg", 5) or 5))
+                         if multi_send_on() else [body])
+                if len(_segs) > 1:
+                    asyncio.create_task(send_segments_drip(group_id, conv.get("name") or group_id,
+                                                           _segs, "AFK 自动回复"))
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "AI_STATUS", "status": "ok",
+                                            "message": f"AI 已分 {len(_segs)} 段回复（段间随机几秒逐条发）"})
+                else:
+                    await send_to_player({"command": "SEND_REPLY", "content": body,
+                                          "groupID": group_id}, "AFK 自动回复",
+                                         origin=_auto_origin(group_id), require_page=True, auto=True)
         else:
             # 半自动模式：草稿推到网页与手机输入框（同样已过安全闸）
             #   ★ V8.0.2：带 noOverwrite —— 输入框里如果已经有客服自己写的内容，**绝不覆盖**
-            await send_to_player({"command": "FILL_DRAFT", "content": body, "category": "其他",
+            #   ★ V8.6：多段回复**只粘第 1 段**，其余排队 —— 客服发出第 1 段后自动粘下一条
+            _segs = (split_reply(body, int(config.get("multi_send_max_seg", 5) or 5))
+                     if multi_send_on() else [body])
+            _first = _segs[0] if _segs else body
+            await send_to_player({"command": "FILL_DRAFT", "content": _first, "category": "其他",
                                   "groupID": group_id, "noOverwrite": True}, "半自动草稿",
                                  origin=_auto_origin(group_id), require_page=True, auto=True)
-            for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": body})
+            for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": _first})
+            if len(_segs) > 1:
+                queue_reply_segments(group_id, conv.get("name") or group_id, _segs, "半自动草稿")
+                for m in list(active_clients["mobile"]):
+                    await safe_send(m, {"type": "AI_STATUS", "status": "ok",
+                                        "message": f"已起草第 1/{len(_segs)} 段（共 {len(_segs)} 段）"
+                                                   f"——你发出后会自动粘下一段"})
 
 
 # ================= 手机端 H5 界面 =================
@@ -2569,11 +2850,21 @@ async def api_fill_draft(request):
     if not active_clients["extension"]:
         return web.json_response({"ok": False, "error": "电脑端探针未连接（网页没开 / 脚本没跑）"}, status=503)
     # ★ V8.0：`?test=1` 时只发给**测试探针** —— 测试脚本调用本接口不许往客服真实页面的回复框里填字
-    await send_to_player({"command": "FILL_DRAFT", "content": content}, "F9/F10 直填",
+    # ★ V8.6：多段回复只填第 1 段，其余排队（用"网页当前工单"当键，客服发出去后自动续粘）
+    _gid = page_gid()
+    _segs = (split_reply(content, int(config.get("multi_send_max_seg", 5) or 5))
+             if (multi_send_on() and _gid) else [content])
+    _first = _segs[0] if _segs else content
+    await send_to_player({"command": "FILL_DRAFT", "content": _first}, "F9/F10 直填",
                          origin=("test" if request.query.get("test") == "1" else None))
+    if len(_segs) > 1:
+        _qname = str((state["companies"]["main"]["conversations"].get(_gid) or {}).get("name") or _gid)
+        queue_reply_segments(_gid, _qname, _segs, "F9/F10 直填")
     return web.json_response({"ok": True, "clients": len(active_clients["extension"]),
                               "test": request.query.get("test") == "1",
-                              "filtered": left})
+                              "filtered": left,
+                              "segments": len(_segs),
+                              "queue_gid": _gid if len(_segs) > 1 else ""})
 
 def _kb_stats():
     """知识库概况（诊断页用）。任何异常都不能影响诊断接口本身。"""
@@ -2680,6 +2971,23 @@ async def api_diag(request):
         "server_ver": SERVER_VER,
         # ★ V8.3：已捕获的人工回复样本数（distill_rules.py 的语料；0 说明探针还没记到，不是坏了）
         "demo_records": int(state.get("demo_records") or 0),
+        # ★ V8.6：半自动"待发段"队列（客服发出上一段后会自动粘下一段；HUD 会显示它）
+        "reply_queue": {_g: {"name": _q.get("name"), "total": _q.get("total"),
+                             "sent": _q.get("sent"), "remaining": len(_q.get("remaining") or []),
+                             "next": ((_q.get("remaining") or [""])[0] or "")[:60],
+                             "source": _q.get("source"),
+                             "age_sec": int(time.time() - float(_q.get("ts") or 0))}
+                        for _g, _q in list(_REPLY_QUEUE.items())[:5]},
+        # ★ V8.6：电脑端提醒兜底（探针出不了声时，由桌面悬浮窗响铃）
+        "sound_ok": state.get("probe_sound_ok", True),
+        "desktop_ding": state.get("desktop_ding") or {},
+        "desktop_alarm": state.get("desktop_alarm") or {},
+        "sound_blocked": state.get("sound_blocked") or {},
+        # ★ QC：质检页历史语料采集（走独立通道 /ws/qc，与工作台探针/出站链路完全无关）
+        "history_records": int(state.get("history_records") or 0),
+        "qc_clients": int(state.get("qc_clients") or 0),
+        "qc_sweep": state.get("qc_sweep") or {},
+        "qc_sweep_done": state.get("qc_sweep_done") or {},
         "features": state.get("features") or feature_flags(),
         # ★ V7.9 安全状态：出站总开关 + "网页当前打开的工单" + 测试客户端数（一键止血/防发错人）
         "safety": {
@@ -2989,6 +3297,16 @@ async def diag_page_handler(request):
                  row("问题分类数", len(state.get("category_options") or [])) +
                  row("人工样本（蒸馏语料）", "%s 条 · 见 demonstrations.jsonl（离线跑 distill_rules.py 提炼话术）"
                      % int(state.get("demo_records") or 0)) +
+                 row("历史会话样本（质检页采集）", "%s 条 · 见 demonstrations_history.jsonl"
+                     "（distill_rules.py --mode history）"
+                     % int(state.get("history_records") or 0)) +
+                 row("质检页采集器", ("已连接 %d 个" % int(state.get("qc_clients") or 0)) +
+                     (" · 最近进度 已采 %s / 跳过 %s / 失败 %s"
+                      % ((state.get("qc_sweep") or {}).get("done", 0),
+                         (state.get("qc_sweep") or {}).get("skipped", 0),
+                         (state.get("qc_sweep") or {}).get("failed", 0))
+                      if state.get("qc_sweep") else
+                      ' · 未开始（<a href="/api/qc_sweep?on=1">点这里启动采集</a>）')) +
                  row("规章条目", "%s 条 / %s 张表" % (kb.get("total_rows", kb.get("error", "-")),
                                                       kb.get("sheets", "-"))) +
                  row("常驻静态区", "%s 字符" % kb.get("static_chars", "-")) +
@@ -2996,6 +3314,157 @@ async def diag_page_handler(request):
 
     html = DIAG_HTML.replace("$CARDS", "".join(cards)).replace("$EXPECT_VER", SERVER_VER)
     return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+# ==================== ★ QC 采集器：独立通道 /ws/qc + 启停接口（与工作台探针物理隔离） ====================
+# 为什么单独开一条通道：质检页采集器只做"读历史 + 落盘"，它**绝不能**被当成工作台探针——
+#   不进 ext_targets（不会被下发 FILL_DRAFT / SEND_REPLY 之类的发送指令）、
+#   不进手机端会话列表、不推 Bark。分开一条 WS 通道 = 从物理上杜绝这类事故。
+_QC_CONNS = set()
+
+
+async def qc_probe_js_handler(request):
+    """把质检页采集器脚本发给浏览器（`http://IP:8765/qc_probe.js`）。
+
+    与 /probe.js 同款：把 @match 里的占位域名替换成本机 config.json → workbench_domains 的真实域名。
+    安装方法见 README 7.9；★ 请从这个地址复制，别直接复制项目目录里的文件（域名是占位符）。
+    """
+    path = os.path.join(BASE_DIR, "qc_probe.js")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            body = render_probe_js(f.read())
+    except Exception:
+        return web.json_response({"ok": False, "error": "qc_probe.js 不存在于项目目录"}, status=404)
+    headers = {"Cache-Control": "no-store"}
+    if request.query.get("download"):
+        headers["Content-Disposition"] = 'attachment; filename="qc_probe.js"'
+    return web.Response(text=body, content_type="application/javascript", headers=headers)
+
+
+async def api_qc_status(request):
+    """质检页采集器的状态：连没连上、上一次扫描进度、已采到多少条历史语料。"""
+    return web.json_response({
+        "ok": True,
+        "clients": len(_QC_CONNS),
+        "hello": state.get("qc_hello") or {},
+        "progress": state.get("qc_sweep") or {},
+        "last_done": state.get("qc_sweep_done") or {},
+        "history_records": int(state.get("history_records") or 0),
+        "history_file": os.path.basename(HISTORY_FILE),
+        "dump": state.get("qc_dump") or {},          # ★ 质检页结构回报（/api/qc_sweep?dump=1 触发后看这里）
+        "script_url": "/qc_probe.js",
+        "hint": "clients=0 说明质检页没装/没启用采集器脚本：打开 http://127.0.0.1:8765/qc_probe.js "
+                "复制到油猴（详见 README 7.9）",
+    })
+
+
+async def api_qc_sweep(request):
+    """启动/停止质检页历史采集（**只发指令给质检采集器**，绝不碰工作台探针）。
+
+    用法：
+      `/api/qc_sweep?on=1&max_rows=60&min_score=90&pages=4&row_delay_ms=2500`
+      `/api/qc_sweep?on=0`  停止（当前这一条读完就停）
+    """
+    on = str(request.query.get("on", "1")).lower() not in ("0", "false", "no")
+    # ?dump=1：让采集器把"详情面板的真实结构"回报过来（只读排障，用来校准正文节点/关闭键）
+    if str(request.query.get("dump", "")).lower() in ("1", "true", "yes"):
+        payload = {"command": "QC_DUMP"}
+    else:
+        payload = {"command": "QC_SWEEP", "on": on}
+    if payload["command"] == "QC_SWEEP":
+        for key, cast in (("max_rows", int), ("pages", int), ("row_delay_ms", int), ("min_score", float)):
+            raw = request.query.get(key)
+            if raw is None:
+                continue
+            try:
+                payload[key] = cast(float(raw))
+            except Exception:
+                pass
+    sent = 0
+    for w in list(_QC_CONNS):
+        try:
+            await safe_send(w, payload)
+            sent += 1
+        except Exception:
+            pass
+    if sent:
+        print(f"[QC] 📤 已{'启动' if on else '停止'}历史采集：{json.dumps(payload, ensure_ascii=False)}")
+    return web.json_response({"ok": bool(sent), "targets": sent, "payload": payload,
+                              "hint": "没有采集器在线？先在质检页装好 /qc_probe.js（README 7.9）；"
+                                      "dump=1 的结果看 /api/qc_status 的 dump 字段"})
+
+
+async def ws_qc_handler(request):
+    """质检页采集器专用 WebSocket（qc_probe.js 连这里）。
+
+    ★ 与 /ws/extension（工作台探针）完全隔离：
+      · 收到的事件只做两件事 —— 落盘历史语料、更新诊断进度；
+      · 不广播给手机端、不写 state["companies"]、不推 Bark；
+      · 不在 ext_targets 里，因此**永远不会**被下发发送/填草稿类指令。
+    """
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    _QC_CONNS.add(ws)
+    state["qc_clients"] = len(_QC_CONNS)
+    print(f"[QC] ✅ 采集器已连接（当前 {len(_QC_CONNS)} 个）· 来源: {request.headers.get('Referer', '未知')}")
+    try:
+        async for msg in ws:
+            if msg.type != web.WSMsgType.TEXT:
+                continue
+            try:
+                pkt = json.loads(msg.data)
+            except Exception:
+                continue
+            if not isinstance(pkt, dict):
+                continue
+            ev = str(pkt.get("event") or "")
+            data = pkt.get("data") or {}
+            if ev in ("QC_HELLO", "QC_HEARTBEAT"):
+                state["qc_hello"] = {"version": str(data.get("version") or "")[:16],
+                                     "page": str(data.get("page") or "")[:200],
+                                     "ua": str(data.get("ua") or "")[:120],
+                                     "running": bool(data.get("running")),
+                                     "last_seen": int(time.time())}
+                if ev == "QC_HELLO":
+                    print(f"[QC] 🚀 采集器握手：v{state['qc_hello']['version'] or '?'} · "
+                          f"{state['qc_hello']['page'] or '未提供页面地址'}")
+                continue
+            if ev == "RECORD_HISTORY_SESSION":
+                try:
+                    added = await asyncio.get_event_loop().run_in_executor(
+                        None, _append_history_record, data)
+                except Exception as e:
+                    print(f"[QCRecorder] ⚠️ 落盘失败（不影响页面）：{e}")
+                    added = False
+                if added:
+                    state["history_records"] = int(state.get("history_records") or 0) + 1
+                    print(f"[QCRecorder] 成功捕获 1 条历史会话样本（累计 {state['history_records']}）"
+                          f" · 分类：{str(data.get('category') or '')[:28]}"
+                          f" · 评分：{data.get('score') or '-'}"
+                          f" · 消息：{len(data.get('messages') or [])} 条")
+                continue
+            if ev == "QC_SWEEP_PROGRESS":
+                state["qc_sweep"] = dict(data)
+                state["qc_sweep"]["ts"] = int(time.time())
+                if int(data.get("done") or 0) % 5 == 0:
+                    print(f"[QC] 进度：已采 {data.get('done')} / 跳过 {data.get('skipped')} / "
+                          f"失败 {data.get('failed')} · 第 {data.get('page')} 页"
+                          + (f" · {data.get('lastError')}" if data.get("lastError") else ""))
+                continue
+            if ev == "QC_SWEEP_DONE":
+                state["qc_sweep_done"] = dict(data)
+                state["qc_sweep_done"]["ts"] = int(time.time())
+                print(f"[QC] ✅ 扫描结束：{json.dumps(data, ensure_ascii=False)[:240]}")
+                continue
+            if ev == "QC_DEBUG":
+                state["qc_dump"] = dict(data)
+                print(f"[QC] 🧭 结构回报：{json.dumps(data, ensure_ascii=False)[:600]}")
+                continue
+    finally:
+        _QC_CONNS.discard(ws)
+        state["qc_clients"] = len(_QC_CONNS)
+        print(f"[QC] 采集器已断开（剩 {len(_QC_CONNS)} 个）")
+    return ws
 
 
 async def ws_ext_handler(request):
@@ -3198,6 +3667,18 @@ async def ws_ext_handler(request):
                         await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": emsg})
                     continue
 
+                # ★ V8.6：探针报"浏览器不给出声"（需先点/按一下页面）——只记录+提示，不改任何状态
+                if ev == "SOUND_BLOCKED":
+                    data = pkt.get("data") or {}
+                    state["sound_blocked"] = {"what": str(data.get("what") or "")[:16],
+                                              "ts": int(time.time()),
+                                              "hint": str(data.get("hint") or "")[:80]}
+                    if ws not in TEST_WS:
+                        state["probe_sound_ok"] = False
+                    print(f"[提醒] 🔇 探针出不了声（{state['sound_blocked']['what']}）：请在工作台页面"
+                          f"点一下或按一下键；在那之前由桌面悬浮窗兜底提醒")
+                    continue
+
                 # ★ V8.3：人工回复"影子录制" —— 客服真人发出的回复 + 当时的工单上下文，落盘给离线蒸馏用。
                 #   铁律：
                 #     ① 这条分支**只落盘、零出站**（不填草稿/不发送/不改状态），所以不需要也不允许走 safe_outbound
@@ -3214,6 +3695,16 @@ async def ws_ext_handler(request):
                     if added:
                         state["demo_records"] = int(state.get("demo_records") or 0) + 1
                         print("[DemoRecorder] 成功捕获 1 条人工标准回复样本")
+                    # ★ V8.6：半自动"分段回复"——客服把上一条发出去后，自动把下一段粘进输入框
+                    #   （安全阀见 advance_reply_queue：不像他发的那段就丢弃队列，绝不硬塞）
+                    try:
+                        _d = pkt.get("data") or {}
+                        _mgid = str(_d.get("groupID") or "")
+                        _mtxt = str(_d.get("humanReply") or "")
+                        if _mgid and _mtxt and ws not in TEST_WS and _mgid in _REPLY_QUEUE:
+                            await advance_reply_queue(_mgid, _mtxt)
+                    except Exception as e:
+                        print(f"[分段回复] 续粘失败（不影响发送）：{e}")
                     continue
 
                 # ★ V8.0：探针上报"网页左侧会话列表"（手机端"全部会话"的数据源 + 切会话的依据）
@@ -3320,6 +3811,14 @@ async def ws_ext_handler(request):
                 if ev == "ABNORMAL_OFFLINE":
                     # 异常掉线警报闭环（探针在页面上确实读到"离线"才会发这个事件）
                     state["alarm_status"] = True
+                    # ★ V8.6：探针若报"出不了声"，让桌面悬浮窗兜底报警（否则电脑静悄悄）
+                    _ad = pkt.get("data") or {}
+                    if "sound_ok" in _ad:
+                        state["probe_sound_ok"] = bool(_ad.get("sound_ok"))
+                    if _ad.get("sound_ok") is False and ws not in TEST_WS:
+                        state["desktop_alarm"] = {"ts": int(time.time() * 1000),
+                                                  "why": "探针无法出声（掉线警笛）"}
+                        print("[提醒] 🚨 探针出不了声 -> 已请桌面悬浮窗兜底报警")
                     apply_im_status(3, manual=False, source="异常掉线", persist=(ws not in TEST_WS))
                     # 推送给手机端
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
@@ -3347,6 +3846,10 @@ async def ws_ext_handler(request):
                     #   后续自动起草/自动回复只打到测试探针 —— 绝不填/发客服的真实工单。
                     _is_test_origin = (ws in TEST_WS)
                     state["automation_origin_test"] = _is_test_origin
+                    # ★ V8.6：记住"浏览器到底能不能出声"（探针上报的 sound_ok）——
+                    #   出不了声时就由桌面悬浮窗兜底响铃（见下面的 desktop_ding / desktop_alarm）
+                    if not _is_test_origin and "sound_ok" in payload:
+                        state["probe_sound_ok"] = bool(payload.get("sound_ok"))
                     gid = payload.get("groupID")
                     # ★ V8.3：这次上报**之前**网页打开着哪条会话 —— 用来区分
                     #   "我正在看的会话来了新消息"（该提示）与"我刚切到另一条工单"（不该提示/不该推 Bark）。
@@ -3466,6 +3969,13 @@ async def ws_ext_handler(request):
                             #   "bark_on_new_message": false 关掉）。push_bark 内部走线程池，不阻塞事件循环。
                             if config.get("bark_on_new_message", True) and not _is_test_origin:
                                 push_bark(f"💬 {name} 新消息", preview or "（玩家发来新消息）", gid)
+                            # ★ V8.6 兜底：探针报"浏览器出不了声"（没点过/没按过页面）时，
+                            #   让**桌面悬浮窗**来响一声 —— 客服的电脑一定要能听见提醒。
+                            if payload.get("sound_ok") is False:
+                                state["desktop_ding"] = {"ts": int(new_ts or (time.time() * 1000)),
+                                                         "name": name, "preview": preview[:40],
+                                                         "why": "浏览器未授权出声（需先点/按一下工作台页面）"}
+                                print("[提醒] 🔊 探针出不了声 -> 已请桌面悬浮窗兜底响铃")
                     except Exception as e:
                         print(f"[新消息] 通知失败（不影响主流程）：{e}")
 
@@ -4003,6 +4513,11 @@ app.router.add_get("/api/outbound", api_outbound)
 app.router.add_get("/api/purge_test_data", api_purge_test_data)
 app.router.add_get("/ws/extension", ws_ext_handler)
 app.router.add_get("/ws/mobile", ws_mobile_handler)
+# ★ QC：质检页历史会话采集（独立通道 + 独立脚本，与工作台探针互不影响）
+app.router.add_get("/qc_probe.js", qc_probe_js_handler)
+app.router.add_get("/api/qc_status", api_qc_status)
+app.router.add_get("/api/qc_sweep", api_qc_sweep)
+app.router.add_get("/ws/qc", ws_qc_handler)
 
 if __name__ == "__main__":
     local_ip = get_local_ip()

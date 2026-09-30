@@ -157,9 +157,11 @@ _srv.err
 # 人工回复影子录制语料（含真实玩家昵称/对话，**绝对不入库**）
 demonstrations.jsonl
 demonstrations.test.jsonl
+# 质检页历史会话语料（qc_probe.js 采集，同样含真实玩家对话，**绝不入库**）
+demonstrations_history.jsonl
 
 # 蒸馏产物（distill_rules.py 生成，人工确认后再并入补丁库）
-distilled_patch.txt
+distilled_patch*.txt
 
 # ==================== 本地工具与临时产物（不入库） ====================
 # Cline skills / 单文件 skill

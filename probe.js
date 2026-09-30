@@ -33,6 +33,9 @@
     };
 
     let audioCtx = null;
+    let audioReady = false;          // ★ 只有"真的能出声"才为 true（浏览器未授权时是 false）
+    let audioWarned = false;         // 是否已经提示过"需要点一下页面"
+    let lastSoundWarnAt = 0;         // 上报"出不了声"的节流
     let sirenInterval = null;
     let isManualOffline = false;
     // ★ V7.5：手动"离开"状态（离线或忙碌）——客服铁律：离线/忙碌都不许被网页自动改成在线
@@ -367,13 +370,41 @@
     }
 
     // ==================== 音效引擎 ====================
+    // ★ V8.6 血泪修复：**浏览器要求"用户先点过/按过页面"才允许出声**（WebAudio 的硬规则）。
+    //   旧版 initAudio() 只是"尝试 resume"、从不检查结果，而且只有"点击页面"才会调用它 ——
+    //   客服如果只打字 + 回车（不点页面），AudioContext 会一直是 suspended：
+    //   **新消息叮咚、掉线警笛会一起哑掉**（刷新/重贴脚本后必然复发，客服投诉的"怎么又不提醒了"就是它）。
+    //   现在：① 每次按键/聚焦/切换可见性都尝试解锁；② 真出不了声就**如实**告诉中继（由桌面悬浮窗兜底响铃）+ 胶囊提示。
     function initAudio() {
-        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        if (audioCtx.state === 'suspended') audioCtx.resume();
+        try {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+            audioReady = (audioCtx && audioCtx.state === 'running');
+            if (!audioReady && !audioWarned) {
+                audioWarned = true;
+                console.warn("🔇 [探针] 浏览器还没允许本页出声：请在工作台页面上**点一下或按一下键**"
+                             + "（在那之前：新消息叮咚 / 掉线警笛都不会响；中继会让桌面悬浮窗兜底提醒）。");
+                setChip('waiting', "🔇 点一下工作台页面才能出声");
+            } else if (audioReady && audioWarned) {
+                audioWarned = false;
+                console.log("🔊 [探针] 提示音已恢复");
+                setChip('connected', "");
+            }
+        } catch (e) { audioReady = false; }
+        return audioReady;
+    }
+
+    // 出不了声时如实上报（节流 10 秒，避免刷屏）——中继据此让**桌面悬浮窗**兜底响铃
+    function reportSoundBlocked(what) {
+        const now = Date.now();
+        if (now - lastSoundWarnAt < 10000) return;
+        lastSoundWarnAt = now;
+        sendToBrain({ event: "SOUND_BLOCKED", data: { what: what, sound_ok: false,
+                                                      hint: "浏览器需要一次点击/按键才允许出声" } });
     }
 
     function playDingDong() {
-        initAudio();
+        if (!initAudio()) { reportSoundBlocked("ding"); return false; }
         try {
             const now = audioCtx.currentTime;
             const osc1 = audioCtx.createOscillator(), gain1 = audioCtx.createGain();
@@ -391,14 +422,16 @@
             gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.6);
             osc2.connect(gain2); gain2.connect(audioCtx.destination);
             osc2.start(now + 0.1); osc2.stop(now + 0.7);
-        } catch (e) {}
+            return true;
+        } catch (e) { return false; }
     }
 
     function playSiren() {
-        initAudio();
-        if (sirenInterval) return;
+        if (!initAudio()) { reportSoundBlocked("siren"); return false; }
+        if (sirenInterval) return true;
         sirenInterval = setInterval(() => {
             try {
+                if (!audioReady) { initAudio(); return; }      // 还没解锁：等解锁了再响
                 const now = audioCtx.currentTime;
                 const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
                 osc.type = 'sawtooth';
@@ -410,6 +443,23 @@
                 osc.start(now); osc.stop(now + 0.8);
             } catch (e) {}
         }, 1000);
+        return true;
+    }
+
+    // 解锁提示音：按键 / 聚焦 / 切回本页 —— 任意一个都算"用户手势"，不再依赖"必须点一下"
+    function setupAudioUnlock() {
+        try {
+            document.addEventListener('keydown', function () {
+                try { initAudio(); } catch (e) {}
+            }, true);
+        } catch (e) {}
+        try {
+            window.addEventListener('focus', function () { try { initAudio(); } catch (e) {} });
+            document.addEventListener('visibilitychange', function () {
+                try { if (!document.hidden) initAudio(); } catch (e) {}
+            });
+            window.addEventListener('pageshow', function () { try { initAudio(); } catch (e) {} });
+        } catch (e) {}
     }
 
     function stopSiren() {
@@ -1440,7 +1490,8 @@
         //    （否则手机端会一直显示旧状态，手动挂"离线"更是永远同步不过去）
         sendToBrain({
             event: "IM_STATUS",
-            data: { status: imStatusCode(currentStatus), manual: manualByUser, via_relay: manualViaRelay }
+            data: { status: imStatusCode(currentStatus), manual: manualByUser, via_relay: manualViaRelay,
+                    sound_ok: audioReady }
         });
 
         // 2) 只有"异常掉线"才拉警报；手动离线不报警
@@ -1449,7 +1500,7 @@
                 stopSiren();
             } else {
                 playSiren();
-                sendToBrain({ event: "ABNORMAL_OFFLINE" });
+                sendToBrain({ event: "ABNORMAL_OFFLINE", data: { sound_ok: audioReady } });
             }
         } else {
             stopSiren();
@@ -1500,7 +1551,8 @@
 
         const payload = {
             event: "PLAYER_MESSAGE",
-            data: { groupID: ident.gid, name: ident.name, messages: messages, playerInfo: playerInfo }
+            data: { groupID: ident.gid, name: ident.name, messages: messages, playerInfo: playerInfo,
+                    sound_ok: audioReady }        // ★ 浏览器能不能出声（false 时中继让桌面悬浮窗兜底响铃）
         };
         // 未连接时不更新 hash，等重连后自动补发
         if (!sendToBrain(payload)) return;
@@ -1788,6 +1840,7 @@
     };
 
     // ==================== 启动 ====================
+    setupAudioUnlock();                 // ★ V8.6：按键/聚焦即解锁提示音（不再依赖"必须点一下页面"）
     setupManualReplySniffer();          // ★ V8.3：人工回复静默嗅探（只读录制，绝不影响客服操作）
     setChip('idle', "");
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', connectBrain);

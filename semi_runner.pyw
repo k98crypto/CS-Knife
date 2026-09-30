@@ -162,6 +162,26 @@ def long_human_alarm():
     except Exception:
         pass
 
+
+# ★ V8.6 兜底提示音：浏览器（探针）出不了声时，由悬浮窗替它响 —— 客服的电脑必须能听见提醒。
+#   只在"中继明确报了 sound_ok=False"时才会响（正常情况仍由网页发声，不会双响）。
+def beep_ding():
+    """新消息"叮咚"（两声音，模仿网页版）。"""
+    try:
+        winsound.Beep(1046, 120)
+        winsound.Beep(1318, 200)
+    except Exception:
+        pass
+
+
+def beep_offline():
+    """掉线兜底警报（低声下行两声；与"人工介入三短一长"明显不同）。"""
+    try:
+        winsound.Beep(700, 300)
+        winsound.Beep(500, 600)
+    except Exception:
+        pass
+
 # ==================== 功能开关（三个 AI 动作可独立关闭） ====================
 # 值来自中继 /api/diag.features（config.json → enable_ai_close / enable_auto_draft / enable_f10_polish）
 FEATURES = {}
@@ -204,6 +224,9 @@ class HUDOverlay:
         self._q = queue.Queue()
         self._pos_fixed = False
         self._staged_text = ""        # 小窗暂存内容（最近提炼/框选预览/F9·F10 结果）——供 ESC 清空
+        self._last_ding_ts = 0        # ★ V8.6：已兜底响过的"新消息叮咚"时间戳（防重复响）
+        self._last_alarm_ts = 0       # ★ V8.6：已兜底报过的"掉线警报"时间戳
+        self._queue_shown = False     # ★ V8.6：暂存区当前显示的是不是"分段回复待发队列"
         # 记录"我们想要的坐标"。不要依赖 winfo_x()：窗口还没映射时它返回 0，
         # 会把 (962,592) 这种正确位置写成 (0,0)（第七轮踩过的坑）。
         self._target = (DEFAULT_MARGIN, DEFAULT_MARGIN)
@@ -581,6 +604,8 @@ class HUDOverlay:
                     fg=FG_DIM)
                 self._handle_human_alerts(info.get("alerts") or [])
                 self._sync_mode_ui(info)
+                self._handle_desktop_fallback(info, probe)
+                self._handle_reply_queue(info)
         except Exception:
             pass
 
@@ -618,6 +643,53 @@ class HUDOverlay:
         suffix = "·手机" if self.mode_owner == "mobile" else ""
         try:
             self.btn_mode.config(text=short + suffix, fg=ACCENT if m == "afk" else FG_DIM)
+        except Exception:
+            pass
+
+    def _handle_reply_queue(self, info):
+        """★ V8.6：半自动"分段回复"的待发队列 —— 在暂存区告诉你"还有几段待发、下一段会自动粘"。"""
+        try:
+            q = (info or {}).get("reply_queue") or {}
+            if not q:
+                if self._queue_shown:                      # 队列结束了：把暂存区还原成占位提示
+                    self._queue_shown = False
+                    self.update_ui(last=STAGED_PLACEHOLDER, last_color=FG_DIM)
+                return
+            gid, item = list(q.items())[0]
+            nxt = str(item.get("next") or "").strip()
+            total = int(item.get("total") or 0)
+            sent = int(item.get("sent") or 0)
+            self._queue_shown = True
+            tail = (f"（发出上一条后自动粘）｜下一段：{nxt[:40]}" if nxt else "｜最后一段，发出即完成")
+            self.update_ui(last=f"📨 {item.get('name') or gid}：待发第 {sent + 1}/{total} 段" + tail,
+                           last_color=ACCENT)
+        except Exception:
+            pass
+
+    def _handle_desktop_fallback(self, info, probe):
+        """★ V8.6 兜底提醒：探针（浏览器）出不了声时，由悬浮窗替它响铃。
+
+        为什么会需要：浏览器要求"用户先点过/按过页面"才允许 WebAudio 出声。
+        客服如果只打字+回车，网页的"新消息叮咚/掉线警笛"会一直哑着 —— 这里保证**电脑一定有提醒**。
+        只有中继明确报 sound_ok=False 时才响（正常情况仍由网页发声，不会双响）。
+        """
+        try:
+            ding = (info or {}).get("desktop_ding") or {}
+            ts = int(ding.get("ts") or 0)
+            if ts and ts != self._last_ding_ts:
+                self._last_ding_ts = ts
+                threading.Thread(target=beep_ding, daemon=True).start()
+                self.update_ui(last=f"🔔 [兜底响铃] {ding.get('name') or ''}：{(ding.get('preview') or '')[:50]}",
+                               last_color=ACCENT)
+            sound_ok = bool((info or {}).get("sound_ok", (probe or {}).get("sound_ok", True)))
+            alarm = (info or {}).get("desktop_alarm") or {}
+            ats = int(alarm.get("ts") or 0)
+            if ats and ats != self._last_alarm_ts:
+                self._last_alarm_ts = ats
+                self.update_ui(status="🚨 掉线警报（悬浮窗兜底发声）", status_color=DANGER)
+            # 掉线中且探针出不了声 -> 每 5 秒响一次，直到恢复/探针解锁
+            if (alarm or (info or {}).get("alarm_status")) and not sound_ok:
+                threading.Thread(target=beep_offline, daemon=True).start()
         except Exception:
             pass
 
