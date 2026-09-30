@@ -142,6 +142,40 @@
         return Array.from(last.querySelectorAll('.el-cascader-node')).filter(n => n.offsetParent !== null);
     }
 
+    // ==================== ★ V8.8：问题分类「真实菜单」读取 / 搜索 / 按路径选择 ====================
+    // 🛑 铁律：分类**只能来自网页上真实存在的菜单**，绝不写死/猜测/兜底取第一项。
+    //   · categoryNodeInfo()    ：把可见的级联面板项读成 { text, hasChildren }
+    //   · exploreCategory(path) ：按路径**下钻读下一层**（只点"有子级"的节点 -> 不会真的选中/提交任何值）
+    //   · searchCategory(kw)    ：优先用**网页自己的级联搜索框**（Element filterable 自带）搜，返回完整路径
+    //   · selectCategoryPath()  ：真正关单时用 —— 逐层点到位并**逐层校验**；任一层对不上就中止并回传该层真实选项
+    function categoryTrigger() {
+        return document.querySelector('.el-cascader input, .el-cascader__search-input, input[placeholder="请选择问题分类"]');
+    }
+    function categorySearchInput() {
+        return document.querySelector('.el-cascader__search-input, .el-cascader input[placeholder*="搜索"], input[placeholder*="搜索"]');
+    }
+    function closeCategoryDropdown() {
+        try { document.body.click(); } catch (e) {}
+        try {
+            const esc = new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, which: 27, bubbles: true });
+            const t = categoryTrigger();
+            (t || document).dispatchEvent(esc);
+        } catch (e) {}
+    }
+    function categoryNodeInfo(n) {
+        let text = "", hasChildren = false;
+        try { text = normText(n.innerText || ""); } catch (e) {}
+        try {
+            hasChildren = !!(n.querySelector && n.querySelector(
+                '.el-cascader-node__postfix, .el-icon-arrow-right, i[class*="arrow-right"]'));
+            if (!hasChildren) {
+                const cls = String((n.className || "") + "");
+                hasChildren = cls.indexOf("is-leaf") === -1 && !!n.querySelector("i");
+            }
+        } catch (e) {}
+        return { text: text, hasChildren: !!hasChildren };
+    }
+
     // ==================== 问题分类缓存（避免"下拉框自己跑下来"） ====================
     // 用户自己点开分类下拉时顺手把选项缓存下来；后端来问时优先给缓存，不再主动去点开。
     const CATEGORY_CACHE_MS = 30 * 60 * 1000;
@@ -726,6 +760,190 @@
             };
             setTimeout(step, 300);
         },
+        // ★ V8.8：**按真实路径**逐层选（比"关键字兜底"更准，且选不中就不关单）
+        //   path = ["一级","二级","三级"]（来自网页真实菜单，由中继/手机选择）
+        selectCategoryPath: function (path, cb) {
+            const want = (path || []).map(normText).filter(Boolean);
+            const finish = (res) => { try { cb && cb(res || {}); } catch (e) {} };
+            const trig = categoryTrigger();
+            if (!trig) {
+                finish({ ok: false, level: 0, path: [], options: [],
+                         error: "页面上没找到问题分类选择器（工单可能还没打开/还没渲染）" });
+                return;
+            }
+            if (!want.length) { finish({ ok: false, error: "没有给出分类路径" }); return; }
+            trig.click();
+            let depth = 0, stalls = 0;
+            const step = () => {
+                const nodes = lastPaneNodes();
+                if (!nodes.length) {
+                    closeCategoryDropdown();
+                    finish({ ok: false, level: depth, path: want.slice(0, depth), options: [],
+                             error: "第 " + (depth + 1) + " 层的分类面板没出现" });
+                    return;
+                }
+                const kw = want[depth];
+                const hit = nodes.find(n => normText(n.innerText) === kw)
+                            || nodes.find(n => normText(n.innerText).indexOf(kw) !== -1);
+                if (!hit) {
+                    const options = nodes.map(categoryNodeInfo);
+                    closeCategoryDropdown();
+                    finish({ ok: false, level: depth + 1, path: want.slice(0, depth), options: options,
+                             error: "第 " + (depth + 1) + " 层没有「" + kw + "」，本层真实选项见 options" });
+                    return;
+                }
+                const info = categoryNodeInfo(hit);
+                const isLast = (depth === want.length - 1);
+                if (!isLast && !info.hasChildren) {      // 还没走完路径就遇到叶子 -> 路径给错了，绝不硬点
+                    const options = nodes.map(categoryNodeInfo);
+                    closeCategoryDropdown();
+                    finish({ ok: false, level: depth + 1, path: want.slice(0, depth), options: options,
+                             error: "第 " + (depth + 1) + " 层「" + info.text + "」已是叶子分类但路径还有下一层，"
+                                    + "路径不匹配，已中止（本层真实选项见 options）" });
+                    return;
+                }
+                const before = document.querySelectorAll('.el-cascader-menu').length;
+                try { hit.click(); } catch (e) {}
+                depth++;
+                setTimeout(() => {
+                    const after = document.querySelectorAll('.el-cascader-menu').length;
+                    if (isLast) {                        // 最后一层：点完应已选中并关闭
+                        let shown = "";
+                        try { shown = String((categoryTrigger() || {}).value || ""); } catch (e) {}
+                        if (!after || shown.indexOf(want[want.length - 1]) !== -1) {
+                            finish({ ok: true, level: depth, path: want, picked: want.join(" / "), options: [] });
+                        } else {
+                            finish({ ok: false, level: depth, path: want.slice(0, depth - 1),
+                                     options: lastPaneNodes().map(categoryNodeInfo),
+                                     error: "点了「" + want[want.length - 1] + "」但分类框里没显示出来（页面没接受）" });
+                        }
+                        return;
+                    }
+                    if (after <= before) {
+                        stalls++;
+                        if (stalls > 1) {
+                            closeCategoryDropdown();
+                            finish({ ok: false, level: depth, path: want.slice(0, depth),
+                                     options: lastPaneNodes().map(categoryNodeInfo),
+                                     error: "点「" + info.text + "」后下一层没有展开" });
+                            return;
+                        }
+                    } else {
+                        stalls = 0;
+                    }
+                    step();
+                }, 260);
+            };
+            setTimeout(step, 320);
+        },
+        // ★ V8.8：只读"按路径下钻看下一层有什么"（只点有子级的节点，不会真选中/提交任何值）
+        exploreCategory: function (path, cb) {
+            const want = (path || []).map(normText).filter(Boolean);
+            const finish = (res) => { try { cb && cb(res || {}); } catch (e) {} };
+            const trig = categoryTrigger();
+            if (!trig) {
+                finish({ ok: false, level: 0, path: [], options: [], error: "页面上没找到问题分类选择器" });
+                return;
+            }
+            trig.click();
+            let depth = 0, stalls = 0;
+            const step = () => {
+                const nodes = lastPaneNodes();
+                if (!nodes.length) {
+                    closeCategoryDropdown();
+                    finish({ ok: false, level: depth, path: want.slice(0, depth), options: [],
+                             error: depth === 0 ? "分类下拉没打开（可能被别的弹层挡住）" : "下一层面板没出现" });
+                    return;
+                }
+                if (depth >= want.length) {              // 到达目标层 -> 读出这一层（含"有没有下一层"）
+                    const options = nodes.map(categoryNodeInfo);
+                    closeCategoryDropdown();
+                    finish({ ok: true, level: depth + 1, path: want.slice(), options: options });
+                    return;
+                }
+                const kw = want[depth];
+                const hit = nodes.find(n => normText(n.innerText) === kw)
+                            || nodes.find(n => normText(n.innerText).indexOf(kw) !== -1);
+                if (!hit) {
+                    const options = nodes.map(categoryNodeInfo);
+                    closeCategoryDropdown();
+                    finish({ ok: false, level: depth + 1, path: want.slice(0, depth), options: options,
+                             error: "第 " + (depth + 1) + " 层没有「" + kw + "」，本层真实选项见 options" });
+                    return;
+                }
+                const info = categoryNodeInfo(hit);
+                if (!info.hasChildren) {                 // 叶子：不再下钻（也**不点它**，避免真的选中）
+                    const options = nodes.map(categoryNodeInfo);
+                    closeCategoryDropdown();
+                    finish({ ok: false, level: depth + 1, path: want.slice(0, depth), options: options,
+                             error: "第 " + (depth + 1) + " 层「" + info.text + "」是叶子分类，没有下一层" });
+                    return;
+                }
+                const before = document.querySelectorAll('.el-cascader-menu').length;
+                try { hit.click(); } catch (e) {}
+                depth++;
+                setTimeout(() => {
+                    if (document.querySelectorAll('.el-cascader-menu').length <= before) {
+                        stalls++;
+                        if (stalls > 1) {
+                            closeCategoryDropdown();
+                            finish({ ok: false, level: depth, path: want.slice(0, depth),
+                                     options: lastPaneNodes().map(categoryNodeInfo),
+                                     error: "点「" + info.text + "」后下一层没有展开" });
+                            return;
+                        }
+                    } else {
+                        stalls = 0;
+                    }
+                    step();
+                }, 260);
+            };
+            setTimeout(step, 320);
+        },
+        // ★ V8.8：用**网页自己的搜索框**搜分类（Element 级联 filterable 自带），返回匹配的完整路径
+        //   没有搜索框就如实回 searchable:false（绝不编造结果），由调用方决定是否退回本地过滤。
+        searchCategory: function (kw, cb) {
+            const finish = (res) => { try { cb && cb(res || {}); } catch (e) {} };
+            const key = normText(kw || "");
+            if (!key) { finish({ ok: false, searchable: false, options: [], error: "没有给出搜索词" }); return; }
+            const trig = categoryTrigger();
+            if (!trig) { finish({ ok: false, searchable: false, options: [], error: "没找到问题分类选择器" }); return; }
+            trig.click();
+            setTimeout(() => {
+                const box = categorySearchInput();
+                if (!box) {
+                    const opts = lastPaneNodes().map(categoryNodeInfo)
+                        .filter(o => o.text.indexOf(key) !== -1)
+                        .map(o => ({ text: o.text, path: [o.text], hasChildren: o.hasChildren }));
+                    closeCategoryDropdown();
+                    finish({ ok: true, searchable: false, options: opts,
+                             error: opts.length ? "" : "网页的分类框没有搜索功能，且当前这层没有匹配项" });
+                    return;
+                }
+                try {
+                    box.focus();
+                    box.value = key;
+                    box.dispatchEvent(new Event('input', { bubbles: true }));
+                } catch (e) {}
+                setTimeout(() => {
+                    const items = Array.from(document.querySelectorAll(
+                        '.el-cascader__suggestion-item, .el-cascader__suggestion-panel li, .el-cascader-menu .el-cascader-node'))
+                        .filter(isVisibleEl);
+                    const out = [];
+                    items.slice(0, 40).forEach(n => {
+                        let t = "";
+                        try {
+                            const lab = n.querySelector('.el-cascader__suggestion-item__label');
+                            t = normText(((lab || n).innerText) || "");
+                        } catch (e) {}
+                        if (t) out.push({ text: t, path: t.split(/\s*[\/>»]\s*/).filter(Boolean) });
+                    });
+                    closeCategoryDropdown();
+                    finish({ ok: true, searchable: true, options: out,
+                             error: out.length ? "" : "网页的搜索框没有返回匹配项" });
+                }, 450);
+            }, 320);
+        },
         // 只读预览一级分类（不做任何选择，仅用于回报给后端/AI 参考）
         // ★ 客户反馈"电脑网页的问题分类下拉老是自己跑下来"：旧版每次探针连上都点开一次。
         //   现在：① 优先用缓存（用户自己点开时顺手采集，零打扰）；
@@ -1285,22 +1503,44 @@
                 const filled = cmd.content ? Operator.fillReplyBox(cmd.content, true) : false;
                 if (cmd.content && !filled) reportActionResult("ACTION_REPLY_CLOSE", false, Operator.editorFailureReason() + "，已停止关单");
                 if (!cmd.content) reportActionResult("ACTION_REPLY_CLOSE", true, "（无结束语，直接关单）");
+                const doClickClose = (delay) => setTimeout(() => {
+                    Operator.clickActionWithRetry(['回复并关单', '回复并关闭', '回复关闭', '回复并结束', '关单'],
+                        "ACTION_REPLY_CLOSE", "已点击「回复并关单」",
+                        { iconHints: ['close-ticket', 'reply-close'] });
+                }, delay);
                 const path = cmd.categoryPath || ["一级分类", "二级分类"];
-                if (cmd.category) {
+                if (cmd.categoryPath && cmd.categoryPath.length) {
+                    // ★ V8.8：**按网页真实路径逐层点选并逐层校验**；选不中就不关单
+                    //   （旧的"关键字兜底"会把分类选错，客服还以为选对了 —— 关单是最不能出错的环节）
+                    reportActionResult("SELECT_CATEGORY", true,
+                        "开始按真实路径选择分类：" + cmd.categoryPath.join(" / "));
+                    Operator.selectCategoryPath(cmd.categoryPath, (res) => {
+                        if (!res || !res.ok) {
+                            reportActionResult("SELECT_CATEGORY", false,
+                                ((res && res.error) || "分类没选上") + "｜已中止关单，请手动选择分类后再关");
+                            return;
+                        }
+                        reportActionResult("SELECT_CATEGORY", true, "已选择分类：" + (res.picked || ""));
+                        doClickClose(1600);
+                    });
+                } else if (cmd.category) {
                     Operator.selectCategory(path[0], path[1], cmd.category, cmd.defaultCategory);
-                    // 留足级联下钻时间，避免分类还没选完就点了"回复并关单"
-                    setTimeout(() => {
-                        Operator.clickActionWithRetry(['回复并关单', '回复并关闭', '回复关闭', '回复并结束', '关单'],
-                            "ACTION_REPLY_CLOSE", "已点击「回复并关单」",
-                            { iconHints: ['close-ticket', 'reply-close'] });
-                    }, 2200);
+                    doClickClose(2200);
                 } else {
-                    setTimeout(() => {
-                        Operator.clickActionWithRetry(['回复并关单', '回复并关闭', '回复关闭', '回复并结束', '关单'],
-                            "ACTION_REPLY_CLOSE", "已点击「回复并关单」",
-                            { iconHints: ['close-ticket', 'reply-close'] });
-                    }, 800);
+                    doClickClose(800);
                 }
+            }
+            else if (cmd.command === "CATEGORY_PROBE" || cmd.command === "CATEGORY_SEARCH") {
+                // ★ V8.8：手机端"关单选分类"面板要用**网页真实菜单**：按路径下钻读下一层 / 用网页自带搜索框搜
+                const reqId = String(cmd.reqId || "");
+                const kind = (cmd.command === "CATEGORY_SEARCH") ? "search" : "probe";
+                const done = (payload) => {
+                    sendToBrain({ event: "CATEGORY_RESULT", data: Object.assign({
+                        reqId: reqId, kind: kind, path: cmd.path || [], q: cmd.q || ""
+                    }, payload || {}) });
+                };
+                if (kind === "search") Operator.searchCategory(String(cmd.q || ""), done);
+                else Operator.exploreCategory(cmd.path || [], done);
             }
             else if (cmd.command === "REQUEST_CATEGORIES") {
                 Operator.peekCategoryOptions().then(opts => {

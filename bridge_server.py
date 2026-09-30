@@ -180,6 +180,69 @@ def _notify_category_waiters(options):
                 pass
 
 
+# ==================== ★ V8.8：问题分类「真实菜单」（只能来自网页，绝不写死/猜测） ====================
+# 关单必须选择**网页上真实存在的三级分类**。这里提供"按路径下钻读下一层 / 用网页自带搜索框搜"两种只读探测，
+# 以及"手机端选的路径 → 交给探针逐层严格点选（选不中就中止关单）"的链路。
+_CAT_WAITERS = {}          # reqId -> future（探针回报 CATEGORY_RESULT 时唤醒）
+_CAT_SEQ = [0]
+_CAT_CACHE = {}            # "p:一级,二级" 或 "q:关键字" -> 最近一次真实读取结果（手机面板刷新可复用）
+
+
+def _new_cat_req():
+    _CAT_SEQ[0] += 1
+    return "c%d%s" % (int(time.time() * 1000) % 1000000, _CAT_SEQ[0])
+
+
+async def probe_category(path=None, q=None, origin=None, timeout: float = 6.0):
+    """请**电脑网页**读一次真实问题分类菜单（绝不编造：读不到就如实回 ok=False）。
+
+    path=[] 读第一层；path=["一级"] 读第二层；q=关键字 优先用**网页自带的搜索框**搜。
+    返回 {"ok", "options":[{"text","hasChildren","path?"}], "level", "searchable", "error"}
+    """
+    targets = ext_targets(origin)
+    if not targets:
+        return {"ok": False, "options": [], "level": 0, "searchable": None,
+                "error": "电脑端探针未连接（网页没开/脚本没跑）"}
+    req = _new_cat_req()
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _CAT_WAITERS[req] = fut
+    cmd = {"command": ("CATEGORY_SEARCH" if q else "CATEGORY_PROBE"), "reqId": req,
+           "path": [str(x) for x in (path or []) if str(x).strip()]}
+    if q:
+        cmd["q"] = str(q)[:24]
+    for ext in targets:
+        await safe_send(ext, cmd)
+    try:
+        res = await asyncio.wait_for(fut, timeout=timeout)
+        return res if isinstance(res, dict) else {"ok": False, "options": [], "error": "探针返回异常"}
+    except asyncio.TimeoutError:
+        return {"ok": False, "options": [], "level": len(cmd["path"]) + 1,
+                "error": "读取超时（下拉可能被别的弹层挡住）"}
+    finally:
+        _CAT_WAITERS.pop(req, None)
+
+
+def _resolve_cat_waiters(req_id, payload):
+    fut = _CAT_WAITERS.get(str(req_id))
+    if fut and not fut.done():
+        try:
+            fut.set_result(payload)
+        except Exception:
+            pass
+
+
+def _remember_draft(gid, text):
+    """记住"最近一次下发给手机/网页的草稿"——手机输入框为空时点发送也能一键发出（不再"点了没反应"）。"""
+    try:
+        if not gid or not text:
+            return
+        state.setdefault("last_draft", {})[str(gid)] = {"text": str(text)[:2000],
+                                                       "ts": int(time.time())}
+    except Exception:
+        pass
+
+
 def _im_txt(code):
     """状态码 -> 中文（日志/提示统一用词）。"""
     try:
@@ -1476,6 +1539,7 @@ async def handle_ai_automation(group_id: str, source: str = "", force: bool = Fa
             await send_to_player({"command": "FILL_DRAFT", "content": _first, "category": "其他",
                                   "groupID": group_id, "noOverwrite": True}, "半自动草稿",
                                  origin=_auto_origin(group_id), require_page=True, auto=True)
+            _remember_draft(group_id, _first)      # ★ V8.8：手机空输入框时"点发送"能直接发出这份草稿
             for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FILL_DRAFT", "content": _first})
             if len(_segs) > 1:
                 queue_reply_segments(group_id, conv.get("name") or group_id, _segs, "半自动草稿")
@@ -1642,6 +1706,19 @@ HTML_CONTENT = """<!DOCTYPE html>
               align-self:flex-end;
               color:#0B0C0E;background:linear-gradient(145deg,#7CC4FF,#4EC9B0)}
     .send-btn:active{opacity:.8}
+    /* ★ V8.8：发送中/被锁时的明确视觉反馈（旧版点了没反应、按钮永远一个样，客服以为"点不动"） */
+    .send-btn.sending{opacity:.5;pointer-events:none}
+    .close-sheet .csv{width:100%;box-sizing:border-box;background:var(--card-2);color:var(--text);
+                      border:1px solid var(--line);border-radius:10px;padding:9px 10px;font-size:14px;margin:6px 0}
+    .close-sheet .csrow{display:flex;gap:8px;align-items:center}
+    .close-sheet .csrow .csv{flex:1 1 auto;min-width:0}
+    .close-sheet .csbtn{flex:0 0 auto;background:var(--card-2);color:var(--text);border:1px solid var(--line);
+                        border-radius:10px;padding:9px 12px;font-size:14px}
+    .close-sheet .cslist{max-height:34vh;overflow-y:auto;-webkit-overflow-scrolling:touch;margin-top:6px}
+    .close-sheet .csitem{background:var(--card-2);border:1px solid var(--line);border-radius:10px;
+                         padding:9px 11px;font-size:14px;margin-bottom:6px}
+    .close-sheet .csitem:active{opacity:.8}
+    .close-sheet .csnote{color:var(--fg-dim);font-size:12px;line-height:1.5;margin-top:6px}
     /* 失败原因常驻条：toast 一闪而过看不清/复制不了，这里保留到手动关闭 */
     .err-bar{position:fixed;left:10px;right:10px;bottom:calc(var(--safe-bottom) + 76px);z-index:70;display:none;
              background:#3A1D1F;border:1px solid #8B3A3A;color:#FFD9D9;border-radius:12px;padding:9px 12px;
@@ -1743,7 +1820,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <div class="player-card" id="player-card" onclick="togglePlayerCard()"></div>
         <div class="input-bar">
           <textarea class="chat-text-input" id="chat-input" rows="1" placeholder="输入回复内容…"></textarea>
-          <button class="send-btn" onclick="execCommand('SEND')">↑</button>
+          <button class="send-btn" id="btn-send" onclick="execCommand('SEND')">↑</button>
         </div>
       </div>
     </div>
@@ -1759,6 +1836,18 @@ HTML_CONTENT = """<!DOCTYPE html>
     let lastKnownGids = {};                // 上一次渲染时已知的会话（用于"兜底自动打开"）
     let showOtherConvs = false;            // ★ V8.2："其它会话（不在网页列表里）"默认收起
     let lastDraftFilled = '';              // ★ V8.5：本页自己填进去的最后一份草稿（用来判断"输入框里的字是不是客服写的"）
+    // ★ V8.8：发送回执机制 —— 点发送后进入"发送中"，**收到中继回执**才清空输入框/复位按钮
+    //   （旧版：内容为空时静默什么都不做、失败也照样清空 -> 客服体感"按钮点不动、一直蓝着"）
+    let pendingSend = null;                // { id, text, gid }
+    let sendStateTimer = null;
+    function setSendState(on) {
+        try {
+            const b = document.getElementById ? document.getElementById('btn-send') : null;
+            if (!b) return;
+            if (on) { b.classList.add('sending'); b.textContent = '…'; }
+            else { b.classList.remove('sending'); b.textContent = '↑'; }
+        } catch (e) {}
+    }
     let audioCtx = null; let sirenInterval = null;
     let wsAttempts = 0;
     let imStatusRequested = false;      // 已向电脑端索要过真实状态（4 秒内不重复要）
@@ -2354,12 +2443,31 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
         else if (payload.type === 'AI_STATUS') {
             if (payload.message) toast(payload.message);   // 关单结果 / AI 状态提示
+            // ★ V8.8：发送回执 —— 等它复位"发送中"；**只有成功才清空输入框**（失败保留原内容可重发）
+            const echo = String(payload.echo || '');
+            if (echo && pendingSend && echo === pendingSend.id) {
+                const okSent = (payload.status === 'ok' || payload.status === 'closing');
+                const ps = pendingSend;
+                pendingSend = null;
+                if (sendStateTimer) { clearTimeout(sendStateTimer); sendStateTimer = null; }
+                setSendState(false);
+                if (okSent) {
+                    const inp = document.getElementById('chat-input');
+                    if (inp && inp.value.trim() === String(ps.text || '').trim()) { inp.value = ''; }
+                    lastDraftFilled = '';
+                    autoGrowInput();
+                    hideErr();
+                }
+            }
             // ★ 失败原因不要一闪而过：常驻显示，可复制（含页面真实按钮名）
             if (payload.status === 'error') {
                 showErr((payload.groupID ? '[' + payload.groupID + '] ' : '') + (payload.message || '操作失败'));
             } else {
                 hideErr();
             }
+        }
+        else if (payload.type === 'CATEGORY_RESULT') {
+            handleCategoryResult(payload);      // ★ V8.8：关单分类面板（网页真实菜单 / 网页自带搜索）
         }
       };
       ws.onerror = () => { /* 出错后浏览器会触发 onclose，由 onclose 统一调度重连 */ };
@@ -2638,6 +2746,238 @@ HTML_CONTENT = """<!DOCTYPE html>
       if (isAtBottom) stream.scrollTop = stream.scrollHeight;
     }
 
+    // ==================== ★ V8.8：关单「问题分类」面板（数据全部来自网页真实菜单） ====================
+    // 🛑 铁律：分类名**绝不内置/编造** —— 三级下拉与搜索结果都由探针从网页真实菜单读取；
+    //   选完由中继带着"完整路径"下发，探针逐层点选并校验，选不中就**中止关单**。
+    let csOpen = false, csContent = '', csReqSeq = 0;
+    let csData = { l1: '', l2: '', l3: '', lv1: [], lv2: [], lv3: [], rows: [], note: '',
+                   loading: 0, pickLevel: 0 };
+
+    function csSheet() { return document.getElementById('close-sheet'); }
+    function csBuild() {
+        if (csSheet()) return csSheet();
+        const d = document.createElement('div');
+        d.id = 'close-sheet';
+        d.className = 'sheet close-sheet';
+        // ⚠️ 不用原生下拉框（项目约定：iOS 上像"框框"且卡顿）—— 用"自绘行 + 点开列表"选择
+        d.innerHTML = '<div id="cs-rows"></div>'
+            + '<div class="csrow"><input class="csv" id="cs-q" placeholder="搜索分类（可点🔍在网页里搜）">'
+            + '<button class="csbtn" id="cs-qgo">🔍</button></div>'
+            + '<div class="cslist" id="cs-list"></div>'
+            + '<div class="csnote" id="cs-note"></div>'
+            + '<div class="csrow" style="margin-top:8px">'
+            + '<button class="csbtn" id="cs-cancel" style="flex:1 1 auto">取消</button>'
+            + '<button class="csbtn" id="cs-ok" style="flex:1 1 auto">✅ 关单</button></div>';
+        document.body.appendChild(d);
+        d.querySelector('#cs-cancel').addEventListener('click', function () { closeCloseSheet(); });
+        d.querySelector('#cs-qgo').addEventListener('click', csSearchWeb);
+        d.querySelector('#cs-q').addEventListener('input', csFilterLocal);
+        d.querySelector('#cs-ok').addEventListener('click', csConfirm);
+        return d;
+    }
+
+    function csRender() {
+        const d = csSheet();
+        if (!d) return;
+        // 三行"层级胶囊行"：点哪一行，就在下面的列表里选哪一层（不弹原生 select）
+        const rowsBox = d.querySelector('#cs-rows');
+        const lv = [{ n: 1, v: csData.l1, ph: '一级分类' },
+                    { n: 2, v: csData.l2, ph: csData.l1 ? '二级分类' : '（先选一级）' },
+                    { n: 3, v: csData.l3, ph: csData.l2 ? '三级分类' : '（先选二级）' }];
+        rowsBox.innerHTML = lv.map(function (x) {
+            const on = (csData.pickLevel === x.n);
+            return '<div class="csitem" data-lv="' + x.n + '">'
+                 + (on ? '▼ ' : '') + (x.v || ('— ' + x.ph + ' —')) + '</div>';
+        }).join('');
+        Array.prototype.forEach.call(rowsBox.querySelectorAll('.csitem'), function (el) {
+            el.addEventListener('click', function () { csOpenPick(Number(this.dataset.lv)); });
+        });
+        // 列表：选层级时 = 该层可选；搜索时 = 匹配结果
+        const box = d.querySelector('#cs-list');
+        box.innerHTML = (csData.rows || []).map(function (r, i) {
+            return '<div class="csitem" data-i="' + i + '">' + String(r.text || '').replace(/</g, '‹')
+                 + (r && r.hasChildren ? ' ›' : '') + '</div>';
+        }).join('');
+        Array.prototype.forEach.call(box.querySelectorAll('.csitem'), function (el) {
+            el.addEventListener('click', function () { csUseRow(Number(this.dataset.i)); });
+        });
+        let note = csData.note || '';
+        if (csData.loading > 0) note = '正在从电脑网页读取真实分类…' + note;
+        if (!(csData.rows || []).length && !note) note = '点上面三行逐级选择；也可以点 🔍 用网页自带的分类搜索';
+        d.querySelector('#cs-note').textContent = note;
+    }
+
+    function csOpenPick(level) {
+        csData.pickLevel = level;
+        csData.rows = [];
+        if (level === 1) {
+            csData.rows = (csData.lv1 || []).map(function (o) {
+                return { text: o.text, hasChildren: o.hasChildren, path: [o.text] }; });
+        } else if (level === 2) {
+            if (!csData.l1) { toast('请先选一级分类'); csData.pickLevel = 0; csRender(); return; }
+            csData.rows = (csData.lv2 || []).map(function (o) {
+                return { text: o.text, hasChildren: o.hasChildren, path: [csData.l1, o.text] }; });
+        } else {
+            if (!csData.l2) { toast('请先选二级分类'); csData.pickLevel = 0; csRender(); return; }
+            csData.rows = (csData.lv3 || []).map(function (o) {
+                return { text: o.text, hasChildren: o.hasChildren, path: [csData.l1, csData.l2, o.text] }; });
+        }
+        csData.note = (csData.rows || []).length
+            ? ('点下面的选项填入「第 ' + level + ' 层」')
+            : '这一层还没读到选项（点 🔍 让电脑网页再读一次）';
+        csRender();
+    }
+
+    function csReq(kind, path, q) {
+        const reqId = 'h' + (++csReqSeq);
+        csData.loading++;
+        csRender();
+        if (!sendMsg({ action: kind, reqId: reqId, path: path || [], q: q || '', clientId: reqId })) {
+            csData.loading = Math.max(0, csData.loading - 1);
+            csData.note = '连接已断开，正在重连…';
+            csRender();
+        }
+    }
+
+    function handleCategoryResult(p) {
+        if (!csOpen || !p) return;
+        csData.loading = Math.max(0, csData.loading - 1);
+        const path = p.path || [];
+        const opts = Array.isArray(p.options) ? p.options : [];
+        if (String(p.kind) === 'search') {
+            csData.rows = opts;
+            csData.note = p.ok ? (p.searchable === false
+                ? '网页的分类框没有搜索功能：下面是当前这层的匹配项' : '') : (p.error || '搜索失败');
+        } else if (!path.length) {
+            csData.lv1 = opts; csData.lv2 = []; csData.lv3 = [];
+            csData.l2 = ''; csData.l3 = '';
+            csData.note = p.ok ? '' : (p.error || '读取失败');
+        } else if (path.length === 1) {
+            csData.lv2 = opts; csData.lv3 = []; csData.l3 = '';
+            csData.note = p.ok ? '' : (p.error || '读取失败');
+        } else {
+            csData.lv3 = opts;
+            csData.note = p.ok ? '' : (p.error || '读取失败');
+        }
+        csRender();
+    }
+
+    // 点列表里的一项：选层级时 = 填这一层（并继续读下一层）；搜索结果 = 直接填整条路径
+    function csUseRow(i) {
+        const r = (csData.rows || [])[i];
+        if (!r) return;
+        const p = (r.path && r.path.length) ? r.path : String(r.text || '').split(/\\s*[\\/>»]\\s*/);
+        const lvl = csData.pickLevel || 0;
+        if (lvl === 1) {
+            csData.l1 = p[0] || r.text;
+            csData.l2 = ''; csData.l3 = '';
+            csData.lv2 = []; csData.lv3 = [];
+            csData.pickLevel = 0; csData.rows = [];
+            if (r.hasChildren === false) {
+                csData.note = '「' + csData.l1 + '」是叶子分类（没有下级）';
+                csRender();
+                return;
+            }
+            csReq('CATEGORY_PROBE', [csData.l1], '');
+            return;
+        }
+        if (lvl === 2) {
+            csData.l2 = p[1] || r.text;
+            csData.l3 = ''; csData.lv3 = [];
+            csData.pickLevel = 0; csData.rows = [];
+            if (r.hasChildren === false) { csData.note = ''; csRender(); return; }
+            csReq('CATEGORY_PROBE', [csData.l1, csData.l2], '');
+            return;
+        }
+        if (lvl === 3) {
+            csData.l3 = p[2] || r.text;
+        } else {                       // 搜索/本地过滤的结果：整条路径一次填好
+            csData.l1 = p[0] || ''; csData.l2 = p[1] || ''; csData.l3 = p[2] || '';
+        }
+        csData.pickLevel = 0; csData.rows = [];
+        csRender();
+        toast('已填入：' + [csData.l1, csData.l2, csData.l3].filter(Boolean).join(' / '));
+    }
+
+    function csFilterLocal() {
+        const el = document.getElementById('cs-q');
+        const q = String((el && el.value) || '').trim();
+        const pool = [];
+        (csData.lv1 || []).forEach(function (o) { pool.push({ text: o.text, path: [o.text] }); });
+        (csData.lv2 || []).forEach(function (o) {
+            pool.push({ text: csData.l1 + ' / ' + o.text, path: [csData.l1, o.text] }); });
+        (csData.lv3 || []).forEach(function (o) {
+            pool.push({ text: csData.l1 + ' / ' + csData.l2 + ' / ' + o.text,
+                        path: [csData.l1, csData.l2, o.text] }); });
+        csData.rows = q ? pool.filter(function (r) { return r.text.indexOf(q) !== -1; }).slice(0, 40) : [];
+        csData.pickLevel = 0;                  // 进入"搜索/过滤"模式：点结果=整条路径一次填好
+        csData.note = (q && !csData.rows.length) ? '已读到的分类里没有「' + q + '」——点 🔍 让电脑网页搜一次' : '';
+        csRender();
+    }
+
+    function csSearchWeb() {
+        const el = document.getElementById('cs-q');
+        const q = String((el && el.value) || '').trim();
+        if (!q) { toast('先在搜索框里输入关键字'); return; }
+        csData.rows = [];
+        csData.note = '正在让电脑网页搜索「' + q + '」…';
+        csRender();
+        csReq('CATEGORY_SEARCH', [], q);
+    }
+
+    function csConfirm() {
+        const path = [csData.l1, csData.l2, csData.l3].filter(Boolean);
+        if (!path.length) {
+            toast('请先选择问题分类');
+            showErr('关单前必须选择问题分类：点下拉逐级选择，或点 🔍 让电脑网页搜索');
+            return;
+        }
+        const c = getConv(activeGroupId);
+        const cid = 'C' + Date.now() + Math.floor(Math.random() * 1000);
+        pendingSend = { id: cid, text: csContent, gid: activeGroupId };
+        setSendState(true);
+        if (sendStateTimer) clearTimeout(sendStateTimer);
+        sendStateTimer = setTimeout(function () {      // 关单要下钻选分类，给 15 秒
+            if (pendingSend && pendingSend.id === cid) {
+                pendingSend = null;
+                setSendState(false);
+                showErr('未收到电脑端回执：关单可能没执行（会话还在），请确认电脑网页停在该会话上');
+            }
+        }, 15000);
+        const okSend = sendMsg({ action: 'CLOSE_WITH_PATH', groupID: activeGroupId, content: csContent,
+                                 path: path, clientId: cid,
+                                 name: (c && c.name && String(c.name) !== String(activeGroupId)) ? c.name : '' });
+        if (!okSend) {
+            pendingSend = null;
+            setSendState(false);
+            if (sendStateTimer) { clearTimeout(sendStateTimer); sendStateTimer = null; }
+            toast('连接已断开，正在重连');
+            return;
+        }
+        closeCloseSheet();
+        toast('已请求关单（分类：' + path.join(' / ') + '）…（页面 v' + H5_VER + '）');
+    }
+
+    function openCloseSheet(content) {
+        csContent = String(content || '');
+        csData = { l1: '', l2: '', l3: '', lv1: [], lv2: [], lv3: [], rows: [], note: '',
+                   loading: 0, pickLevel: 0 };
+        const d = csBuild();
+        const q = d.querySelector('#cs-q');
+        if (q) q.value = '';
+        csOpen = true;
+        d.classList.add('show');
+        csRender();
+        toast('正在从电脑网页读取真实问题分类…');
+        csReq('CATEGORY_PROBE', [], '');
+    }
+
+    function closeCloseSheet() {
+        csOpen = false;
+        const d = csSheet();
+        if (d) d.classList.remove('show');
+    }
+
     // ==================== 电脑端指令下发 ====================
     function execCommand(cmd) {
       if (!activeGroupId) return;
@@ -2676,21 +3016,52 @@ HTML_CONTENT = """<!DOCTYPE html>
           toast('已请求电脑端恢复/接入，结果会再提示…（页面 v' + H5_VER + '）');
       } else {
           const input = document.getElementById('chat-input');
-          const text = input && input.value ? input.value.trim() : '';
+          let text = input && input.value ? input.value.trim() : '';
           if (cmd === 'CLOSE') {
-              sendMsg({ action: 'EXT_COMMAND', command: 'ACTION_REPLY_CLOSE', groupID: activeGroupId, content: text, category: "其他" });
-              toast('已请求回复并关单…（页面 v' + H5_VER + '）');
-          } else if (cmd === 'SEND' && text) {
+              // ★ V8.8：关单 = 自己写结束语 + **从网页真实菜单里选三级分类**
+              //   （旧版这里写死 category:"其他" —— 那是错的，等于给工单贴错分类）
+              if (!text) {
+                  showErr('关单需要一个结束语：请先在输入框里写好，再点「关单」选择问题分类');
+                  toast('请先写结束语');
+                  return;
+              }
+              openCloseSheet(text);
+              return;
+          }
+          if (cmd === 'SEND') {
+              // ★ V8.8：输入框为空但有 AI 草稿 -> 直接发草稿
+              //   （旧版这里静默什么都不做 + 无条件清空输入框，客服体感就是"发送按钮点不动、一直蓝着"）
+              let usedDraft = false;
+              if (!text && lastDraftFilled) { text = String(lastDraftFilled).trim(); usedDraft = true; }
+              if (!text) {
+                  showErr('没有可发送的内容：请在输入框里输入；若刚让 AI 起草过，直接点发送会自动带上草稿');
+                  toast('输入框是空的，没东西可发');
+                  return;
+              }
+              if (pendingSend) { toast('上一条还在发送中，请稍等…'); return; }
               const c = getConv(activeGroupId);
-              if (!sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text,
+              const cid = 'S' + Date.now() + Math.floor(Math.random() * 1000);
+              pendingSend = { id: cid, text: text, gid: activeGroupId };
+              setSendState(true);
+              if (sendStateTimer) clearTimeout(sendStateTimer);
+              sendStateTimer = setTimeout(function () {          // 8 秒没回执：如实提示并复位（内容保留，可重发）
+                  if (pendingSend && pendingSend.id === cid) {
+                      pendingSend = null;
+                      setSendState(false);
+                      showErr('未收到电脑端回执（可能没发出去）：请确认电脑网页停在该会话上、探针在线，然后重发');
+                  }
+              }, 8000);
+              if (!sendMsg({ action: 'SEND_REPLY', groupID: activeGroupId, content: text, clientId: cid,
+                             useDraft: usedDraft,
                              name: (c && c.name && String(c.name) !== String(activeGroupId)) ? c.name : '' })) {
+                  pendingSend = null;
+                  setSendState(false);
+                  if (sendStateTimer) { clearTimeout(sendStateTimer); sendStateTimer = null; }
                   toast('连接已断开，正在重连');
                   return;
               }
-              toast('已发送（页面 v' + H5_VER + '）');
+              toast((usedDraft ? '已发送 AI 草稿' : '正在发送') + '…（页面 v' + H5_VER + '）');
           }
-          if (input) { input.value = ''; lastDraftFilled = ''; }   // ★ V8.5：清空后草稿可重新填入（不再被"已有内容"挡住）
-          autoGrowInput();                       // 清空后把高度收回去
       }
     }
 
@@ -3634,6 +4005,32 @@ async def ws_ext_handler(request):
                             await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     continue
 
+                if ev == "CATEGORY_RESULT":
+                    # ★ V8.8：探针回报"网页真实分类菜单"（按路径下钻结果 / 网页自带搜索的匹配项）
+                    #   -> 唤醒等待者 + 缓存（手机面板刷新可复用）+ 日志如实记录
+                    #   ⚠️ 这里必须用 pkt.get("data")：本分支在事件分发的前段，data 变量此刻还没被赋值
+                    _res = dict(pkt.get("data") or {})
+                    _resolve_cat_waiters(_res.get("reqId"), _res)
+                    try:
+                        _key = (("q:" + str(_res.get("q") or "")) if str(_res.get("kind")) == "search"
+                                else ("p:" + ",".join(_res.get("path") or [])))
+                        _CAT_CACHE[_key] = {"ok": _res.get("ok"), "level": _res.get("level"),
+                                            "options": _res.get("options") or [],
+                                            "searchable": _res.get("searchable"),
+                                            "error": _res.get("error") or "", "ts": int(time.time())}
+                    except Exception:
+                        pass
+                    if str(_res.get("kind")) == "search":
+                        print(f"[分类] 🔍 网页搜索「{_res.get('q')}」-> "
+                              f"{len(_res.get('options') or [])} 条匹配"
+                              + (f"（{_res.get('error')}）" if _res.get("error") else ""))
+                    else:
+                        print("[分类] 🧭 读取真实菜单 "
+                              + (" / ".join(_res.get("path") or []) or "（第一层）")
+                              + f" -> {len(_res.get('options') or [])} 项"
+                              + (f"（{_res.get('error')}）" if _res.get("error") else ""))
+                    continue
+
                 # 探针上报的 IM 状态（含手动离线 / 忙碌，手机端据此显示真实状态）
                 if ev == "IM_STATUS":
                     data = pkt.get("data") or {}
@@ -4184,7 +4581,22 @@ async def handle_ai_close(group_id: str, origin=None):
     if not ext_targets(origin):
         return False, "电脑端探针未连接（或测试客户端没有测试探针），无法关单"
 
-    path = config.get("close_category_path") or ["一级分类", "二级分类"]
+    # ★ V8.8：分类必须是**网页上真实存在的路径** —— 先用网页自带搜索把 AI 选的分类解析成完整路径；
+    #   解析不出来就用配置里的路径提示，交给探针**逐层严格匹配**；探针选不中就中止关单（绝不带错分类关单）。
+    path = []
+    try:
+        sres = await probe_category(q=str(category or ""), origin=origin, timeout=5.0)
+        cands = [o for o in (sres.get("options") or []) if (o.get("path") or [])]
+        if sres.get("ok") and cands:
+            exact = [o for o in cands if str(o["path"][-1]) == str(category or "")] or cands
+            exact.sort(key=lambda o: -len(o.get("path") or []))     # 同名取层级最多的（三级最具体）
+            path = [str(x) for x in exact[0]["path"]]
+            print(f"[关单] 🧭 已从网页真实菜单解析出分类路径：{' / '.join(path)}")
+    except Exception as e:
+        print(f"[关单] 分类路径解析失败（改用配置里的提示）：{e}")
+    if not path:
+        path = [str(x) for x in (config.get("close_category_path") or ["一级分类", "二级分类"])]
+        print(f"[关单] 用配置里的路径提示交给探针逐层匹配：{path}（选不中会中止关单）")
     payload = {
         "command": "ACTION_REPLY_CLOSE",
         "content": content,
@@ -4443,24 +4855,94 @@ async def ws_mobile_handler(request):
                                 await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     for ext in ext_targets(ws):                 # ★ V7.9：测试客户端只打到测试探针
                         await safe_send(ext, fwd)
+                elif act == "CATEGORY_PROBE" or act == "CATEGORY_SEARCH":
+                    # ★ V8.8：手机端"关单选分类"面板要读**网页真实菜单**（按路径下钻 / 用网页自带搜索框）
+                    _is_search = (act == "CATEGORY_SEARCH")
+                    _res = await probe_category(path=pkt.get("path") or [],
+                                                q=(str(pkt.get("q") or "") if _is_search else None),
+                                                origin=ws, timeout=(7.0 if _is_search else 6.0))
+                    await safe_send(ws, {"type": "CATEGORY_RESULT", "kind": ("search" if _is_search else "probe"),
+                                         "reqId": str(pkt.get("reqId") or ""),
+                                         "echo": str(pkt.get("clientId") or ""),
+                                         "path": pkt.get("path") or [], "q": str(pkt.get("q") or ""),
+                                         "ok": bool(_res.get("ok")), "options": _res.get("options") or [],
+                                         "level": _res.get("level"), "searchable": _res.get("searchable"),
+                                         "error": _res.get("error") or ""})
+                elif act == "CLOSE_WITH_PATH":
+                    # ★ V8.8：手机端「关单」= 自己写结束语 + 从**网页真实菜单**里选三级分类。
+                    # 🛑 铁律：认不出"这条会话就是网页当前打开的那条"就**拒绝关单**（绝不误关别人的工单）。
+                    _cgid = str(pkt.get("groupID") or "")
+                    _ctext = str(pkt.get("content") or "")
+                    _cpath = [str(x) for x in (pkt.get("path") or pkt.get("categoryPath") or []) if str(x).strip()]
+                    _cname = str(pkt.get("name") or "")
+                    _echo = str(pkt.get("clientId") or "")
+                    _conv = state["companies"]["main"]["conversations"].get(_cgid) or {}
+                    if not _cgid or not _conv:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": _echo,
+                                             "message": "这条会话还没在电脑网页上打开过 —— 先在手机主页点它一下"
+                                                        "（电脑会自动切过去），再关单"})
+                        continue
+                    if not _ctext.strip():
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": _echo,
+                                             "message": "关单需要一个结束语：请先在输入框里写好，再选分类"})
+                        continue
+                    if not _cpath:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": _echo,
+                                             "message": "请先选择问题分类再关单（分类必须来自网页真实菜单）"})
+                        continue
+                    if page_gid(ws) != _cgid and not _cname:
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": _echo,
+                                             "message": "为防关错工单：这条不是电脑网页当前打开的会话，"
+                                                        "且没带上会话名 —— 请先在手机主页点它一下再关单"})
+                        continue
+                    _ctext, _left = safe_outbound(_ctext, "手机关单")
+                    if not _ctext.strip():
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": _echo,
+                                             "message": "结束语清洗后为空（只含内部提示），已拦截"})
+                        continue
+                    _c_test = (ws in TEST_WS) or bool(_conv.get("_test_origin"))
+                    _cok = await send_to_player({"command": "ACTION_REPLY_CLOSE", "content": _ctext,
+                                                 "groupID": _cgid, "category": _cpath[-1],
+                                                 "categoryPath": _cpath},
+                                                "手机关单", origin=ws, require_page=True, page_name=_cname)
+                    if not _cok:
+                        continue                      # 拒发原因已由 send_to_player 推给手机端
+                    mark_close_pending(_cgid, _cpath[-1], is_test=_c_test)
+                    asyncio.create_task(_close_confirm_watchdog(_cgid))
+                    await safe_send(ws, {"type": "AI_STATUS", "status": "closing", "echo": _echo, "groupID": _cgid,
+                                         "message": "已下发「回复并关单」（分类：" + " / ".join(_cpath)
+                                                    + "），等页面确认…"})
+                    for _m in list(active_clients["mobile"]):
+                        await safe_send(_m, {"type": "FULL_SYNC", "data": state})
                 elif act == "SEND_REPLY":
                     gid = pkt.get("groupID")
                     text = pkt.get("content")
-                    if not gid or not text:
+                    echo = str(pkt.get("clientId") or "")
+                    # ★ V8.8：手机输入框为空时，允许直接发"最近一次下发给它的 AI 草稿"。
+                    #   旧版这里直接 continue —— 手机点了发送**什么都不发生**，客服体感就是"按钮点不动/一直蓝着"。
+                    if not str(text or "").strip() and pkt.get("useDraft"):
+                        text = ((state.get("last_draft") or {}).get(str(gid)) or {}).get("text") or ""
+                        if text:
+                            print(f"[手机端代发] 输入框为空 -> 用最近一次草稿（{len(str(text))} 字）")
+                    if not gid or not str(text or "").strip():
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": echo,
+                                             "groupID": str(gid or ""),
+                                             "message": "没有可发送的内容：请在手机输入框里输入；"
+                                                        "若刚让 AI 起草过，直接点发送会自动带上草稿"})
                         continue
                     gid = str(gid)
                     # ★ V8.0.1：不再给"中继不认识的会话"造占位卡片（名字=工单号）。
                     #   那正是手机上出现 NOTOPEN-… / 长得像工单号的假会话的来源（客服看到就是垃圾）。
                     #   不认识的会话直接拒绝，并告诉客服正确动作：先在手机主页点它一下（电脑会自动打开）。
                     if not (state["companies"]["main"]["conversations"].get(gid) or {}):
-                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": echo,
                                              "message": "这条会话还没在电脑网页上打开过 —— "
                                                         "先在手机主页点它一下（电脑会自动切过去），再发消息"})
                         continue
                     # ★ 安全闸：手机端代发的内容也会进玩家对话框（可能是从草稿复制来的）
                     text, left = safe_outbound(text, "手机端代发")
                     if not text.strip():
-                        await safe_send(ws, {"type": "AI_STATUS", "status": "error",
+                        await safe_send(ws, {"type": "AI_STATUS", "status": "error", "echo": echo,
                                              "message": "内容清洗后为空（只含内部提示），未发送"})
                         continue
                     conv = state["companies"]["main"]["conversations"][gid]
@@ -4480,6 +4962,10 @@ async def ws_mobile_handler(request):
                                          "ts": int(time.time() * 1000)})
                     conv["updatedAt"] = int(time.time() * 1000)
                     _LAST_ACTIVE["gid"] = gid
+                    # ★ V8.8：发送成功才回执给手机（手机据此清空输入框并复位"发送中"状态）——
+                    #   旧版手机发完就无条件清空输入框，失败了也不说，客服只看到"内容没了/按钮没反应"。
+                    await safe_send(ws, {"type": "AI_STATUS", "status": "ok", "echo": echo, "groupID": gid,
+                                         "message": "已发送给玩家"})
                     for m in list(active_clients["mobile"]):
                         await safe_send(m, {"type": "FULL_SYNC", "data": state})
     finally:
