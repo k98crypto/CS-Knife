@@ -4,7 +4,7 @@ const vm = require('vm');
 
 const TARGET = process.argv[2] || 'probe.js';
 const code = fs.readFileSync(TARGET, 'utf8');
-const EXPECT_VER = '8.2';        // 与实际 @version 对齐（升级脚本时同步改这里）
+const EXPECT_VER = '8.4';        // 与实际 @version 对齐（升级脚本时同步改这里）
 
 const sent = [];
 const intervals = [];
@@ -853,6 +853,31 @@ function check(name, ok, extra) {
     let r4 = resetAndReport();
     check('没有昵称时用 UID 兜底命名', !!r4 && r4.name === '玩家8765', r4 && r4.name);
     check('不同玩家 -> 不同标识', !!r4 && r4.groupID !== gidName, (r4 && r4.groupID) + ' vs ' + gidName);
+
+    // ★ V8.5.1 实机回归（客服现场报的真实数据）：workstation 页右侧面板文本里
+    //   ① "字段名"与"值"之间隔着竖线（换行被转成 " | "）：`UID: | 100000432614`、`角色名: | 羽婵`
+    //   ② 顶部还有一排页签（玩家信息 | 服务记录 | 数据查询Agent | AI 智能总结）排在前面
+    //   旧代码两种都读不出来 → 把页签名"服务记录"当成玩家名 → 与网页会话列表的真名对不上
+    //   → 手机端把所有会话都当"未打开"（点了进不去、通知也匹配不上）。
+    playerInfoText = '玩家信息 | 服务记录 | 数据查询Agent | AI 智能总结 | 收起 | 暂无总结数据 | 基本信息'
+        + ' | UID: | 100000432614 | FPID: | fp_account_cn:2740151 | 角色名: | 羽婵 | 角色等级: | 60';
+    bubbles = [makeEl('辉石问题', ['from-player'])];
+    let rReal = resetAndReport();
+    check('实机格式「字段名: | 值」能解析出真实玩家名（不再是页签名「服务记录」）',
+        !!rReal && rReal.name === '羽婵', rReal && rReal.name);
+    check('页签名（服务记录/数据查询Agent/AI 智能总结）绝不会被当成玩家名',
+        !!rReal && ['服务记录', '数据查询Agent', 'AI 智能总结', '玩家信息'].indexOf(rReal.name) === -1,
+        rReal && rReal.name);
+
+    // ★ V8.5.1：聊天区用的名字必须与**网页会话列表**同源（手机端列表/切会话都按这个名字走）
+    sessionItems = [makeSessionRow('羽婵', '辉石问题', '刚刚', true),
+                    makeSessionRow('别人', '你好', '1小时前', false)];
+    playerInfoText = '玩家信息 | 角色名: | 羽婵';
+    bubbles = [makeEl('辉石问题', ['from-player'])];
+    let rSame = resetAndReport();
+    check('聊天区名字与网页会话列表同源（列表高亮那一行优先）',
+        !!rSame && rSame.name === '羽婵', rSame && rSame.name);
+    sessionItems = [];
 
     // 恢复默认环境
     playerInfoText = '玩家A\nUID:12345';

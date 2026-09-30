@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         智能工单探针 (V8.2 重连即重新上报 + 不冲掉你正在写的字)
+// @name         智能工单探针 (V8.4 静默嗅探人工回复 + 玩家名与会话列表同源)
 // @namespace    http://tampermonkey.net/
-// @version      8.2
-// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）；V8.0 会话列表上报（手机端"全部会话"）+ 远程/自动切会话（OPEN_CONV，回复前先切对工单）；V8.1 草稿不再冲掉客服正在写的字、切会话必须确认页面真的切过去才回执；V8.2 重连后重新上报会话列表与聊天（中继重启不再显示空白）
+// @version      8.4
+// @description  真实 DOM 靶点、防 Token 雪球、双音效引擎、WebSocket 指数退避重连（永不放弃）、页面内状态胶囊；V7.3 手动离线守护 + 强制状态复核；V7.4 提示音只认真新消息 + 挂起/恢复动作回执 + 分类不盲选；V7.5 发送兜底（按钮/图标/回车 + 发后复验）、挂起恢复自动重试与「更多」菜单、图标按钮与 aria/title 匹配、动作回执带工单号；V7.7 实机校准（客服 Console dump）：回复框改用 Quill 的 .ql-editor（不再误写普通 input）、发送键认 .reply-btn、只读模式如实回报、IM 状态下拉懒渲染重试 + 人手点击/中继指令分开上报；V7.8 指令自检（PING/PONG 自报家门）+ onmessage 整段兜底（出错回报 PROBE_ERROR）；V7.9 状态胶囊实机修正（Element 下拉是 hover 触发 + 触发器由内到外逐个试 + 下拉面板结构回报）；V8.0 会话列表上报（手机端"全部会话"）+ 远程/自动切会话（OPEN_CONV，回复前先切对工单）；V8.1 草稿不再冲掉客服正在写的字、切会话必须确认页面真的切过去才回执；V8.2 重连后重新上报会话列表与聊天（中继重启不再显示空白）；V8.3 新增"人工回复静默嗅探"（setupManualReplySniffer：只读录制客服真人发出的回复 + 当时的工单上下文 -> RECORD_MANUAL_DEMO，供离线 distill_rules.py 蒸馏话术规则；绝不代发、绝不影响人工点击与输入）；V8.4 修「玩家名与会话列表不同源」（workstation 页右侧面板的页签名"服务记录"曾被当成玩家名 → 与网页会话列表里的真名对不上 → 手机端把所有会话都显示成"未打开"、点了进不去、通知也匹配不上）：面板解析支持"字段名: | 值"格式 + 排除页签名 + 玩家名以**会话列表高亮行**为准
 // ⚠️ 下面 @match 里的域名是**占位符**：从本机中继 http://127.0.0.1:8765/probe.js 取脚本时，
 //    中继会按 config.json 的 workbench_domains 自动替换成你自己的工单工作台域名（可填多个，会自动展开成多行）。
 //    请务必从该地址复制脚本，不要直接从这个文件复制。
@@ -15,7 +15,7 @@
 (function() {
     'use strict';
 
-    const PROBE_VERSION = "8.2";
+    const PROBE_VERSION = "8.4";
     console.log("🚀 [工单探针 V" + PROBE_VERSION + "] 真实靶点定位系统与防暴雷机制已就绪！");
     console.log("💡 调试入口：__probe.version() / __probe.status() / __probe.reconnect()");
 
@@ -25,7 +25,11 @@
         manualGraceMs: 1500,        // 你自己点完状态后多久内不"抢"（留给你自己操作的时间）
         guardWindowMs: 10000,       // 两次离线守护之间的最小间隔（避免和网页互刷）
         guardMaxPerWindow: 3,       // 每次窗口内最多硬顶几次，超过就如实上报（不和网页无限对抗）
-        forceStatusOnConnect: true  // 连上中继就立刻复核一次真实状态（服务端重启后不会残留旧状态）
+        forceStatusOnConnect: true, // 连上中继就立刻复核一次真实状态（服务端重启后不会残留旧状态）
+        // ★ V8.3：人工回复"影子录制"（只读嗅探，回传 RECORD_MANUAL_DEMO 给中继落盘，供离线蒸馏规则）
+        demoCapture: true,          // 总开关：false = 彻底不嗅探（连监听都不注册）
+        demoMinLen: 2,              // 回复正文短于这个字数就不记（防误触/防刷屏）
+        demoVerifyMs: 1200          // 发出后等多久回头复验"是不是真的发出去了"（没发出去就不记）
     };
 
     let audioCtx = null;
@@ -267,7 +271,12 @@
     // 踩坑：右侧面板第一行往往是"玩家信息"这种**栏目名**，旧代码直接把它当玩家名，
     // 于是手机端 9 个会话全叫"玩家信息"，根本分不清谁是谁。
     const GENERIC_PANEL_WORDS = ['玩家信息', '玩家资料', '玩家详情', '客户信息', '用户信息',
-                                 '基本信息', '会员信息', '信息', '玩家', '客户'];
+                                 '基本信息', '会员信息', '信息', '玩家', '客户',
+                                 // ★ V8.5.1 实机：workstation 页右侧面板顶部有一排**页签**，
+                                 //   面板全文里它们排在基本信息之前，会被当成"玩家名"混进来
+                                 //   （实测抓到过 "服务记录"，导致与网页会话列表里的真名对不上）
+                                 '服务记录', '数据查询Agent', 'AI 智能总结', '智能总结',
+                                 '暂无总结数据', '暂无数据', '收起', '展开'];
     const FIELD_KEYS = '昵称|玩家昵称|玩家名|角色名|角色昵称|角色|游戏名|用户名|姓名|名字|昵称/账号';
 
     function cleanFieldValue(v) {
@@ -285,12 +294,17 @@
     function parsePlayerIdentity(playerInfo) {
         const raw = String(playerInfo || "").replace(/\n+/g, ' | ');
         let name = "", uid = "";
-        const mu = raw.match(/(?:UID|uid|账号|account)\s*[:：]\s*([A-Za-z0-9_-]{2,24})/);
+        // ★ V8.5.1 实机修复：页面文本里"字段名"和"值"之间隔着竖线（换行被转成 " | "），
+        //   形如 `UID: | 100000432614`、`角色名: | 羽婵`。旧正则只认 `字段名: 值`，
+        //   于是 UID/角色名全都解析不出来 → 退化成"取第一个像名字的段" → 抓到页签名
+        //   （"服务记录"）当玩家名 → 与网页会话列表里的真名对不上，
+        //   手机端把所有会话都当成"未打开"（点了进不去、通知也匹配不上）。
+        const mu = raw.match(/(?:UID|uid|账号|account)\s*[:：][\s|｜]*([A-Za-z0-9_-]{2,24})/);
         if (mu) uid = mu[1];
 
-        // 1) 明确的昵称字段优先：昵称：张三
+        // 1) 明确的昵称字段优先：昵称：张三 / 角色名: | 羽婵
         try {
-            const m1 = raw.match(new RegExp('(?:' + FIELD_KEYS + ')\\s*[:：]\\s*([^|]{1,30})'));
+            const m1 = raw.match(new RegExp('(?:' + FIELD_KEYS + ')\\s*[:：][\\s|｜]*([^|｜]{1,30})'));
             if (m1) name = cleanFieldValue(m1[1]);
         } catch (e) {}
 
@@ -299,7 +313,7 @@
             const parts = raw.split('|');
             for (let i = 0; i < parts.length; i++) {
                 let seg = String(parts[i]).trim();
-                try { seg = seg.replace(new RegExp('^(?:' + FIELD_KEYS + ')\\s*[:：]\\s*'), ''); } catch (e) {}
+                try { seg = seg.replace(new RegExp('^(?:' + FIELD_KEYS + ')\\s*[:：][\\s|｜]*'), ''); } catch (e) {}
                 const v = cleanFieldValue(seg);
                 if (v) { name = v; break; }
             }
@@ -313,12 +327,22 @@
     let lastIdentity = null;      // { gid, playerKey }
     function buildTicketIdentity(playerInfo, messages) {
         const ident = parsePlayerIdentity(playerInfo);
-        const name = ident.name || "玩家";
+        let name = ident.name || "玩家";
+
+        // ★ V8.5.1 实机修复（关键）：手机端列表里显示的会话名、以及中继"切会话 / 匹配"用的名字，
+        //   都来自**网页左侧会话列表**（CONV_LIST）。而聊天区 playerInfo 解析出的名字可能与之不同
+        //   （本页实测：右侧面板的页签名"服务记录"曾被当成玩家名 → 两边对不上
+        //    → 手机端把所有会话都显示成"未打开"，点了进不去、通知也匹配不上）。
+        //   所以：会话列表里**当前高亮那一行**的名字才是权威（与手机端同源），优先采用它。
+        try {
+            const _act = scanConversationList().filter(function (r) { return r.active && r.name; })[0];
+            if (_act && _act.name) name = _act.name;
+        } catch (e) {}
 
         // ★ 玩家指纹只用"身份"字段，**绝不含聊天内容**：
         //   旧版把"第一条玩家消息"混进指纹，列表虚拟滚动/重新渲染就会换指纹，
         //   同一个工单被算成两个会话 —— 手机端于是出现重复卡片。
-        const playerKey = (ident.uid || '') + "##" + (ident.name || '');
+        const playerKey = (ident.uid || '') + "##" + (name || '');
         let gid = pickTicketId();
 
         if (gid) {
@@ -1352,6 +1376,8 @@
                     hasWaitForMenu: typeof Operator.waitForMenu === "function",
                     hasEditorFn: typeof Operator.editorFailureReason === "function",
                     hasReplyBtnTarget: String(Operator.clickSendButton).indexOf("reply-btn") !== -1,
+                    // ★ V8.3：浏览器里跑的这版到底有没有"人工回复嗅探"（排查"改了没生效"）
+                    hasDemoSniffer: typeof setupManualReplySniffer === "function",
                     composer: composerInfo,
                     imStatus: findIMStatusText(),
                     manualByUser: manualByUser,
@@ -1544,6 +1570,151 @@
         return rows;
     }
 
+    // ==================== ★ V8.3：人工回复"影子录制"（静默嗅探，供离线蒸馏规则） ====================
+    // 目的：把客服**真人**在工作台上打出的回复，连同当时的工单上下文（玩家信息 + 完整对话）
+    //   静默回传一条 RECORD_MANUAL_DEMO 给中继（落盘 demonstrations.jsonl），
+    //   供离线工具 distill_rules.py 让大模型逆向蒸馏"常用固定句式 / 避坑策略 / 索要信息边界"。
+    // 铁律（逐条对齐 .clinerules）：
+    //   ① 纯只读嗅探：不 preventDefault / 不 stopPropagation / 不改输入框 / 不点按钮 / 不代为发送；
+    //   ② 只认"真人操作"：AI 与手机代发走的是 fireClick() 的**合成事件**（isTrusted=false），
+    //      这里一律跳过 —— 否则会把系统自己生成的话当成"人工标准答案"喂给蒸馏脚本（污染语料）；
+    //   ③ 全程 try/catch，出错只 console.warn —— 绝不干扰客服界面的按钮点击与输入（红线：静默保护）；
+    //   ④ 复用的 DOM 靶点与"定时任务 2"完全一致（.chat-bubble-row / .from-player / .from-agent /
+    //      .ws-right-panel），不新增、不猜测任何类名（红线②：实机校准过的靶点不许乱动）；
+    //   ⑤ 事后复验：只有输入框**真的被清空**（或对话里真的出现了这句话）才上报；
+    //      点了却没发出去的误触不会污染语料。
+    let _demoCaptured = 0;        // 命中"人工发送动作"的次数
+    let _demoSent = 0;            // 复验通过、真的上报给中继的条数
+    let _demoSkipped = 0;         // 复验未通过（没真发出去）而丢弃的条数
+    let _lastDemoPreview = "";    // 最近一条已上报样本的回复预览（__probe.demos() 用）
+
+    // 抓一份"当前工单上下文"：玩家信息 + 聊天气泡数组（与定时任务 2 同一套靶点，绝不另猜类名）
+    function collectDemoSnapshot() {
+        const snap = { playerInfo: "", messages: [] };
+        try {
+            const rightPanel = document.querySelector('.ws-right-panel');
+            if (rightPanel) snap.playerInfo = rightPanel.innerText.replace(/\n+/g, ' | ').trim();
+        } catch (e) {}
+        try {
+            document.querySelectorAll('.chat-bubble-row').forEach(row => {
+                const isPlayer = row.classList.contains('from-player');
+                const isAgent = row.classList.contains('from-agent');
+                if (!isPlayer && !isAgent) return;
+                const textNode = row.querySelector('.msg-rich-text') || row;
+                const content = (textNode.innerText || "").trim();
+                if (content) snap.messages.push({ sender: isPlayer ? 'player' : 'agent', text: content });
+            });
+        } catch (e) {}
+        return snap;
+    }
+
+    // 读回复框里"客服此刻准备发出去"的原文（Quill / contenteditable / input 都兼容）
+    function readComposerText() {
+        try {
+            const el = Operator.composerInput();
+            if (!el) return "";
+            const v = (el.value !== undefined && el.value !== null) ? el.value : (el.innerText || "");
+            return String(v || "").trim();
+        } catch (e) { return ""; }
+    }
+
+    // 被点的元素是不是"人工的回复/发送"？（只认实机校准过的靶点 + 精确文字，绝不猜类名）
+    function isManualSendTrigger(target) {
+        try {
+            if (!target || typeof target.closest !== 'function') return false;
+            // 实机靶点：button.im-action-btn.reply-btn（"回复"）；灰的（disabled）不算 —— 点了也不会发
+            const rep = target.closest('button.im-action-btn.reply-btn, button.reply-btn');
+            if (rep && !rep.disabled && isVisibleEl(rep)) return true;
+            // 兜底：容器内文字恰为"发送 / 发送消息"的按钮（仍只认文字，不认猜测的类名）
+            const btn = target.closest('button, .im-action-btn, [role="button"]');
+            if (btn && !btn.disabled) {
+                const texts = elTextsOf(btn);
+                if (texts.some(t => t === '发送' || t === '发送消息')) return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    // 嗅探核心：捕获阶段先把"客服打的原文 + 当前工单上下文"抓在手（页面还没清空输入框），
+    //   再延迟复验"到底发出去没有"，通过了才回传中继。中继侧只落盘、零出站，不会代发。
+    function captureManualDemo(trigger) {
+        try {
+            if (!PROBE_CONFIG.demoCapture) return;
+            const humanReply = readComposerText();
+            const minLen = Math.max(1, parseInt(PROBE_CONFIG.demoMinLen, 10) || 2);
+            if (normText(humanReply).length < minLen) return;      // 空/太短：不记（防误触、防刷屏）
+            _demoCaptured++;
+            const snap = collectDemoSnapshot();
+            const ident = buildTicketIdentity(snap.playerInfo, snap.messages);
+            setTimeout(() => {
+                try {
+                    // 复验：① 回复框被清空  或  ② 对话里真的出现了这段话 —— 有一即算"真的发出去了"
+                    const empty = Operator.isComposerEmpty();
+                    const after = collectDemoSnapshot().messages.map(m => m.text);
+                    const appeared = after.some(t => normText(t) === normText(humanReply));
+                    if (!(empty === true || appeared)) {
+                        _demoSkipped++;
+                        console.warn("🛑 [探针] 人工回复嗅探：输入框没清空、对话里也没出现这段话，"
+                                     + "判定为没真正发出，不记录（不影响你的操作）");
+                        return;
+                    }
+                    sendToBrain({
+                        event: "RECORD_MANUAL_DEMO",
+                        data: {
+                            timestamp: Date.now(),
+                            trigger: trigger,                    // 'click' = 点了回复/发送按钮；'enter' = 键盘回车
+                            groupID: ident.gid,
+                            name: ident.name,
+                            playerInfo: snap.playerInfo,
+                            messages: snap.messages,
+                            humanReply: humanReply,              // 客服真人准备发出的最终文本（原文，不清洗）
+                            probeVersion: PROBE_VERSION
+                        }
+                    });
+                    _demoSent++;
+                    _lastDemoPreview = normText(humanReply).slice(0, 40);
+                    console.log("🎙️ [探针] 已静默记录 1 条人工回复样本：" + _lastDemoPreview);
+                } catch (e) { console.warn("⚠️ [探针] 人工回复嗅探复验异常：", e); }
+            }, Math.max(200, parseInt(PROBE_CONFIG.demoVerifyMs, 10) || 1200));
+        } catch (e) {
+            console.warn("⚠️ [探针] 人工回复嗅探异常（不影响发送）：", e);
+        }
+    }
+
+    // 注册嗅探监听（只注册一次，在启动处调用）。
+    //   ★ 为什么用 mousedown（捕获）+ keydown（捕获）而不是 click：
+    //     ① 捕获阶段**先于**页面自己的处理执行，能读到"客服刚打完、还没被清空"的原文；
+    //     ② 不使用已有的 document 'click' 监听（那是"人手点状态"的守卫），两者互不干扰；
+    //     ③ AI / 手机代发走的是 fireClick() 合成的 pointerdown/mousedown/mouseup/click 事件，
+    //        这里靠 isTrusted === false 直接跳过 —— 系统自己发的话绝不会被当成人工样本。
+    function setupManualReplySniffer() {
+        if (!PROBE_CONFIG.demoCapture) return;
+        try {
+            document.addEventListener('mousedown', function (ev) {
+                try {
+                    if (!ev || ev.isTrusted === false) return;      // 合成事件（AI/手机代发）不算人工
+                    if (!isManualSendTrigger(ev.target)) return;
+                    captureManualDemo('click');
+                } catch (e) { console.warn("⚠️ [探针] 人工回复嗅探(mousedown)异常：", e); }
+            }, true);
+        } catch (e) { console.warn("⚠️ [探针] 人工回复嗅探(mousedown)绑定失败：", e); }
+        try {
+            document.addEventListener('keydown', function (ev) {
+                try {
+                    if (!ev || ev.isTrusted === false) return;
+                    // Shift+Enter 是换行、输入法组合中的回车都不是"发送"
+                    if (ev.key !== 'Enter' || ev.shiftKey || ev.isComposing) return;
+                    const box = Operator.composerInput();
+                    if (!box) return;
+                    const t = ev.target;
+                    if (!(t === box || (box.contains && t && box.contains(t)))) return;  // 焦点不在回复框里的回车不算
+                    captureManualDemo('enter');
+                } catch (e) { console.warn("⚠️ [探针] 人工回复嗅探(keydown)异常：", e); }
+            }, true);
+        } catch (e) { console.warn("⚠️ [探针] 人工回复嗅探(keydown)绑定失败：", e); }
+        console.log("🎙️ [探针] 人工回复嗅探已就绪（只读录制真人回复 -> RECORD_MANUAL_DEMO，不影响发送）");
+    }
+
     // ==================== 定时任务 3：心跳 + 胶囊状态刷新 ====================
     // 心跳让后端 /api/diag 能显示"探针活着、跑的是哪一版"，胶囊让客服肉眼可见。
     setInterval(() => {
@@ -1606,10 +1777,18 @@
             console.table ? console.table(info) : console.log(info);
             return info;
         },
+        // ★ V8.3：人工回复嗅探自检（客服/运维可直接看"到底记到没有、记了几条"）
+        demos: function () {
+            const st = { captureEnabled: !!PROBE_CONFIG.demoCapture, captured: _demoCaptured,
+                         sent: _demoSent, skipped: _demoSkipped, lastReply: _lastDemoPreview };
+            console.table ? console.table(st) : console.log(st);
+            return st;
+        },
         reconnect: function () { reconnectAttempts = 0; connectBrain(); return "已触发重连"; }
     };
 
     // ==================== 启动 ====================
+    setupManualReplySniffer();          // ★ V8.3：人工回复静默嗅探（只读录制，绝不影响客服操作）
     setChip('idle', "");
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', connectBrain);
     else connectBrain();

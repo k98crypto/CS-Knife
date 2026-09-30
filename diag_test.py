@@ -18,7 +18,7 @@ except Exception:
     pass
 
 BASE = "http://127.0.0.1:8765"
-TEST_VER = "8.2"
+TEST_VER = "8.4"
 TEST_PAGE = "https://ticket.example.com/imChat/workstation"
 
 passed = 0

@@ -17,6 +17,34 @@ except Exception:
 
 import bridge_server as B
 
+# ★ V8.5.1：单测也会调用 apply_*（会落盘），记下初始状态，结束时恢复 —— 别污染真实的 im_state.json / mode_state.json
+import os as _os
+import json as _json
+_IM_FP = getattr(B, "IM_STATE_PATH", None)
+_MODE_FP = getattr(B, "MODE_FILE", None)
+
+
+def _snap(p):
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+_IM_SNAP = _snap(_IM_FP) if _IM_FP else None
+_MODE_SNAP = _snap(_MODE_FP) if _MODE_FP else None
+
+
+def _restore_state_files():
+    for p, s in ((_IM_FP, _IM_SNAP), (_MODE_FP, _MODE_SNAP)):
+        if p and s is not None:
+            try:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(s)
+            except Exception:
+                pass
+
 passed = 0
 failed = 0
 
@@ -313,7 +341,7 @@ check("留存「网页下拉实测选项」（含触发元素与可见状态节�
 check("自检页把这三项渲染出来（不用看控制台）",
       'row("上次切换请求"' in SRC and 'row("上次动作回执"' in SRC and 'row("网页下拉实测"' in SRC)
 check("手机页面禁缓存（否则 iOS 一直用旧版 H5，看不到新按钮）",
-      'Cache-Control": "no-store, no-cache, must-revalidate"' in SRC)
+      'Cache-Control": "no-store, no-cache, must-revalidate' in SRC and '"Expires": "0"' in SRC)
 print("\n[10.7] 指令自检（V7.8：先确认'指令到底有没有到探针'，再谈干活）")
 check("新增 GET /api/probe_ping（发 PING 等 PONG，3 秒超时直说）",
       "def api_probe_ping" in SRC and '"/api/probe_ping"' in SRC and "timeout=3.0" in SRC)
@@ -477,6 +505,76 @@ check("半自动/手动点按钮 -> 草稿推到网页与手机输入框（FILL_
       '{"type": "FILL_DRAFT", "content": body}' in SRC)
 check("草稿不覆盖客服正在写的字（noOverwrite）",
       '"noOverwrite": True' in SRC)
+
+print("\n[10.15] V8.5 测试来源绝不许打扰客服手机（Bark 隔离）+ 手机输入框不被草稿冲掉")
+
+# ① 行为断言：测试来源的关单成功 -> 不推 Bark；真实来源照旧推（没修过头）
+_bark_calls = []
+_orig_push_bark = B.push_bark
+B.push_bark = lambda *a, **k: _bark_calls.append(a)
+try:
+    _convs = B.state["companies"]["main"]["conversations"]
+    _convs["BARKTEST-T"] = {"name": "测试来源会话", "_test_origin": True, "msgs": [p("在吗")]}
+    B.mark_close_pending("BARKTEST-T", "其他")           # 会话带 _test_origin -> 自动按测试来源处理
+    B.resolve_close("BARKTEST-T", True, "已点击「回复并关单」")
+    check("测试来源的关单成功 -> 不推 Bark（铁律⑨：测试只推测试连接，含 Bark）",
+          _bark_calls == [] and "BARKTEST-T" not in _convs, str(_bark_calls))
+    _convs["BARKTEST-R"] = {"name": "真实来源会话", "msgs": [p("在吗")]}
+    B.mark_close_pending("BARKTEST-R", "其他")
+    B.resolve_close("BARKTEST-R", True, "已点击「回复并关单」")
+    check("真实来源的关单成功照旧推 Bark（没有修过头）",
+          len(_bark_calls) == 1 and "已回复并关单" in str(_bark_calls[0]), str(_bark_calls)[:120])
+finally:
+    B.push_bark = _orig_push_bark
+    for _g in ("BARKTEST-T", "BARKTEST-R"):
+        B.state["companies"]["main"]["conversations"].pop(_g, None)
+        B._PENDING_CLOSE.pop(_g, None)
+
+# ② 静态断言：其余几条会推 Bark / 打扰手机的通路也必须带隔离
+check("异常掉线警报隔离：测试探针发的 ABNORMAL_OFFLINE 只站内、不推 Bark",
+      "测试来源：只做站内告警，不推 Bark" in SRC
+      and 'if ws in TEST_WS:\n                        print("[掉线]' in SRC)
+check("「需要人工介入」隔离：测试来源只站内告警，不推手机、不推 Bark",
+      "_is_test_alert" in SRC and "_mobile_targets_for(_is_test_alert)" in SRC
+      and "测试来源：只做站内告警（不推手机、不推 Bark）" in SRC)
+check("手机输入框里的字不被 AI 草稿冲掉（红线⑫延伸到手机端）",
+      "lastDraftFilled" in SRC and "AI 草稿没覆盖你在输入框里写的内容" in SRC)
+check("手机页面版本号已更新（改完一眼能确认手机刷没刷上）",
+      "const H5_VER = '8.5.1'" in SRC)
+check("防重复发送的字典不会无限增长（60 秒前的记录清掉）",
+      "对 6 秒防抖已无意义" in SRC and "len(_DEDUP_SENT) > 200" in SRC)
+
+print("\n[10.16] V8.5.1 切旧会话不再误响 Bark + 测试绝不污染 IM 状态/模式")
+
+# ① 静态：切会话误响 Bark 的根因修复 —— 用"上一次 PLAYER_MESSAGE 的工单"判断，与 CONV_LIST 的 page_gid 解耦
+check("「正在看这条会话」改用 _LAST_MSG_GID 判断（不再被 CONV_LIST 的 active 行提前污染）",
+      "_LAST_MSG_GID" in SRC and "_LAST_TEST_MSG_GID" in SRC
+      and "_prev_page_gid = str((_LAST_TEST_MSG_GID if _is_test_origin else _LAST_MSG_GID)" in SRC)
+
+# ② 静态：测试来源改 IM 状态/模式只改内存、不落盘
+check("IM 状态写入口支持 persist（测试来源不落盘 im_state.json）",
+      'def apply_im_status(status, manual=None, source="", from_probe=False, persist=True)' in SRC
+      and "if persist:" in SRC)
+check("回复模式写入口支持 persist（测试来源不落盘 mode_state.json）",
+      'def apply_reply_mode(mode: str, source: str = "mobile", force: bool = False, persist: bool = True)' in SRC)
+check("SET_IM_STATUS / RESET_IM_STATE / SET_MODE / TOGGLE_AFK 测试来源都传 persist=(ws not in TEST_WS)",
+      SRC.count("persist=(ws not in TEST_WS)") >= 7, str(SRC.count("persist=(ws not in TEST_WS)")))
+check("测试探针上报的 IM_STATUS / 掉线 / 恢复事件也不落盘（彻底不污染 im_state.json）",
+      'persist=(ws not in TEST_WS))' in SRC and "测试探针（?test=1）上报的 IM_STATUS" in SRC)
+
+# ③ 行为：persist=False 不落盘，persist=True 落盘（用 manual=True 避开"自动上线"守卫）
+B.apply_im_status(2, manual=True, persist=True)     # 先落盘成"忙碌"
+_disk0 = _json.load(open(B.IM_STATE_PATH, encoding="utf-8-sig"))
+check("准备：persist=True 落盘成 2", int(_disk0.get("status")) == 2, str(_disk0))
+B.apply_im_status(3, manual=True, persist=False)    # 测试来源：设成离线但不落盘
+_disk = _json.load(open(B.IM_STATE_PATH, encoding="utf-8-sig"))
+check("persist=False 不写 im_state.json（磁盘仍是 2，没被测试覆盖）",
+      int(_disk.get("status")) == 2, str(_disk))
+B.apply_im_status(1, manual=True, persist=True)     # 真实来源：落盘成"在线"
+_disk2 = _json.load(open(B.IM_STATE_PATH, encoding="utf-8-sig"))
+check("persist=True 照常落盘（磁盘变 1）", int(_disk2.get("status")) == 1, str(_disk2))
+
+_restore_state_files()   # ★ 收尾：把单测写过的状态文件恢复原样
 
 print(f"\n=== 结果: {passed} 通过 / {failed} 失败 ===")
 raise SystemExit(0 if failed == 0 else 1)

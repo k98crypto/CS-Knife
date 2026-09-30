@@ -30,6 +30,13 @@ function makeEl(id) {
         set innerHTML(v) { this._html = String(v); },
         get innerHTML() { return this._html; },
         addEventListener(ev, fn) { this._listeners[ev] = fn; if (ev === 'click') this._click = fn; },
+        // ★ V8.5.1：补上 closest（真实浏览器的 Element.closest），让兜底委托 onTap 能被真正测到
+        closest(sel) {
+            if (sel === '.conv-card[data-gid]' && this.dataset && this.dataset.gid) return this;
+            if (sel === '[data-openname]' && this.dataset && this.dataset.openname) return this;
+            if (sel === '[data-toggle-other]' && this.dataset && this.dataset.toggleOther) return this;
+            return null;
+        },
         insertAdjacentHTML(pos, v) { if (pos === 'beforeend') this._html += String(v); },
         querySelectorAll(sel) {
             const out = [];
@@ -691,6 +698,64 @@ check('关闭后点「AI 回复并关单」不会下发 AI_CLOSE（本地就拦�
     'sentHasAiClose=' + sentHasAiClose + ' errHasClosed=' + errHasClosed
     + ' | sent=' + JSON.stringify(FakeWebSocket.sent)
     + ' | err=' + (els['err-text'].innerText || ''));
+
+console.log('\n[18] V8.5 草稿绝不冲掉客服正在手机上敲的字');
+wsInst.readyState = 1;
+els['chat-input'].value = '';
+els['toast'].innerText = ''; els['err-text'].innerText = '';
+onmsg({ type: 'FILL_DRAFT', content: 'AI 草稿内容' });
+check('输入框为空时草稿照常填入（老行为没变）',
+    els['chat-input'].value === 'AI 草稿内容', String(els['chat-input'].value));
+check('填入后有明确反馈（带页面版本，方便确认手机刷没刷上）',
+    (els['toast'].innerText || '').indexOf('AI 草稿已填入输入框') !== -1
+    && (els['toast'].innerText || '').indexOf('页面 v') !== -1, els['toast'].innerText);
+
+// 客服自己敲了字 -> 草稿只提示、绝不覆盖（和探针 fillReplyBox 同一条铁律）
+els['chat-input'].value = '我正在写的字';
+els['toast'].innerText = ''; els['err-text'].innerText = '';
+onmsg({ type: 'FILL_DRAFT', content: '另一份 AI 草稿' });
+check('客服正在写字 -> 草稿绝不覆盖', els['chat-input'].value === '我正在写的字',
+    String(els['chat-input'].value));
+check('未覆盖时给出可读提示（并保留草稿内容，可复制）',
+    (els['toast'].innerText || '').indexOf('没覆盖') !== -1
+    && (els['err-text'].innerText || '').indexOf('另一份 AI 草稿') !== -1,
+    (els['toast'].innerText || '') + ' | ' + (els['err-text'].innerText || ''));
+
+// 本页自己填过的那份草稿可以继续刷新（不能把自己挡在外面）
+els['chat-input'].value = 'AI 草稿内容';
+els['toast'].innerText = '';
+onmsg({ type: 'FILL_DRAFT', content: 'AI 草稿内容（更新版）' });
+check('本页自己填的草稿可以刷新（不会把自己挡在门外）',
+    els['chat-input'].value === 'AI 草稿内容（更新版）', String(els['chat-input'].value));
+// 发完清空后，再来草稿应当恢复正常填入
+els['chat-input'].value = ''; sandbox.execCommand('SEND');
+onmsg({ type: 'FILL_DRAFT', content: '清空后的新草稿' });
+check('发送清空后再来草稿 -> 正常填入（不会被"已写过字"长期挡住）',
+    els['chat-input'].value === '清空后的新草稿', String(els['chat-input'].value));
+
+console.log('\n[19] V8.5.1 兜底委托（直接绑定万一失效，点卡片仍能进会话）');
+// 先造一条会话，让 renderAll 渲染出卡片
+onmsg({ type: 'FULL_SYNC', data: {
+    afk_mode: false, alarm_status: false, extension_online: true, im_status: 1, im_status_known: true,
+    human_alerts: [],
+    companies: { main: { conversations: {
+        'T-FALLBACK': { name: '兜底玩家', updatedAt: nowMs, msgs: [{ sender: 'player', text: '在吗', ts: nowMs }] }
+    } } }
+} });
+const fbCards = (els['conv-container']._cards || []).filter(c => c.dataset.gid === 'T-FALLBACK');
+check('兜底测试的卡片已渲染', fbCards.length === 1, '数量=' + fbCards.length);
+// 兜底委托在启动时绑到 conv-container 上（onTap），靠 closest 找卡片
+const contEl = els['conv-container'];
+const onTap = contEl && contEl._click;
+check('启动时已把兜底委托 onTap 绑到列表容器', typeof onTap === 'function');
+if (fbCards.length && typeof onTap === 'function') {
+    fbCards[0]._click = null;                        // 模拟"直接绑定失效"（只剩兜底委托）
+    const evt = { target: fbCards[0], _h5Handled: false };
+    onTap(evt);
+    check('仅靠兜底委托也能进入会话（chat-view 激活）',
+        els['chat-view'].classList.contains('active'));
+    check('兜底委托带 _h5Handled 去重（不会与直接绑定重复处理）', evt._h5Handled === true);
+}
 
 console.log('\n=== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ===');
 process.exit(fail === 0 ? 0 : 1);

@@ -231,11 +231,12 @@ async def _reassert_im_status(target_code):
         await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": msg})
 
 
-def reset_im_state(source=""):
+def reset_im_state(source="", persist=True):
     """♻️ 以"电脑网页的真实现状"为准重置 IM 状态（清掉卡住的手动锁）。返回采用的状态码。
 
     真机场景：手机切忙碌时页面上没生效（旧脚本标签匹配不上），中继却把"忙碌+手动"锁住了，
     于是手机显示忙碌、网页显示在线，两边都改不动 —— 这个口子就是给这种情况的逃生舱。
+    ★ V8.5.1：persist=False = 测试来源，只改内存、不落盘。
     """
     page = state.get("im_status_page") or state.get("im_status") or 1
     try:
@@ -249,12 +250,12 @@ def reset_im_state(source=""):
     state["im_status_tries"] = 0
     state["im_status_conflict"] = ""
     state["im_status_notified"] = ""
-    apply_im_status(page, manual=False, source="重置（以网页为准）")
+    apply_im_status(page, manual=False, source="重置（以网页为准）", persist=persist)
     print(f"[状态] ♻️ 已按网页真实现状重置为「{_im_txt(page)}」（来源：{source or '手动'}）")
     return page
 
 
-def apply_im_status(status, manual=None, source="", from_probe=False):
+def apply_im_status(status, manual=None, source="", from_probe=False, persist=True):
     """IM 状态唯一写入口：内存 + 落盘 + 标记"已核实"，返回是否有变化。
 
     ★ 客服铁律（第三轮补充）：**任何情况都不得把"离线/忙碌"自动改成"在线"**，除非是人工手动动作。
@@ -265,6 +266,9 @@ def apply_im_status(status, manual=None, source="", from_probe=False):
       from_probe=True 表示这条来自探针读 DOM（网页事实），只更新 im_status_page；
       一旦"事实 ≠ 意图"除了拦住，还会把人工意图**重新下发给探针**（最多 3 次），
       重试无效就如实推手机 —— 不再出现"手机显示忙碌、网页其实在线、两边都改不动"。
+
+    ★ V8.5.1 铁律⑥：persist=False 表示"测试来源"—— 只改内存、**不落盘 im_state.json**，
+      否则跑一次回归测试就把客服真实的 IM 状态记忆覆盖掉（"又把我改成在线"）。
     """
     try:
         st = int(status)
@@ -307,7 +311,8 @@ def apply_im_status(status, manual=None, source="", from_probe=False):
         state["im_status_notified"] = ""
     if st == 1:
         state["alarm_status"] = False
-    save_im_state(st, state.get("im_status_manual", False))
+    if persist:
+        save_im_state(st, state.get("im_status_manual", False))
     return changed
 
 
@@ -357,8 +362,10 @@ def save_mode_state():
         print(f"[警告] 回复模式落盘失败：{e}")
 
 
-def apply_reply_mode(mode: str, source: str = "mobile", force: bool = False):
-    """切换回复模式。返回 (ok, note)：手机端优先窗口内拒绝电脑小窗的改动。"""
+def apply_reply_mode(mode: str, source: str = "mobile", force: bool = False, persist: bool = True):
+    """切换回复模式。返回 (ok, note)：手机端优先窗口内拒绝电脑小窗的改动。
+    ★ V8.5.1 铁律⑥：persist=False = 测试来源，只改内存、不落盘 mode_state.json。
+    """
     if mode not in MODE_LABEL:
         return False, "未知模式"
     now = time.time()
@@ -372,7 +379,8 @@ def apply_reply_mode(mode: str, source: str = "mobile", force: bool = False):
     state["auto_draft"] = (mode != "manual")
     state["mode_owner"] = source
     state["mode_ts"] = now
-    save_mode_state()
+    if persist:
+        save_mode_state()
     print(f"[模式] {MODE_LABEL[mode]} · 来源：{'手机端' if source == 'mobile' else ('电脑小窗' if source == 'desktop' else '默认')}")
     return True, MODE_LABEL[mode]
 
@@ -512,6 +520,12 @@ _LAST_ACTIVE = {"gid": None}
 #   真实探针与测试探针各记一份，互不干扰。
 _LAST_PAGE_GID = {"gid": ""}
 _LAST_TEST_PAGE_GID = {"gid": ""}
+# ★ V8.5.1：上一次"玩家消息"上报的工单（**只**由 PLAYER_MESSAGE 更新，与 CONV_LIST 的 page_gid 解耦）。
+#   用途：判断"我当时是不是正看着这条会话"。切会话时探针会先报 CONV_LIST（active 行变了），
+#   把 _LAST_PAGE_GID 提前改成新会话 —— 于是 PLAYER_MESSAGE 里 `_prev_page_gid == gid`，
+#   把"翻旧会话的历史"误判成新消息，导致 Bark 响铃（客服反馈"切到旧会话还响"的根因）。
+_LAST_MSG_GID = {"gid": ""}
+_LAST_TEST_MSG_GID = {"gid": ""}
 # ★ 分类候选的"按需等待者"（ensure_category_options 用）
 _CATEGORY_WAITERS = []
 _PONG_WAITERS = []                   # ★ V7.8：/api/probe_ping 等探针 PONG 的地方（诊断用）
@@ -551,7 +565,7 @@ _LAST_NOTIFIED = {}
 _PROBE_CONNS = {}            # ws -> {"version","page","ua","last_seen","hello"}
 _PROBE_META = {"version": "", "page": "", "ua": "", "last_seen": 0.0, "hello_count": 0}
 SERVER_START = time.time()
-SERVER_VER = "8.2"
+SERVER_VER = "8.4"
 
 
 def _probe_refresh():
@@ -713,6 +727,73 @@ def _log_outbound(where, pkt, ok, note="", auto=False, targets=None):
         print(f"[审计] 记录失败（不影响发送）：{e}")
 
 
+# ==================== ★ V8.3：人工回复"影子录制"语料（供 distill_rules.py 离线蒸馏） ====================
+# 背景：探针 V8.3 会把客服**真人**在工作台上发出的回复 + 当时的工单上下文，静默上报 RECORD_MANUAL_DEMO。
+# 这里只做一件事：把它落盘成 JSONL，给离线的 distill_rules.py 去逆向蒸馏话术规则。
+#
+# 🛑 红线声明：本函数**只落盘、零出站** —— 不填草稿、不发送、不改会话状态、不经过也无需经过 safe_outbound
+#   （它是"学习语料"，不是要发给玩家的内容；将来蒸馏出的话术仍会走原有的出站安全闸）。
+DEMO_FILE = os.path.join(BASE_DIR, "demonstrations.jsonl")
+DEMO_TEST_FILE = os.path.join(BASE_DIR, "demonstrations.test.jsonl")   # 测试探针（?test=1）单独存，不污染真实语料
+_DEMO_DEDUP = {}          # (gid, 回复前 80 字, 是否测试) -> 最近一次记录时间戳，用于 6 秒防刷
+_DEMO_MAX_MSGS = 40       # 单个样本最多带多少条历史消息（防止异常大包把文件撑爆）
+
+
+def _append_demo_record(data, is_test=False):
+    """把一条"人工真实回复"示范样本追加写入 JSONL。返回 True = 真的写入了一条。
+
+    防刷与健壮性（极简，不做任何多余动作）：
+      ① humanReply 去掉空白后 < 2 字 -> 直接忽略（空包/误触）；
+      ② 同一 (工单 + 文本) 6 秒内只记一次（防双击、防探针重复派发）；
+      ③ 任何异常只打印日志，绝不影响探针连接与消息链路（红线：不得阻塞/打断主流程）。
+    """
+    try:
+        data = data or {}
+        reply = " ".join(str(data.get("humanReply") or "").split())
+        if len(reply) < 2:
+            return False
+        gid = str(data.get("groupID") or "")
+        msgs = data.get("messages")
+        if not isinstance(msgs, list):
+            msgs = []
+        clean_msgs = []
+        for m in msgs[:_DEMO_MAX_MSGS]:
+            if not isinstance(m, dict):
+                continue
+            clean_msgs.append({
+                "sender": "agent" if str(m.get("sender")) == "agent" else "player",
+                "text": " ".join(str(m.get("text") or "").split())[:2000],
+            })
+        now = time.time()
+        key = (gid, reply[:80], bool(is_test))
+        if now - float(_DEMO_DEDUP.get(key) or 0.0) < 6.0:
+            return False
+        _DEMO_DEDUP[key] = now
+        if len(_DEMO_DEDUP) > 500:                     # 轻量清理，长期运行也不涨内存
+            for k in sorted(_DEMO_DEDUP, key=lambda k: _DEMO_DEDUP[k])[:250]:
+                _DEMO_DEDUP.pop(k, None)
+        rec = {
+            "timestamp": int(data.get("timestamp") or (now * 1000)),
+            "recordedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "groupID": gid,
+            "name": str(data.get("name") or "")[:60],
+            "playerInfo": " ".join(str(data.get("playerInfo") or "").split())[:300],
+            "messages": clean_msgs,
+            "humanReply": reply[:2000],
+            "trigger": str(data.get("trigger") or "")[:16],
+            "probeVersion": str(data.get("probeVersion") or "")[:16],
+            "test": bool(is_test),
+        }
+        path = DEMO_TEST_FILE if is_test else DEMO_FILE
+        # 单行 JSON（UTF-8 追加）：一条一行，distill_rules.py 可逐行读、去重、抽样
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        print(f"[DemoRecorder] ⚠️ 记录失败（不影响任何发送）：{e}")
+        return False
+
+
 async def send_to_player(payload, where="", origin=None, require_page=False, page_name=None, auto=False):
     """把指令发给电脑端探针去执行前，先把"玩家可见文本"过一遍安全闸。
 
@@ -754,6 +835,11 @@ async def send_to_player(payload, where="", origin=None, require_page=False, pag
             print(f"[防重] 6 秒内同一条会话的同样内容已发过，忽略重复指令（{where}）")
             _log_outbound(where, pkt, ok=False, note="重复指令（6 秒内同样内容）已忽略", auto=auto)
             return False
+        # ★ V8.5：长期运行的清理（60 秒前的记录对 6 秒防抖已无意义，别让字典越涨越大）
+        if len(_DEDUP_SENT) > 200:
+            for _hk, _hv in list(_DEDUP_SENT.items()):
+                if _now - float(_hv or 0) > 60.0:
+                    _DEDUP_SENT.pop(_hk, None)
         _DEDUP_SENT[_k] = _now
     # ① 页面绑定核对（防"发错人"）：不对就**自动把网页切过去**，而不是让客服自己切
     if require_page:
@@ -913,14 +999,19 @@ async def send_hold_and_alert(group_id: str, conv: dict, history_str: str, reply
     conv["alertTs"] = alert["ts"]
     # ★ V8.2：只有"新鲜消息"才推 Bark —— 翻看旧工单（AI 本不该对旧消息动手）不再打扰手机锁屏
     _lp = last_player_ts(conv)
-    if _lp and (int(time.time() * 1000) - _lp) <= AUTO_ACTIVE_WINDOW_MS:
+    # ★ V8.5 铁律⑨：这条告警是不是"测试来源"（测试客户端 / 测试造的会话）——
+    #   测试来源只许走站内（/diag / 桌面），**绝不**推客服手机的 Bark，也不弹真机横幅。
+    _is_test_alert = (_auto_origin(group_id) == "test")
+    if _is_test_alert:
+        print("[人工介入] 测试来源：只做站内告警（不推手机、不推 Bark）")
+    elif _lp and (int(time.time() * 1000) - _lp) <= AUTO_ACTIVE_WINDOW_MS:
         push_bark("🙋 需要人工介入", f"{name}：表格里没有对应答案，已发安抚话术", group_id)
     else:
         print("[人工介入] 旧会话（消息不新鲜）：只做站内告警，不推 Bark")
     state["human_alerts"] = ([alert] + [a for a in state.get("human_alerts", []) if a.get("groupID") != group_id])[:20]
 
     print(f"[人工] 🙋 需要人工介入：{name}（{group_id}）· {summary[:60]}")
-    for m in list(active_clients["mobile"]):
+    for m in _mobile_targets_for(_is_test_alert):
         await safe_send(m, {"type": "HUMAN_ALERT", "groupID": group_id, "name": name,
                             "message": f"{name}：{alert['reason']}", "summary": summary,
                             "playerInfo": alert["playerInfo"]})
@@ -1380,12 +1471,13 @@ HTML_CONTENT = """<!DOCTYPE html>
   <script>
     let globalState = null; let activeGroupId = null; let ws = null;
     // ★ V8.0.2：手机页面版本号（顶栏胶囊显示）——"刷新了没生效"时第一眼就能确认
-    const H5_VER = '8.4';
+    const H5_VER = '8.5.1';
     // ★ V8.0.1：点过"未打开"的会话后，等它出现在中继会话列表里就自动打开聊天页（不用点第二次）
     let pendingOpenName = '';
     let pendingOpenAt = 0;                 // 待打开的登记时间（25 秒后自动作废，避免乱开）
     let lastKnownGids = {};                // 上一次渲染时已知的会话（用于"兜底自动打开"）
     let showOtherConvs = false;            // ★ V8.2："其它会话（不在网页列表里）"默认收起
+    let lastDraftFilled = '';              // ★ V8.5：本页自己填进去的最后一份草稿（用来判断"输入框里的字是不是客服写的"）
     let audioCtx = null; let sirenInterval = null;
     let wsAttempts = 0;
     let imStatusRequested = false;      // 已向电脑端索要过真实状态（4 秒内不重复要）
@@ -1961,11 +2053,23 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
         else if (payload.type === 'FILL_DRAFT') {
             const input = document.getElementById('chat-input');
-            if (input) input.value = payload.content || '';
+            const draft = String(payload.content || '');
+            // ★ V8.5：草稿**绝不冲掉客服正在手机上敲的字**（和探针 fillReplyBox 同一条铁律）——
+            //   输入框里已有"不是本页自己填的"内容时只提示、不覆盖；客服清空后再点「✨ AI 立刻起草」即可。
+            const cur = input ? String(input.value || '') : '';
+            if (input && draft && cur.trim() && cur !== lastDraftFilled) {
+                const skipMsg = 'AI 草稿没覆盖你在输入框里写的内容（清空输入框后点「✨ AI 立刻起草」可重新生成）';
+                toast('⚠️ ' + skipMsg);
+                showErr('未覆盖你正在写的内容 · 草稿：' + draft.slice(0, 120));
+                autoGrowInput();                       // 草稿可能很长：自动长高到看得全（有上限，超出滚动）
+                return;
+            }
+            if (input) input.value = draft;
+            lastDraftFilled = draft;
             autoGrowInput();                       // 草稿可能很长：自动长高到看得全（有上限，超出滚动）
             if (input && input.focus) { try { input.focus(); } catch (e) {} }
             // ★ V8.4：起草是"动作"，必须给明确反馈（客服点了才知道生效）
-            if (payload.content) toast('✅ AI 草稿已填入输入框（可修改后点 ↑ 发送 · 页面 v' + H5_VER + '）');
+            if (draft) toast('✅ AI 草稿已填入输入框（可修改后点 ↑ 发送 · 页面 v' + H5_VER + '）');
         }
         else if (payload.type === 'AI_STATUS') {
             if (payload.message) toast(payload.message);   // 关单结果 / AI 状态提示
@@ -2304,7 +2408,7 @@ HTML_CONTENT = """<!DOCTYPE html>
               }
               toast('已发送（页面 v' + H5_VER + '）');
           }
-          if (input) input.value = '';
+          if (input) { input.value = ''; lastDraftFilled = ''; }   // ★ V8.5：清空后草稿可重新填入（不再被"已有内容"挡住）
           autoGrowInput();                       // 清空后把高度收回去
       }
     }
@@ -2373,8 +2477,10 @@ async def api_current_ticket(request):
 async def index_handler(request):
     # ★ V7.7：手机页面必须 no-store —— 否则 iOS 会把旧版 H5 缓存下来，
     #   新加的按钮/提示（如「以网页为准」「网页仍在线」）在手机上根本看不到。
+    # ★ V8.5.1：再加 Expires:0，进一步压住 iOS Safari 对 no-store 偶发无视的缓存（"改了没生效/打不开卡片"第一排查点）。
     return web.Response(text=HTML_CONTENT, content_type="text/html",
-                        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                 "Pragma": "no-cache", "Expires": "0"})
 
 
 async def api_categories(request):
@@ -2572,6 +2678,8 @@ async def api_diag(request):
     return web.json_response({
         "ok": True,
         "server_ver": SERVER_VER,
+        # ★ V8.3：已捕获的人工回复样本数（distill_rules.py 的语料；0 说明探针还没记到，不是坏了）
+        "demo_records": int(state.get("demo_records") or 0),
         "features": state.get("features") or feature_flags(),
         # ★ V7.9 安全状态：出站总开关 + "网页当前打开的工单" + 测试客户端数（一键止血/防发错人）
         "safety": {
@@ -2879,6 +2987,8 @@ async def diag_page_handler(request):
     cards.append('<div class="card"><div class="k">工单与知识库</div>' +
                  row("会话数", len(convs)) +
                  row("问题分类数", len(state.get("category_options") or [])) +
+                 row("人工样本（蒸馏语料）", "%s 条 · 见 demonstrations.jsonl（离线跑 distill_rules.py 提炼话术）"
+                     % int(state.get("demo_records") or 0)) +
                  row("规章条目", "%s 条 / %s 张表" % (kb.get("total_rows", kb.get("error", "-")),
                                                       kb.get("sheets", "-"))) +
                  row("常驻静态区", "%s 字符" % kb.get("static_chars", "-")) +
@@ -3048,7 +3158,9 @@ async def ws_ext_handler(request):
                         print(f"[状态] 📲 探针确认收到指令并回读：{_im_txt(st)}"
                               f"（累计 {_vr['count']} 次）")
                     _want = int(state.get("im_status") or 1)
-                    apply_im_status(st, manual=manual, source="探针上报", from_probe=True)
+                    # ★ V8.5.1：测试探针（?test=1）上报的 IM_STATUS 也只改内存、不落盘，别污染真实记忆
+                    apply_im_status(st, manual=manual, source="探针上报", from_probe=True,
+                                    persist=(ws not in TEST_WS))
                     if data.get("guarded"):
                         print("[状态] 🛡️ 探针已按手动离线设置，把网页自动跳回的在线改回离线")
                     if via_relay and st != _want:
@@ -3084,6 +3196,24 @@ async def ws_ext_handler(request):
                                             "detail": emsg, "ts": int(time.time())}
                     for m in list(active_clients["mobile"]):
                         await safe_send(m, {"type": "AI_STATUS", "status": "error", "message": emsg})
+                    continue
+
+                # ★ V8.3：人工回复"影子录制" —— 客服真人发出的回复 + 当时的工单上下文，落盘给离线蒸馏用。
+                #   铁律：
+                #     ① 这条分支**只落盘、零出站**（不填草稿/不发送/不改状态），所以不需要也不允许走 safe_outbound
+                #        —— 它记录的是"学习语料"，不是要发给玩家的内容；
+                #     ② 落盘走线程池（run_in_executor），绝不在事件循环里做同步 IO（红线③）；
+                #     ③ 测试来源（?test=1 的假探针）单独写 demonstrations.test.jsonl，不污染真实语料（红线⑥）。
+                if ev == "RECORD_MANUAL_DEMO":
+                    try:
+                        added = await asyncio.get_event_loop().run_in_executor(
+                            None, _append_demo_record, pkt.get("data") or {}, (ws in TEST_WS))
+                    except Exception as e:
+                        print(f"[DemoRecorder] ⚠️ 落盘失败（不影响任何发送）：{e}")
+                        added = False
+                    if added:
+                        state["demo_records"] = int(state.get("demo_records") or 0) + 1
+                        print("[DemoRecorder] 成功捕获 1 条人工标准回复样本")
                     continue
 
                 # ★ V8.0：探针上报"网页左侧会话列表"（手机端"全部会话"的数据源 + 切会话的依据）
@@ -3190,11 +3320,15 @@ async def ws_ext_handler(request):
                 if ev == "ABNORMAL_OFFLINE":
                     # 异常掉线警报闭环（探针在页面上确实读到"离线"才会发这个事件）
                     state["alarm_status"] = True
-                    apply_im_status(3, manual=False, source="异常掉线")
+                    apply_im_status(3, manual=False, source="异常掉线", persist=(ws not in TEST_WS))
                     # 推送给手机端
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 推送 Bark 通知（P0 修复：缺失的 Bark 警报）
-                    push_bark("🚨 异常掉线警报", "VPN 或网页网络连接断开，请立即检查！")
+                    # ★ V8.5 铁律⑨：测试探针发来的掉线事件只做站内告警，绝不推客服手机
+                    if ws in TEST_WS:
+                        print("[掉线] 测试来源：只做站内告警，不推 Bark")
+                    else:
+                        push_bark("🚨 异常掉线警报", "VPN 或网页网络连接断开，请立即检查！")
                     # 向探针发送确认回执（修复 BUG-002：防止重复上报）
                     await ws.send_json({"command": "ALARM_CONFIRMED"})
                     
@@ -3202,7 +3336,7 @@ async def ws_ext_handler(request):
                     state["alarm_status"] = False
                     # 掉线恢复 = 自动把状态改回在线；若你手动设过 忙碌/离线，apply_im_status 会拦下（
                     # 客服铁律：只有人工手动切才能变回在线）
-                    apply_im_status(1, manual=False, source="掉线恢复")
+                    apply_im_status(1, manual=False, source="掉线恢复", persist=(ws not in TEST_WS))
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     # 向探针发送确认回执
                     await ws.send_json({"command": "RECOVERY_CONFIRMED"})
@@ -3216,15 +3350,19 @@ async def ws_ext_handler(request):
                     gid = payload.get("groupID")
                     # ★ V8.3：这次上报**之前**网页打开着哪条会话 —— 用来区分
                     #   "我正在看的会话来了新消息"（该提示）与"我刚切到另一条工单"（不该提示/不该推 Bark）。
-                    _prev_page_gid = str(page_gid(ws) or "")
+                    # ★ V8.5.1：用"上一次 PLAYER_MESSAGE 的工单"判断，而不是 page_gid ——
+                    #   page_gid 会被 CONV_LIST 提前改成新会话，把翻旧会话的历史误判成新消息（Bark 根因）。
+                    _prev_page_gid = str((_LAST_TEST_MSG_GID if _is_test_origin else _LAST_MSG_GID)["gid"] or "")
                     # ★ V7.9 血泪教训：探针的"发送/填写"永远作用于**页面当前打开的那个工单**。
                     #   这里记下"网页上此刻打开的工单"，发送前必须核对，避免发错人。
                     #   真实探针与测试探针各记一份（测试的假探针不该污染真实页面的绑定）。
                     if gid:
                         if _is_test_origin:
                             _LAST_TEST_PAGE_GID["gid"] = str(gid)
+                            _LAST_TEST_MSG_GID["gid"] = str(gid)
                         else:
                             _LAST_PAGE_GID["gid"] = str(gid)
+                            _LAST_MSG_GID["gid"] = str(gid)
                         # ★ V8.0.2：按连接记"这个探针此刻打开的是哪条会话" ——
                         #   多开工作台标签页时，只让"真的打开着目标会话"的那个执行发送（防重复发送）
                         try:
@@ -3413,13 +3551,18 @@ CLOSE_CONFIRM_TIMEOUT = 20.0          # 秒：等探针回执的最长时间
 _PENDING_CLOSE = {}                   # gid -> {"category":..., "name":..., "ts":...}
 
 
-def mark_close_pending(gid: str, category: str) -> bool:
-    """把会话标记为"关单中"（不删除），并记住待确认信息。"""
+def mark_close_pending(gid: str, category: str, is_test: bool = False) -> bool:
+    """把会话标记为"关单中"（不删除），并记住待确认信息。
+
+    ★ V8.5 铁律⑨：is_test=True 表示"这次关单来自测试来源"（测试客户端 / 测试造的会话），
+      关单成功也**不许**推客服手机的 Bark —— 否则跑一次回归测试就给客服推一条假关单通知。
+    """
     conv = state["companies"]["main"]["conversations"].get(gid)
     if not isinstance(conv, dict):
         return False
     conv["closing"] = True
-    _PENDING_CLOSE[gid] = {"category": category, "name": conv.get("name") or gid, "ts": time.time()}
+    _PENDING_CLOSE[gid] = {"category": category, "name": conv.get("name") or gid,
+                           "ts": time.time(), "test": bool(is_test or conv.get("_test_origin"))}
     return True
 
 
@@ -3437,7 +3580,11 @@ def resolve_close(gid: str, ok: bool, detail: str = ""):
         convs.pop(gid, None)
         if _LAST_ACTIVE.get("gid") == gid:
             _LAST_ACTIVE["gid"] = None
-        push_bark("已回复并关单", f"{name}　分类：{info.get('category')}　{(detail or '')[:40]}", gid)
+        # ★ V8.5 铁律⑨：测试来源的关单**绝不推 Bark**（实测过：跑一次回归测试就会给客服手机推一条假关单）
+        if info.get("test"):
+            print("[关单] （测试来源：只记站内，不推 Bark）")
+        else:
+            push_bark("已回复并关单", f"{name}　分类：{info.get('category')}　{(detail or '')[:40]}", gid)
         print(f"[关单] ✅ {name} -> 分类「{info.get('category')}」（页面确认：{detail}）")
         return True, "已关单"
     print(f"[关单] ❌ {name} 未关单，已保留会话：{detail}")
@@ -3506,7 +3653,9 @@ async def handle_ai_close(group_id: str, origin=None):
     # ★ 关键改动：不再立刻移除会话 —— 先标记"关单中"，等探针回执确认成功后才移除。
     #   （旧实现删早了：页面点失败会导致"卡片消失但工单还挂着"）
     name = conv.get("name") or group_id
-    mark_close_pending(group_id, category)
+    # ★ V8.5 铁律⑨：关单来源是测试客户端 / 测试会话 -> 回执成功也不推客服手机 Bark
+    mark_close_pending(group_id, category,
+                       is_test=(_origin_is_test(origin) or bool(conv.get("_test_origin"))))
     asyncio.create_task(_close_confirm_watchdog(group_id))
     for m in list(active_clients["mobile"]):
         await safe_send(m, {"type": "FULL_SYNC", "data": state})
@@ -3576,7 +3725,9 @@ async def ws_mobile_handler(request):
                         st = 1
                     # ★ 手动切到 离线/忙碌 -> 记 manual（网页若自己跳回在线，探针会按守护改回来；
                     #   中继侧 apply_im_status 也会拦住"自动上线"）
-                    apply_im_status(st, manual=(st in (2, 3)), source="手机/小窗手动")
+                    # ★ V8.5.1：测试来源只改内存、不落盘（绝不覆盖客服真实的 im_state.json）
+                    apply_im_status(st, manual=(st in (2, 3)), source="手机/小窗手动",
+                                    persist=(ws not in TEST_WS))
                     state["im_last_request"] = {"status": st, "status_text": _im_txt(st),
                                                 "source": "手机/小窗手动", "ts": int(time.time())}
                     _conns = ext_targets(ws)                        # ★ V7.9：测试客户端只打到测试探针
@@ -3601,7 +3752,7 @@ async def ws_mobile_handler(request):
 
                 # ♻️ 以网页真实现状为准重置 IM 状态（清掉卡住的手动锁）—— V7.7 逃生舱
                 if act == "RESET_IM_STATE":
-                    st = reset_im_state(source="手机端")
+                    st = reset_im_state(source="手机端", persist=(ws not in TEST_WS))
                     for m in list(active_clients["mobile"]):
                         await safe_send(m, {"type": "FULL_SYNC", "data": state})
                     await safe_send(ws, {"type": "AI_STATUS", "status": "ok",
@@ -3694,14 +3845,15 @@ async def ws_mobile_handler(request):
                     continue
 
                 if act == "TOGGLE_AFK":
-                    ok, note = apply_reply_mode("afk" if pkt.get("status", False) else "semi", source="mobile")
+                    ok, note = apply_reply_mode("afk" if pkt.get("status", False) else "semi", source="mobile",
+                                                persist=(ws not in TEST_WS))
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
                 elif act == "SET_MODE":
                     # ★ 三档回复模式：manual=只提醒（不自动起草）/ semi=AI 起草到输入框（不发送）/ afk=AI 直接发送
                     mode = str(pkt.get("mode") or "semi")
                     if mode not in ("manual", "semi", "afk"):
                         mode = "semi"
-                    ok, note = apply_reply_mode(mode, source="mobile")
+                    ok, note = apply_reply_mode(mode, source="mobile", persist=(ws not in TEST_WS))
                     label = {"manual": "手动（只提醒，AI 不起草）", "semi": "半自动（AI 起草到输入框，不发送）",
                              "afk": "AFK 全自动（AI 直接回复）"}[mode]
                     for m in list(active_clients["mobile"]):
@@ -3737,7 +3889,9 @@ async def ws_mobile_handler(request):
                     if str(fwd.get("command") or "") == "ACTION_REPLY_CLOSE":
                         _cgid = str(fwd.get("groupID") or "")
                         if _cgid and state["companies"]["main"]["conversations"].get(_cgid):
-                            mark_close_pending(_cgid, str(fwd.get("category") or "其他"))
+                            # ★ V8.5 铁律⑨：测试客户端 / 测试会话的关单回执成功也不推客服手机 Bark
+                            _c_test = (ws in TEST_WS) or bool((state["companies"]["main"]["conversations"].get(_cgid) or {}).get("_test_origin"))
+                            mark_close_pending(_cgid, str(fwd.get("category") or "其他"), is_test=_c_test)
                             asyncio.create_task(_close_confirm_watchdog(_cgid))
                             for m in list(active_clients["mobile"]):
                                 await safe_send(m, {"type": "FULL_SYNC", "data": state})
