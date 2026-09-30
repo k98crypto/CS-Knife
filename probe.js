@@ -1500,7 +1500,9 @@
                 stopSiren();
             } else {
                 playSiren();
-                sendToBrain({ event: "ABNORMAL_OFFLINE", data: { sound_ok: audioReady } });
+                sendToBrain({ event: "ABNORMAL_OFFLINE",
+                              data: { sound_ok: audioReady,
+                                      hidden: (function () { try { return !!document.hidden; } catch (e) { return false; } })() } });
             }
         } else {
             stopSiren();
@@ -1514,7 +1516,10 @@
     }, 2000);
 
     // ==================== 定时任务 2：工单消息抓取与上报 ====================
-    setInterval(() => {
+    // ★ V8.7：抽成具名函数 —— 除定时器之外，**DOM 变化事件（MutationObserver）也会调用它**。
+    //   为什么：浏览器对**隐藏标签**的定时器会节流（隐藏 5 分钟后降到约 1 次/分钟，甚至被"内存节省"冻结），
+    //   而 DOM 变化事件不受节流影响 —— 这样"不聚焦工作台页面"也能第一时间发现新消息并推给手机。
+    function scanChatAndReport() {
         // 仅在 IM 工作台页面抓取
         if (!document.body || !document.body.innerText.includes('IM工作台')) return;
 
@@ -1552,7 +1557,10 @@
         const payload = {
             event: "PLAYER_MESSAGE",
             data: { groupID: ident.gid, name: ident.name, messages: messages, playerInfo: playerInfo,
-                    sound_ok: audioReady }        // ★ 浏览器能不能出声（false 时中继让桌面悬浮窗兜底响铃）
+                    sound_ok: audioReady,        // ★ 浏览器能不能出声（false 时中继让桌面悬浮窗兜底响铃）
+                    hidden: (function () { try { return !!document.hidden; } catch (e) { return false; } })() }
+                    // ★ V8.7 hidden：页面是否在后台（不聚焦）——后台标签的网页音频不可靠，
+                    //   中继收到 hidden=true 会让**桌面悬浮窗**用系统声提醒（保证一定响、且不双响）。
         };
         // 未连接时不更新 hash，等重连后自动补发
         if (!sendToBrain(payload)) return;
@@ -1572,11 +1580,14 @@
                 isNewPlayerMsg = messages.slice(prevState.texts.length).some(m => m.sender === 'player');
             }
         }
-        if (isNewPlayerMsg) playDingDong();
+        // ★ V8.7：页面在后台（不聚焦）时，网页音频在部分环境下会被浏览器压掉/静音，
+        //   所以隐藏标签页**不在这里响**，改由中继通知"桌面悬浮窗"用系统声（一定响、且不双响）。
+        if (isNewPlayerMsg && !document.hidden) playDingDong();
 
         window._lastChatState = { gid: ident.gid, texts: texts };
         window._lastChatHash = currentHash;
-    }, 2000);
+    }
+    setInterval(scanChatAndReport, 2000);
 
     // ==================== 会话列表（★ V8.0 实机校准：客服 Console dump 的真实结构） ====================
     //   div.session-item[.active]
@@ -1785,7 +1796,7 @@
 
     // 定时任务 4：会话列表上报（手机端"全部会话"就靠它；没变化不上报，防刷屏/防 Token 雪球）
     // ⚠️ 放在最后注册：现有测试按 intervals[0/1/2] 索引取定时器（IM/聊天/心跳），别打乱顺序。
-    setInterval(() => {
+    function bumpConvListReport() {
         if (!pageLoadComplete) return;
         const rows = scanConversationList();
         if (!rows.length) return;
@@ -1794,7 +1805,43 @@
         if (!sendToBrain({ event: "CONV_LIST", data: { rows: rows } })) return;   // 未连接不更新 hash，重连后补发
         window._lastConvListHash = fp;
         console.log("📋 [探针] 会话列表已上报（" + rows.length + " 个）");
-    }, 3000);
+    }
+    setInterval(bumpConvListReport, 3000);
+
+    // ==================== ★ V8.7：不聚焦也能感知新消息（后台标签不再"失聪"） ====================
+    // 背景：Chrome 对**隐藏标签**的定时器会节流（隐藏 5 分钟后约 1 次/分钟；开"内存节省"还会直接冻结 → JS 全停）。
+    //   只靠 setInterval 的探针会漏掉新消息：电脑不响、手机也收不到推送。
+    // 对策：MutationObserver 是 **DOM 变化事件驱动**，不受定时器节流影响 —— 聊天区/会话列表一变就立即扫描上报。
+    //   原定时器全部保留（前台 2~3 秒一次，作为兜底），**不新增/不打乱任何 setInterval**。
+    let lastKickAt = 0;
+    function kickScan(why) {
+        const now = Date.now();
+        if (now - lastKickAt < 500) return;         // 防抖：同一批 DOM 变化只扫一次
+        lastKickAt = now;
+        try { scanChatAndReport(); } catch (e) {}
+        try { bumpConvListReport(); } catch (e) {}
+    }
+
+    function setupFocusIndependentScan() {
+        // ① DOM 变化即扫描（事件驱动，不受后台节流影响）
+        try {
+            if (typeof MutationObserver === "undefined") return;
+            let target = null;
+            try { target = document.querySelector('.ws-right-panel'); } catch (e) {}
+            if (target && target.parentElement) target = target.parentElement;
+            if (!target) target = document.body;
+            if (!target) return;
+            const mo = new MutationObserver(function () { kickScan("dom"); });
+            mo.observe(target, { childList: true, subtree: true, characterData: true });
+        } catch (e) {}
+        // ② 切回前台 / 窗口重新聚焦：立刻补扫一次（把后台期间漏掉的补上）
+        try {
+            document.addEventListener('visibilitychange', function () {
+                try { if (!document.hidden) kickScan("visible"); } catch (e) {}
+            });
+            window.addEventListener('focus', function () { kickScan("focus"); });
+        } catch (e) {}
+    }
 
     // ==================== 调试入口（客服/运维可在控制台直接调用） ====================
     window.__probe = {
@@ -1836,11 +1883,24 @@
             console.table ? console.table(st) : console.log(st);
             return st;
         },
+        // ★ V8.7：立刻强制扫一次并上报（"不聚焦也不漏消息"的排障入口）
+        forceScan: function () {
+            lastKickAt = 0;
+            kickScan("manual");
+            return "已强制扫描一次（看中继日志 / 手机是否收到这条消息）";
+        },
+        // ★ V8.7：当前页面是否在后台（不聚焦）—— 后台时由桌面悬浮窗用系统声兜底提醒
+        hidden: function () {
+            const h = (function () { try { return !!document.hidden; } catch (e) { return false; } })();
+            console.log(h ? "页面在后台（不聚焦）：提醒仍会推手机 + 桌面悬浮窗会响" : "页面在前台：网页自己会出声");
+            return h;
+        },
         reconnect: function () { reconnectAttempts = 0; connectBrain(); return "已触发重连"; }
     };
 
     // ==================== 启动 ====================
     setupAudioUnlock();                 // ★ V8.6：按键/聚焦即解锁提示音（不再依赖"必须点一下页面"）
+    setupFocusIndependentScan();        // ★ V8.7：DOM 变化驱动感知（后台/不聚焦也不漏消息）
     setupManualReplySniffer();          // ★ V8.3：人工回复静默嗅探（只读录制，绝不影响客服操作）
     setChip('idle', "");
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', connectBrain);

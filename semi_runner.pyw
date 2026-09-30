@@ -227,6 +227,7 @@ class HUDOverlay:
         self._last_ding_ts = 0        # ★ V8.6：已兜底响过的"新消息叮咚"时间戳（防重复响）
         self._last_alarm_ts = 0       # ★ V8.6：已兜底报过的"掉线警报"时间戳
         self._queue_shown = False     # ★ V8.6：暂存区当前显示的是不是"分段回复待发队列"
+        self._last_qc_done_ts = 0     # ★ V8.7：已通知过的"质检采集完成"时间戳（防重复响）
         # 记录"我们想要的坐标"。不要依赖 winfo_x()：窗口还没映射时它返回 0，
         # 会把 (962,592) 这种正确位置写成 (0,0)（第七轮踩过的坑）。
         self._target = (DEFAULT_MARGIN, DEFAULT_MARGIN)
@@ -556,7 +557,8 @@ class HUDOverlay:
             self._q.put(lambda: self.set_links(info))
         threading.Thread(target=work, daemon=True).start()
         try:
-            self.root.after(5000, self._poll_links)
+            # ★ V8.7：3 秒一轮（原来 5 秒）—— 后台/不聚焦时的兜底响铃、掉线警报、采集完成通知都更快
+            self.root.after(3000, self._poll_links)
         except Exception:
             pass
 
@@ -606,6 +608,7 @@ class HUDOverlay:
                 self._sync_mode_ui(info)
                 self._handle_desktop_fallback(info, probe)
                 self._handle_reply_queue(info)
+                self._handle_qc_done(info)
         except Exception:
             pass
 
@@ -643,6 +646,31 @@ class HUDOverlay:
         suffix = "·手机" if self.mode_owner == "mobile" else ""
         try:
             self.btn_mode.config(text=short + suffix, fg=ACCENT if m == "afk" else FG_DIM)
+        except Exception:
+            pass
+
+    def _handle_qc_done(self, info):
+        """★ V8.7：质检采集**结束**就主动通知（不用人盯着质检页）：
+
+        响一声 + 暂存区写明"采了多少 / 跳过多少 / 失败多少" + **自动把蒸馏命令复制到剪贴板**
+        （直接去终端粘贴即可，不用再想参数）。
+        """
+        try:
+            d = (info or {}).get("qc_sweep_done") or {}
+            ts = int(d.get("ts") or 0)
+            if not ts or ts == self._last_qc_done_ts:
+                return
+            self._last_qc_done_ts = ts
+            cmd = str(d.get("next_step") or "python distill_rules.py --mode history --append")
+            total = int((info or {}).get("history_records") or 0)
+            text = (f"✅ 质检采集完成：成功 {d.get('done')} · 跳过 {d.get('skipped')} · 失败 {d.get('failed')}"
+                    + (f"｜语料累计 {total} 条" if total else ""))
+            threading.Thread(target=beep_success, daemon=True).start()
+            self.update_ui(last=f"{text}\n📋 蒸馏命令已复制到剪贴板：{cmd}", last_color=ACCENT)
+            try:
+                pyperclip.copy(cmd)
+            except Exception:
+                pass
         except Exception:
             pass
 

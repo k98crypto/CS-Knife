@@ -3321,6 +3321,7 @@ async def diag_page_handler(request):
 #   不进 ext_targets（不会被下发 FILL_DRAFT / SEND_REPLY 之类的发送指令）、
 #   不进手机端会话列表、不推 Bark。分开一条 WS 通道 = 从物理上杜绝这类事故。
 _QC_CONNS = set()
+_QC_TEST_CONNS = set()      # ★ V8.7：测试来源的采集器（完成通知不推真实 Bark/手机）
 
 
 async def qc_probe_js_handler(request):
@@ -3405,6 +3406,9 @@ async def ws_qc_handler(request):
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     _QC_CONNS.add(ws)
+    # ★ V8.7：`ws://.../ws/qc?test=1` = 测试来源：进度照记，但**完成通知不推真实 Bark/手机**
+    if str(request.query.get("test") or "") == "1":
+        _QC_TEST_CONNS.add(ws)
     state["qc_clients"] = len(_QC_CONNS)
     print(f"[QC] ✅ 采集器已连接（当前 {len(_QC_CONNS)} 个）· 来源: {request.headers.get('Referer', '未知')}")
     try:
@@ -3454,7 +3458,29 @@ async def ws_qc_handler(request):
             if ev == "QC_SWEEP_DONE":
                 state["qc_sweep_done"] = dict(data)
                 state["qc_sweep_done"]["ts"] = int(time.time())
-                print(f"[QC] ✅ 扫描结束：{json.dumps(data, ensure_ascii=False)[:240]}")
+                _d = state["qc_sweep_done"]
+                # ★ V8.7：给出"下一步"的可复制命令 —— 采集完就该蒸馏，不用人再想
+                _d["next_step"] = (f"python distill_rules.py --mode history "
+                                   f"--limit {max(1, int(_d.get('done') or 0))} --append")
+                _secs = ""
+                try:
+                    if _d.get("elapsedMs"):
+                        _secs = f" · 用时 {int(int(_d['elapsedMs']) / 1000)} 秒"
+                except Exception:
+                    pass
+                _stall = (" · 后台节流 " + str(int(int(_d.get('stalledMs') or 0) / 1000)) + " 秒"
+                          if int(_d.get("stalledMs") or 0) > 0 else "")
+                _sum = (f"成功 {_d.get('done')} · 跳过(仅机器人) {_d.get('skipped')} · "
+                        f"失败 {_d.get('failed')}{_secs}{_stall}（累计语料 {state.get('history_records') or 0} 条）")
+                print(f"[QC] ✅ 扫描结束：{_sum} · 原因：{_d.get('reason') or '完成'}")
+                print(f"[QC] 👉 现在可以蒸馏了：{_d['next_step']}")
+                # ★ V8.7：**主动通知**（不用人盯着质检页）—— 手机 Bark + 手机端提示 + 桌面悬浮窗响铃
+                if bool(config.get("notify_qc_done", True)) and ws not in _QC_TEST_CONNS:
+                    push_bark("✅ 质检采集完成", f"{_sum}\n下一步：{_d['next_step']}")
+                if ws not in _QC_TEST_CONNS:
+                    for m in list(active_clients["mobile"]):
+                        await safe_send(m, {"type": "AI_STATUS", "status": "ok",
+                                            "message": f"质检采集完成：{_sum}｜已备好蒸馏命令（看悬浮窗/日志）"})
                 continue
             if ev == "QC_DEBUG":
                 state["qc_dump"] = dict(data)
@@ -3462,6 +3488,7 @@ async def ws_qc_handler(request):
                 continue
     finally:
         _QC_CONNS.discard(ws)
+        _QC_TEST_CONNS.discard(ws)
         state["qc_clients"] = len(_QC_CONNS)
         print(f"[QC] 采集器已断开（剩 {len(_QC_CONNS)} 个）")
     return ws
@@ -3811,14 +3838,18 @@ async def ws_ext_handler(request):
                 if ev == "ABNORMAL_OFFLINE":
                     # 异常掉线警报闭环（探针在页面上确实读到"离线"才会发这个事件）
                     state["alarm_status"] = True
-                    # ★ V8.6：探针若报"出不了声"，让桌面悬浮窗兜底报警（否则电脑静悄悄）
+                    # ★ V8.6/V8.7：探针若报"出不了声"或"页面在后台"，让桌面悬浮窗兜底报警（否则电脑静悄悄）
                     _ad = pkt.get("data") or {}
                     if "sound_ok" in _ad:
                         state["probe_sound_ok"] = bool(_ad.get("sound_ok"))
-                    if _ad.get("sound_ok") is False and ws not in TEST_WS:
-                        state["desktop_alarm"] = {"ts": int(time.time() * 1000),
-                                                  "why": "探针无法出声（掉线警笛）"}
-                        print("[提醒] 🚨 探针出不了声 -> 已请桌面悬浮窗兜底报警")
+                    _ad_hidden = bool(_ad.get("hidden"))
+                    if _ad.get("sound_ok") is False or _ad_hidden:
+                        if ws not in TEST_WS:
+                            state["desktop_alarm"] = {"ts": int(time.time() * 1000),
+                                                      "why": ("页面在后台（不聚焦）" if _ad_hidden
+                                                              else "探针无法出声（掉线警笛）")}
+                            print(f"[提醒] {'🖥 页面在后台' if _ad_hidden else '🚨 探针出不了声'}"
+                                  f" -> 已请桌面悬浮窗兜底报警")
                     apply_im_status(3, manual=False, source="异常掉线", persist=(ws not in TEST_WS))
                     # 推送给手机端
                     for m in list(active_clients["mobile"]): await safe_send(m, {"type": "FULL_SYNC", "data": state})
@@ -3969,13 +4000,18 @@ async def ws_ext_handler(request):
                             #   "bark_on_new_message": false 关掉）。push_bark 内部走线程池，不阻塞事件循环。
                             if config.get("bark_on_new_message", True) and not _is_test_origin:
                                 push_bark(f"💬 {name} 新消息", preview or "（玩家发来新消息）", gid)
-                            # ★ V8.6 兜底：探针报"浏览器出不了声"（没点过/没按过页面）时，
-                            #   让**桌面悬浮窗**来响一声 —— 客服的电脑一定要能听见提醒。
-                            if payload.get("sound_ok") is False:
+                            # ★ V8.7 兜底：探针报"浏览器出不了声"**或"页面在后台"**（不聚焦）时，
+                            #   让**桌面悬浮窗**用系统声（winsound）响一声 —— 后台标签的网页音频不可靠，
+                            #   而客服的电脑一定要能听见提醒。前台且能出声时不走这里（不会双响）。
+                            _hidden = bool(payload.get("hidden"))
+                            _hud_on_hidden = bool(config.get("hud_alert_when_hidden", True))
+                            if payload.get("sound_ok") is False or (_hidden and _hud_on_hidden):
                                 state["desktop_ding"] = {"ts": int(new_ts or (time.time() * 1000)),
                                                          "name": name, "preview": preview[:40],
-                                                         "why": "浏览器未授权出声（需先点/按一下工作台页面）"}
-                                print("[提醒] 🔊 探针出不了声 -> 已请桌面悬浮窗兜底响铃")
+                                                         "why": ("页面在后台（不聚焦）" if _hidden
+                                                                 else "浏览器未授权出声（需先点/按一下工作台页面）")}
+                                print(f"[提醒] {'🖥 页面在后台' if _hidden else '🔊 探针出不了声'}"
+                                      f" -> 已请桌面悬浮窗兜底响铃")
                     except Exception as e:
                         print(f"[新消息] 通知失败（不影响主流程）：{e}")
 

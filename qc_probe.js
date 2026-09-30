@@ -90,7 +90,9 @@
                 (document.body || document.documentElement).appendChild(chipEl);
             }
             chipEl.textContent = text;
-            chipEl.style.borderColor = kind === 'err' ? '#F44747' : (kind === 'ok' ? '#4EC9B0' : '#444');
+            chipEl.style.borderColor = (kind === 'err' ? '#F44747'
+                                        : (kind === 'ok' ? '#4EC9B0'
+                                           : (kind === 'warn' ? '#D7BA7D' : '#444')));
         } catch (e) {}
     }
 
@@ -360,13 +362,21 @@
     }
 
     // ==================== 扫描主流程（纯 setTimeout 状态机：不阻塞页面、随时可停） ====================
+    // ★ V8.7：本采集器**不需要页面在前台**（可以切去干别的），但有两点物理限制要知情：
+    //   · 后台标签的定时器会被浏览器节流（隐藏 5 分钟后约 1 次/分钟）→ 采集会**变慢但仍会继续**；
+    //   · 若开着 Chrome「内存节省」，不活跃标签可能被**冻结**（JS 全停）→ 会在恢复前台后自动接着跑。
+    //   建议：把质检页加入 Chrome「性能 → 始终保持活动」，采集速度就和前台一样。
+    //   采集结束会自动通知（手持 Bark + 桌面悬浮窗响铃），不用盯着页面。
     let SW = { running: false, stop: false, done: 0, skipped: 0, failed: 0, pages: 0,
-               lastFp: "", startedAt: 0, seen: {}, lastError: "" };
+               lastFp: "", startedAt: 0, seen: {}, lastError: "", lastProgressAt: 0, stalledMs: 0 };
 
     function reportProgress(extra) {
+        SW.lastProgressAt = Date.now();
         sendToRelay({ event: "QC_SWEEP_PROGRESS", data: Object.assign({
             done: SW.done, skipped: SW.skipped, failed: SW.failed, pages: SW.pages,
             page: currentPage(), running: SW.running, elapsedMs: Date.now() - SW.startedAt,
+            hidden: (function () { try { return !!document.hidden; } catch (e) { return false; } })(),
+            stalledMs: SW.stalledMs,
             lastError: SW.lastError
         }, extra || {}) });
     }
@@ -374,10 +384,12 @@
         SW.running = false;
         const done = { done: SW.done, skipped: SW.skipped, failed: SW.failed, pages: SW.pages,
                        elapsedMs: Date.now() - SW.startedAt, reason: reason || "完成",
-                       lastError: SW.lastError };
+                       hidden: (function () { try { return !!document.hidden; } catch (e) { return false; } })(),
+                       stalledMs: SW.stalledMs, lastError: SW.lastError };
         sendToRelay({ event: "QC_SWEEP_DONE", data: done });
         setChip("QC 采集：" + (reason || "完成") + " · 已采 " + SW.done + " 条 / 跳过 " + SW.skipped, "ok");
-        console.log("🔍 [QC] 扫描结束：", done);
+        console.log("🔍 [QC] 扫描结束：", done,
+                    "\n   → 中继会通知你「可以蒸馏了」，命令：python distill_rules.py --mode history --append");
     }
     function stopSweep(reason) {
         if (!SW.running) return "当前没有在扫描";
@@ -393,12 +405,39 @@
             if (o[k] !== undefined && o[k] !== null && !isNaN(parseFloat(o[k]))) QC_CONFIG[k] = parseFloat(o[k]);
         });
         SW = { running: true, stop: false, done: 0, skipped: 0, failed: 0, pages: 0,
-               lastFp: "", startedAt: Date.now(), seen: {}, lastError: "" };
+               lastFp: "", startedAt: Date.now(), seen: {}, lastError: "",
+               lastProgressAt: Date.now(), stalledMs: 0 };
         console.log("🔍 [QC] 开始扫描：", QC_CONFIG);
+        console.log("   · 可以切到别的标签/窗口去干活：后台会继续采（可能变慢）；"
+                    + "把本页加入 Chrome「性能 → 始终保持活动」则不受节流影响。");
+        console.log("   · 采完会自动通知手机 + 桌面悬浮窗响铃，不用盯着这一页。");
         setChip("QC 采集：开始…");
         reportProgress();
         setTimeout(() => stepRow(currentPage(), 0, ""), 500);
-        return "已开始（进度看页面左下角胶囊 / 中继日志 / /api/qc_status）";
+        return "已开始（可以切走；进度看左下角胶囊 / 中继日志 / /api/qc_status）";
+    }
+
+    // ★ V8.7：切回前台时如实说明"刚才在后台被节流/冻结了多久"（采集会自动继续，无需重开）
+    function setupVisibilityWatch() {
+        try {
+            document.addEventListener('visibilitychange', function () {
+                if (!document.hidden) {
+                    const gap = SW.lastProgressAt ? (Date.now() - SW.lastProgressAt) : 0;
+                    if (SW.running && gap > 8000) {
+                        SW.stalledMs = gap;
+                        console.warn("⏳ [QC] 刚才页面不在前台（被节流/可能被冻结）：距上次进度 "
+                                     + Math.round(gap / 1000) + " 秒。采集会自动继续；"
+                                     + "想满速请在 Chrome「性能 → 始终保持活动」里加入本站点。");
+                        setChip("QC 采集：后台节流 " + Math.round(gap / 1000) + " 秒 · 已继续（已采 "
+                                + SW.done + " 条）", "warn");
+                    }
+                    reportProgress();      // 回来先补报一次
+                } else if (SW.running) {
+                    setChip("QC 采集：后台继续（已采 " + SW.done + " 条）", "ok");
+                }
+            });
+            window.addEventListener('focus', function () { if (SW.running) reportProgress(); });
+        } catch (e) {}
     }
 
     function stepRow(pageNo, idx, prevFp) {
@@ -540,6 +579,7 @@
 
     // ==================== 启动 ====================
     setChip("QC 采集：待命");
+    setupVisibilityWatch();                   // ★ V8.7：切回前台时如实说明"后台被节流了多久"
     connectRelay();
     setInterval(() => {                       // 心跳：让中继知道采集器还活着（30 秒一次，轻量）
         sendToRelay({ event: "QC_HEARTBEAT", data: { version: QC_VERSION, running: SW.running,
